@@ -15,6 +15,10 @@
 //!   values do not survive JSON number parsing in every language.
 //! - Percentages are floats in `0.0..=100.0`.
 //! - Arrays are ranked as documented (largest first) and bounded by `--top`.
+//! - Fields added within version 1 are `Option`s with `#[serde(default)]`,
+//!   so documents written before they existed still deserialize (to
+//!   `None`). They are serialized as `null` when absent, like every other
+//!   nullable field.
 
 use std::fmt;
 use std::str::FromStr;
@@ -196,6 +200,11 @@ pub struct AnalyzeReport {
     /// Types by retained bytes, largest first. At most `--top`.
     pub type_histogram: Vec<TypeRow>,
     pub notes: Vec<Note>,
+    /// What an allocation profile (`--allocations`) says about where the
+    /// memory came from. `null` without `--allocations`, and while the join
+    /// is not implemented.
+    #[serde(default)]
+    pub allocations: Option<Allocations>,
 }
 
 /// Graph-wide counts (`totals`).
@@ -250,6 +259,10 @@ pub struct Retainer {
     pub retained_pct: f64,
     /// Shortest retaining path from a root to this object.
     pub path: RetainingPath,
+    /// Allocation stacks of the sampled objects this entry retains. `null`
+    /// without `--allocations`.
+    #[serde(default)]
+    pub allocated_at: Option<AllocatedAt>,
 }
 
 /// One entry of `type_histogram`.
@@ -262,6 +275,134 @@ pub struct TypeRow {
     /// Retained bytes of the set of all instances: the sum of `retained_bytes`
     /// over instances not dominated by another instance of the same type.
     pub retained_bytes: u64,
+}
+
+// ---------------------------------------------------------------- allocations
+
+/// `allocations` on an analyze report: the allocation profile given with
+/// `--allocations`, joined with the snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Allocations {
+    /// Path of the `.hpya` file as given on the command line.
+    pub path: String,
+    /// Process the samples were recorded from.
+    pub pid: u32,
+    /// `sys.version`-style CPython version recorded in the profile.
+    pub python_version: String,
+    /// Unix seconds when recording started.
+    pub started_at: u64,
+    /// Length of the recording window in milliseconds.
+    pub duration_ms: u64,
+    /// Mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"`.
+    pub mechanisms: Vec<String>,
+    pub sampling: SamplingInfo,
+    pub overhead: OverheadInfo,
+    /// Recording stopped early or lost samples the overhead does not count.
+    pub truncated: bool,
+    /// Some Python frames were matched to events by time (ETW) rather than
+    /// read at the event; stacks marked `approximate` may be off by a call.
+    pub approximate: bool,
+    /// Samples in the profile.
+    pub samples: u64,
+    /// Sum of sample weights: estimated bytes allocated through the sampled
+    /// events during the window.
+    pub estimated_bytes: u64,
+    /// How much of the snapshot the samples explain.
+    pub coverage: Coverage,
+    /// Allocation stacks by `estimated_bytes`, largest first. At most `--top`.
+    pub top_stacks: Vec<AllocationStack>,
+}
+
+/// `allocations.sampling`: how the recorder sampled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplingInfo {
+    /// Event kinds enabled: `"arena"`, `"pool"`, `"large_object"`.
+    pub events: Vec<String>,
+    /// Mean bytes between large-object samples; 0 means every one was kept.
+    pub byte_interval: u64,
+    /// Most Python frames kept per sample.
+    pub max_frames: u32,
+}
+
+/// `allocations.overhead`: what recording cost, as measured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverheadInfo {
+    pub samples_taken: u64,
+    pub samples_dropped: u64,
+    pub probe_hits: u64,
+    /// Total time target threads were stopped, summed over threads.
+    pub total_pause_ns: u64,
+}
+
+/// `allocations.coverage`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Reachable objects whose address falls in a sampled allocation.
+    pub linked_objects: u64,
+    /// Their shallow bytes.
+    pub linked_bytes: u64,
+    /// `linked_bytes / totals.reachable_bytes * 100`.
+    pub linked_pct: f64,
+}
+
+/// One Python frame of an allocation stack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackFrame {
+    /// `co_qualname`, e.g. `"Cache.load"`; `"<unknown>"` if the code
+    /// object could not be read.
+    pub function: String,
+    /// `co_filename`; `null` if unknown.
+    pub file: Option<String>,
+    /// Line of the executing instruction; `null` if unknown.
+    pub line: Option<u32>,
+    /// `file:line`, `file:?` without a line, or `"<unknown>"`.
+    pub location: String,
+    /// Matched to the event by time, not read at the event.
+    pub approximate: bool,
+}
+
+/// One entry of `allocations.top_stacks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationStack {
+    /// 1-based position in the list.
+    pub rank: u32,
+    /// Innermost first: `frames[0]` is the function that allocated.
+    pub frames: Vec<StackFrame>,
+    /// Sum of the weights of this stack's samples.
+    pub estimated_bytes: u64,
+    pub samples: u64,
+    /// Event kinds among the samples, sorted: `"arena"`, `"pool"`, `"large_object"`.
+    pub events: Vec<String>,
+    /// Shallow bytes of reachable snapshot objects linked to these samples.
+    pub linked_bytes: u64,
+    /// Any frame of any sample was approximate.
+    pub approximate: bool,
+}
+
+/// `allocated_at` on a retainer or instance: which stacks allocated the
+/// sampled objects in its dominator subtree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedAt {
+    /// Objects in the subtree linked to a sample.
+    pub linked_objects: u64,
+    /// Their shallow bytes.
+    pub linked_bytes: u64,
+    /// Stacks by `linked_bytes`, largest first. At most 5.
+    pub stacks: Vec<AllocatedAtStack>,
+    /// Any listed stack is approximate.
+    pub approximate: bool,
+}
+
+/// One entry of `allocated_at.stacks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedAtStack {
+    /// Innermost first.
+    pub frames: Vec<StackFrame>,
+    /// Linked objects in the subtree allocated through this stack.
+    pub linked_objects: u64,
+    pub linked_bytes: u64,
+    /// `rank` of the same stack in `allocations.top_stacks`, if listed there.
+    pub top_stack_rank: Option<u32>,
 }
 
 // ---------------------------------------------------------------- query --type
@@ -301,6 +442,10 @@ pub struct Instance {
     pub length: Option<u64>,
     /// Shortest retaining path; `null` if the instance is unreachable.
     pub path: Option<RetainingPath>,
+    /// Allocation stacks of the sampled objects this instance retains.
+    /// `null` without `--allocations`.
+    #[serde(default)]
+    pub allocated_at: Option<AllocatedAt>,
 }
 
 /// One entry of `holders`.

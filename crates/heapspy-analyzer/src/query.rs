@@ -114,6 +114,7 @@ pub fn query_type(
             retained_bytes: a.retained[v as usize],
             length: snap.extras(v).and_then(|x| x.length),
             path: a.path(v)?,
+            allocated_at: None,
         });
     }
 

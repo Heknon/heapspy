@@ -16,6 +16,9 @@ that each example matches the structs field for field.
   `schema_version: 2`.
 - Fields documented as nullable are always present, with `null` when the
   value is unknown. Fields are never omitted.
+- Fields added within version 1 (marked "added in M7" below) may be missing
+  from documents written by an older heapspy. Readers treat a missing
+  added field as `null`; the Rust types do this with `#[serde(default)]`.
 - Byte and object counts are non-negative JSON integers. Deltas (`delta_*`)
   are signed integers.
 - Addresses are strings: lowercase hex with a `0x` prefix, e.g.
@@ -111,12 +114,16 @@ Codes defined so far:
 | `missing_roots` | some root addresses are not in the snapshot |
 | `identity_approximate` | always on diff |
 | `unreachable_target` | a retaining-path target has no path from any root |
+| `allocations_pid_mismatch` | `--allocations`: the profile was recorded from another pid than the (live-process) snapshot |
+| `allocations_python_mismatch` | `--allocations`: the profile and the snapshot name different CPython versions |
+| `allocations_after_snapshot` | `--allocations`: the snapshot was taken before recording started, so no sampled allocation can be in it |
+| `allocations_not_joined` | `--allocations`: the profile was opened and checked, but the join is not implemented yet, so `allocations` and `allocated_at` are `null` |
 
 New codes may be added in version 1.
 
 ## `analyze`
 
-`heapspy analyze SNAP --json [--top N]`. Example: `docs/examples/analyze.json`.
+`heapspy analyze SNAP --json [--top N] [--allocations FILE.hpya]`. Examples: `docs/examples/analyze.json`, and with allocations `docs/examples/analyze_allocations.json`.
 
 | field | type | meaning |
 |---|---|---|
@@ -128,6 +135,7 @@ New codes may be added in version 1.
 | `top_retainers` | array of Retainer | objects with the largest `retained_bytes` |
 | `type_histogram` | array of TypeRow | types by `retained_bytes` |
 | `notes` | array of Note | |
+| `allocations` | Allocations, nullable | added in M7: the `--allocations` profile joined with the snapshot, see [Allocations](#allocations); `null` without `--allocations` |
 
 `totals`:
 
@@ -165,6 +173,7 @@ Retainer (`top_retainers[]`):
 | `retained_objects` | integer | number of objects it dominates, itself included |
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
+| `allocated_at` | AllocatedAt, nullable | added in M7: allocation stacks of the sampled objects this entry retains, see [AllocatedAt](#allocatedat); `null` without `--allocations` |
 
 Which objects are listed:
 
@@ -231,6 +240,7 @@ Instance:
 | `retained_bytes` | integer | |
 | `length` | integer, nullable | `len()` if recorded |
 | `path` | array of PathHop, nullable | shortest retaining path; `null` if unreachable |
+| `allocated_at` | AllocatedAt, nullable | added in M7: as on Retainer; `null` without `--allocations` |
 
 Holder:
 
@@ -239,6 +249,103 @@ Holder:
 | `type` | string | type of the referring object |
 | `edge` | string | edge label from referrer to instance, generalised: dict keys become `[<key>]` and indices `[<index>]`, so one container holding many instances is one row |
 | `count` | integer | instances held this way |
+
+## Allocations
+
+Added in M7. `heapspy analyze SNAP --allocations FILE.hpya --json` joins an
+allocation profile written by `heapspy record` (format:
+`docs/alloc-format.md`) with the snapshot. Example:
+`docs/examples/analyze_allocations.json`. `heapspy query --type T
+--allocations FILE.hpya` fills `allocated_at` on `top_instances`; the
+`retaining_path` and `diff` reports have no allocation fields and only
+check the profile (its notes are added).
+
+Samples are an estimate of where growth came from during the recording
+window, not a full allocation history: only arena, pool and large-object
+events are sampled, blocks reused from freed memory are not, and objects
+allocated before recording started have no sample. An object is *linked*
+to a sample when its address lies inside the sampled range and no later
+sample covers that address.
+
+**Status:** the profile is opened, validated and checked against the
+snapshot, but the join is not implemented yet. Until it is, `allocations`
+and every `allocated_at` are `null` and the report carries the
+`allocations_not_joined` note.
+
+### Allocations (`allocations`)
+
+| field | type | meaning |
+|---|---|---|
+| `path` | string | profile path as given on the command line |
+| `pid` | integer | process the samples were recorded from |
+| `python_version` | string | CPython version recorded in the profile, `sys.version` style |
+| `started_at` | integer | Unix seconds when recording started |
+| `duration_ms` | integer | length of the recording window in milliseconds |
+| `mechanisms` | array of string | mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"` |
+| `sampling.events` | array of string | event kinds enabled: `"arena"`, `"pool"`, `"large_object"` |
+| `sampling.byte_interval` | integer | mean bytes between large-object samples; 0 means every one was kept |
+| `sampling.max_frames` | integer | most Python frames kept per sample |
+| `overhead.samples_taken` | integer | samples written |
+| `overhead.samples_dropped` | integer | samples lost before they were written (buffer full, stack unreadable) |
+| `overhead.probe_hits` | integer | times a probe fired, including events the byte sampler skipped |
+| `overhead.total_pause_ns` | integer | total time target threads were stopped, summed over threads (0 for eBPF and ETW) |
+| `truncated` | bool | recording stopped early or lost samples the overhead does not count |
+| `approximate` | bool | some frames were matched to events by time (ETW) rather than read at the event |
+| `samples` | integer | samples in the profile |
+| `estimated_bytes` | integer | sum of sample weights: estimated bytes allocated through sampled events during the window |
+| `coverage.linked_objects` | integer | reachable objects linked to a sample |
+| `coverage.linked_bytes` | integer | their shallow bytes |
+| `coverage.linked_pct` | float | `coverage.linked_bytes / totals.reachable_bytes * 100` |
+| `top_stacks` | array of AllocationStack | stacks by `estimated_bytes`, at most `--top` |
+
+AllocationStack (`top_stacks[]`):
+
+| field | type | meaning |
+|---|---|---|
+| `rank` | integer | 1-based position |
+| `frames` | array of StackFrame | innermost first: `frames[0]` is the function that allocated |
+| `estimated_bytes` | integer | sum of the weights of this stack's samples |
+| `samples` | integer | samples with this stack |
+| `events` | array of string | event kinds among them, sorted |
+| `linked_bytes` | integer | shallow bytes of reachable objects linked to these samples |
+| `approximate` | bool | any frame of any of these samples was approximate |
+
+Two samples have the same stack when their frames have the same
+`function` and `location` in the same order.
+
+StackFrame:
+
+| field | type | meaning |
+|---|---|---|
+| `function` | string | `co_qualname`, e.g. `"SessionStore.create"`; `"<unknown>"` if the code object could not be read |
+| `file` | string, nullable | `co_filename` |
+| `line` | integer, nullable | line of the executing instruction, from `co_linetable` |
+| `location` | string | `file:line`; `file:?` without a line; `"<unknown>"` without a file |
+| `approximate` | bool | this frame was matched to the event by time, not read at it |
+
+### AllocatedAt
+
+On a Retainer (`top_retainers[].allocated_at`) or an Instance
+(`top_instances[].allocated_at`): which stacks allocated the linked objects
+in the entry's dominator subtree, i.e. the memory it retains. With
+`--allocations`, every listed entry has one; an entry with no linked
+objects has `linked_objects: 0` and no stacks.
+
+| field | type | meaning |
+|---|---|---|
+| `linked_objects` | integer | objects in the subtree linked to a sample |
+| `linked_bytes` | integer | their shallow bytes |
+| `stacks` | array of AllocatedAtStack | by `linked_bytes`, at most 5 |
+| `approximate` | bool | any listed stack is approximate |
+
+AllocatedAtStack:
+
+| field | type | meaning |
+|---|---|---|
+| `frames` | array of StackFrame | innermost first |
+| `linked_objects` | integer | linked objects in the subtree allocated through this stack |
+| `linked_bytes` | integer | their shallow bytes |
+| `top_stack_rank` | integer, nullable | `rank` of the same stack in `allocations.top_stacks`, if it is listed there; always `null` on query reports |
 
 ## `retaining_path`
 
@@ -364,6 +471,7 @@ status 1. Example: `docs/examples/error.json`.
 | `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`) |
 | `not_found` | the requested address or type is not in the snapshot |
 | `invalid_snapshot` | the file is not a snapshot, is truncated or corrupt, or has an unsupported format version |
+| `invalid_allocations` | the `--allocations` file is not an allocation profile, is truncated or corrupt, or has an unsupported format version |
 | `io` | the file could not be read |
 | `permission_denied` | reading the target process was refused |
 | `internal` | anything else |

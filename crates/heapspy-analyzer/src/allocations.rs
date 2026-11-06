@@ -22,18 +22,21 @@
 //!   are already sorted by address, so a merge walk works too. Only some
 //!   objects get a sample, because only a sample of allocations is recorded.
 //! - **By site.** Group samples by their resolved stack (the sequence of
-//!   `(qualname, file:line)`, innermost first) and sum their `weight`. The
-//!   largest groups are `allocations.top_stacks`.
-//! - **Per retainer / instance.** For each object listed, sum the linked
-//!   samples of the objects in its dominator subtree by stack:
-//!   `allocated_at` holds the largest stacks. Each linked sample counts
-//!   once per retainer even if several of its objects are in the subtree;
-//!   use the bytes of linked objects (shallow sizes), not the sample weight,
-//!   for `linked_bytes`.
-//! - **Coverage.** `allocations.coverage` is the shallow bytes of reachable
-//!   objects linked to any sample over `totals.reachable_bytes`.
-//! - `approximate` is true when any linked or listed sample has
-//!   `APPROXIMATE_FRAMES`, or the profile's mechanisms include ETW.
+//!   `(function, location)` from `Profile::stack`, innermost first) and sum
+//!   their `weight` into `estimated_bytes`. The largest groups, at most
+//!   `--top`, are `allocations.top_stacks`; `linked_bytes` there is the
+//!   shallow bytes of reachable objects linked to the group's samples.
+//! - **Per retainer / instance.** For each listed object, group the linked
+//!   objects of its dominator subtree by their sample's stack, counting
+//!   objects and shallow bytes (not sample weights). The 5 largest groups
+//!   by bytes are `allocated_at.stacks`, each with the rank of the same
+//!   stack in `top_stacks` if it is there. Every listed object gets an
+//!   `allocated_at`, with zero counts and no stacks if nothing is linked.
+//! - **Coverage.** `coverage.linked_objects` / `linked_bytes` count the
+//!   reachable objects linked to any sample; `linked_pct` is
+//!   `linked_bytes / totals.reachable_bytes * 100`.
+//! - `approximate` (block, stack, frame) is true when the samples involved
+//!   have approximate frames.
 //! - Add the [`compatibility`] notes to the report.
 
 use heapspy_alloc::Profile;

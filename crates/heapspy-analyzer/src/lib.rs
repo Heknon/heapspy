@@ -222,6 +222,7 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
             retained_objects: a.retained_count[v as usize] as u64,
             retained_pct: pct(bytes, reachable_bytes),
             path: a.path(v)?.unwrap_or_default(),
+            allocated_at: None,
         });
     }
 
@@ -256,6 +257,7 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
         top_retainers,
         type_histogram,
         notes,
+        allocations: None,
     })
 }
 

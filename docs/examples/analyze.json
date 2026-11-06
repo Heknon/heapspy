@@ -65,7 +65,8 @@
           "root_label": null,
           "root_kind": null
         }
-      ]
+      ],
+      "allocated_at": null
     },
     {
       "rank": 2,
@@ -84,7 +85,8 @@
           "root_label": "frame worker:run local 'pending'",
           "root_kind": "frame_local"
         }
-      ]
+      ],
+      "allocated_at": null
     }
   ],
   "type_histogram": [
@@ -110,5 +112,6 @@
       "code": "outside_graph",
       "message": "Python graph accounts for 448.0 MiB of 1.9 GiB RSS. The rest is outside the object graph (native allocations, C extensions, untracked objects)."
     }
-  ]
+  ],
+  "allocations": null
 }
