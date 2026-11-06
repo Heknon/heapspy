@@ -4,7 +4,7 @@ Read the object graph of a running Python process from the outside, and find out
 
 py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
 
-> **Status: early development.** The workspace, the snapshot file format and the command-line interface exist; dumping and analysis do not work yet and report "not implemented". This README describes what heapspy is meant to do and how it will be used. Commands below are the planned interface.
+> **Status: early development.** `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query` and `diff` work on them. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). Packaging and the MCP server are still planned.
 
 ## What it answers, and what it doesn't
 
