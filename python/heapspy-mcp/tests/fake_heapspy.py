@@ -10,7 +10,8 @@ Environment:
     FAKE_HEAPSPY_MODE      ok (default), error:<code>, bad_schema, not_json, timeout,
                            usage, wrong_kind, crash, big, error_exit0;
                            for dump also dump_fail (text error, no document),
-                           dump_no_file, dump_truncated, dump_no_json (exit 0, no
+                           dump_no_file, dump_hang (writes a temporary file and
+                           hangs), dump_truncated, dump_no_json (exit 0, no
                            document), dump_usage (usage error naming --json in its
                            Usage line), old_binary (a heapspy without dump --json,
                            --allocations or flamegraph);
@@ -132,6 +133,10 @@ def dump(args: list[str]) -> None:
         sys.exit(1)
     if MODE == "dump_no_file":
         sys.exit(0)
+    if MODE == "dump_hang":
+        # Like heapspy's writer: a temporary file next to the output, then a hang.
+        (Path(out).parent / ".tmpAbC123").write_bytes(b"partial")
+        time.sleep(30)
     truncated = MODE == "dump_truncated"
     Path(out).write_bytes(b"HPYSNAP\0" + b"\0" * 120)
     trunc = " (truncated)" if truncated else ""

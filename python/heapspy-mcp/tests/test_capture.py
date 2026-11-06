@@ -144,7 +144,14 @@ async def test_live_capture_allowed_by_pid(
     assert out["target"]["allowlist_entry"] == f"pid:{child_python.pid}"
     assert out["stats"]["objects"] == 10
     assert out["contents_captured"] is False
-    assert argv_log()[-1] == ["dump", f"--pid={child_python.pid}", f"--output={path}", "--json"]
+    staged = snapshot_dir / f".{out['snapshot']}.partial" / path.name
+    assert argv_log()[-1] == [
+        "dump",
+        f"--pid={child_python.pid}",
+        f"--output={staged}",
+        "--json",
+    ]
+    assert sorted(p.name for p in snapshot_dir.iterdir()) == [path.name]
     assert out["report"] == "json"
     assert out["stats"]["pause_ms"] == 182.417
     messages = [r.getMessage() for r in caplog.records if r.name == "heapspy_mcp.capture"]
@@ -269,3 +276,26 @@ async def test_capture_with_binary_without_dump_json(call, core_file, argv_log, 
     assert out["stats"]["pause_ms"] is None and out["python_version"] is None
     assert [a[-1] for a in argv_log()] == ["--json", argv_log()[-1][-1]]
     assert "--json" not in argv_log()[-1]
+
+
+async def test_killed_dump_leaves_no_temporary_file(
+    call, core_file, snapshot_dir: Path, monkeypatch
+) -> None:
+    # heapspy writes through a .tmpXXXXXX file next to its output; a dump killed
+    # by the capture timeout must not leave it (or anything else) behind.
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", "dump_hang")
+    err, out = await call(
+        "capture_snapshot", {"core_path": str(core_file), "confirm": True}, capture_timeout=1.0
+    )
+    assert err and out["error"]["code"] == "timeout"
+    assert list(snapshot_dir.iterdir()) == []
+
+
+async def test_failed_dump_removes_staging_directory(
+    call, core_file, snapshot_dir: Path, monkeypatch
+) -> None:
+    for mode in ("dump_fail", "dump_no_file", "error:io"):
+        monkeypatch.setenv("FAKE_HEAPSPY_MODE", mode)
+        err, _ = await call("capture_snapshot", {"core_path": str(core_file), "confirm": True})
+        assert err
+        assert list(snapshot_dir.iterdir()) == []
