@@ -191,6 +191,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "heapspy-alloc"
+version = "0.1.0"
+dependencies = [
+ "heapspy-snapshot",
+ "memmap2",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "heapspy-analyzer"
 version = "0.1.0"
 dependencies = [
