@@ -302,6 +302,12 @@ Captured contents in the extras section (`content`) follow the same rule:
 present only when the header has `CONTENTS_CAPTURED`, cut to `--max-str`
 characters with `...` appended and `CONTENT_TRUNCATED` set when cut. Root
 labels and `source_loc` are always stored; they are names and file paths.
+`source_loc` is built from a code object's `co_filename` and
+`co_firstlineno`, which are code metadata, not data the program handles.
+The analyzer reports it as `source_loc` and `type_location` (see "Source
+locations" in `docs/json-schema.md`). A module's `__file__` is an ordinary
+str value in the module dict, so its text is stored only with contents
+capture.
 
 ### Roots (kind 5), record_len 16
 
