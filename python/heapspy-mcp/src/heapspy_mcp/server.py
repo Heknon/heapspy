@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Annotated, Any, TypeVar
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-from .cli import HeapspyError
+from . import summarize as S
+from .cli import HeapspyCLI, HeapspyError
 from .config import Config
-from .snapshots import SnapshotRefError
+from .snapshots import SnapshotRefError, SnapshotStore
 
 log = logging.getLogger("heapspy_mcp")
 
@@ -66,8 +69,199 @@ def _guard(fn: Callable[[], T]) -> T:
         raise _tool_error({"code": "invalid_argument", "message": str(e)}) from e
 
 
+def _clean_address(address: str) -> str:
+    text = address.strip().lower()
+    if (
+        not text.startswith("0x")
+        or not all(c in "0123456789abcdef" for c in text[2:])
+        or not (2 < len(text) <= 18)
+    ):
+        raise InvalidArgument(
+            f"address {address!r} must be hex with a 0x prefix, e.g. 0x7f3a2c41b0d0"
+        )
+    return text
+
+
+def _clean_type(type_name: str) -> str:
+    text = type_name.strip()
+    if not text or len(text) > 500 or any(c.isspace() or not c.isprintable() for c in text):
+        raise InvalidArgument(f"type {type_name!r} is not a module.qualname type name")
+    return text
+
+
+SnapshotArg = Annotated[
+    str,
+    Field(
+        description="Snapshot handle from capture_snapshot (hs-xxxxxxxx) or a path to a .hpy file."
+    ),
+]
+TopArg = Annotated[
+    int, Field(description=f"How many ranked rows to return per list (1 to {S.MAX_TOP}).")
+]
+
+
 def build_server(config: Config) -> MCPServer:
+    cli = HeapspyCLI(
+        config.heapspy_bin, timeout=config.timeout, capture_timeout=config.capture_timeout
+    )
+    store = SnapshotStore(config.snapshot_dir)
     server = MCPServer("heapspy", instructions=WORKFLOW)
+    read_only = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Summarize a snapshot: the objects that retain the most memory (with the root path "
+            "holding each one and source_hints for map_to_source), the type histogram by "
+            "retained size, and memory accounting (RSS vs. bytes in the object graph). Start "
+            "here after capture_snapshot. If memory.outside_graph_pct is high, most memory is "
+            "native or untracked and the object graph cannot explain it. The report shows what "
+            "is retained now, not where it was allocated."
+        ),
+    )
+    def heap_summary(snapshot: SnapshotArg, top: TopArg = 10) -> dict[str, Any]:
+        def body() -> dict[str, Any]:
+            n = S.clamp(top, 1, S.MAX_TOP)
+            path = store.resolve(snapshot)
+            doc = cli.analyze(path, top=n)
+            return {
+                "snapshot_ref": store.handle_for(path) or str(path),
+                **S.summarize_analyze(doc, n),
+            }
+
+        return _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Show why an object is alive: the labelled chain of references from a GC root "
+            "(module global, thread, frame local) to the object, root first. Give address "
+            "(from heap_summary or type_detail) or type (e.g. app.session.Session; the "
+            "largest instances are traced). Each path has rendered text, hops, and "
+            "source_hints: module.qualname names to pass to map_to_source. The edge just "
+            "before the target (direct_holder) is usually the reference to remove."
+        ),
+    )
+    def retaining_path(
+        snapshot: SnapshotArg,
+        address: Annotated[
+            str | None, Field(description="Object address, 0x-prefixed hex.")
+        ] = None,
+        type: Annotated[
+            str | None, Field(description="Type name, module.qualname or unqualified.")
+        ] = None,
+        max_paths: Annotated[int, Field(description=f"Paths per object (1 to {S.MAX_PATHS}).")] = 3,
+        max_targets: Annotated[
+            int,
+            Field(
+                description=f"With type: how many of the largest instances (1 to {S.MAX_TARGETS})."
+            ),
+        ] = 3,
+    ) -> dict[str, Any]:
+        def body() -> dict[str, Any]:
+            if (address is None) == (type is None):
+                raise InvalidArgument("give exactly one of address or type")
+            paths_n = S.clamp(max_paths, 1, S.MAX_PATHS)
+            path = store.resolve(snapshot)
+            if address is not None:
+                doc = cli.retaining_path(path, _clean_address(address))
+                targets = (doc.get("targets") or [])[:1]
+                result_notes = doc.get("notes")
+                snap = doc.get("snapshot")
+                query = {"by": "address", "value": address}
+                matched = None
+            else:
+                # The CLI traces one address per call; trace the largest instances of the type.
+                tq = cli.query_type(path, _clean_type(type or ""))
+                n = S.clamp(max_targets, 1, S.MAX_TARGETS)
+                targets = []
+                result_notes = list(tq.get("notes") or [])
+                for inst in (tq.get("top_instances") or [])[:n]:
+                    try:
+                        one = cli.retaining_path(path, inst["address"])
+                        targets.extend((one.get("targets") or [])[:1])
+                        for note in one.get("notes") or []:
+                            if note not in result_notes:
+                                result_notes.append(note)
+                    except HeapspyError:
+                        # Fall back to the single shortest path the type query gave.
+                        targets.append(
+                            {
+                                **{
+                                    k: inst.get(k)
+                                    for k in ("address", "type", "shallow_bytes", "retained_bytes")
+                                },
+                                "reachable": inst.get("path") is not None,
+                                "paths": [inst["path"]] if inst.get("path") else [],
+                            }
+                        )
+                snap = tq.get("snapshot")
+                query = {"by": "type", "value": type}
+                matched = {
+                    "matched_types": (tq.get("matched_types") or [])[: S.MAX_MATCHED_TYPES],
+                    "instances": tq.get("instances"),
+                }
+            out: dict[str, Any] = {
+                "snapshot_ref": store.handle_for(path) or str(path),
+                "snapshot": S.snapshot_summary(snap),
+                "query": query,
+                "targets": [S.summarize_target(t, paths_n) for t in targets],
+                "notes": S.notes(result_notes),
+            }
+            if matched is not None:
+                out["type_match"] = matched
+            return out
+
+        return _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Detail for one type: instance count, total shallow and retained size, the largest "
+            "instances with their root paths, and holders (which container types and edges "
+            "reference the instances, grouped, e.g. builtins.dict [<key>] x 400000). Accepts a "
+            "full name (app.session.Session) or an unqualified one (Session). Use it to judge "
+            "whether a type is leaking and who is accumulating it."
+        ),
+    )
+    def type_detail(
+        snapshot: SnapshotArg,
+        type: Annotated[str, Field(description="Type name, module.qualname or unqualified.")],
+        top: TopArg = 10,
+    ) -> dict[str, Any]:
+        def body() -> dict[str, Any]:
+            n = S.clamp(top, 1, S.MAX_TOP)
+            path = store.resolve(snapshot)
+            doc = cli.query_type(path, _clean_type(type))
+            return {
+                "snapshot_ref": store.handle_for(path) or str(path),
+                **S.summarize_type_query(doc, n),
+            }
+
+        return _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Compare two snapshots of the same process: growth by type and by retaining site "
+            "(rendered root path such as sys.modules['app.cache'].__dict__['CACHE']). Sites "
+            "with large delta_retained_bytes are leak candidates; pass the site's names to "
+            "map_to_source. identity_approximate is always true: addresses change between "
+            "dumps, so objects are matched by type and site, not one to one. Do not claim that "
+            "a specific object survived or was freed based on a diff."
+        ),
+    )
+    def diff_snapshots(
+        before: Annotated[str, Field(description="Earlier snapshot: handle or .hpy path.")],
+        after: Annotated[str, Field(description="Later snapshot: handle or .hpy path.")],
+        top: TopArg = 10,
+    ) -> dict[str, Any]:
+        def body() -> dict[str, Any]:
+            n = S.clamp(top, 1, S.MAX_TOP)
+            doc = cli.diff(store.resolve(before), store.resolve(after))
+            return S.summarize_diff(doc, n)
+
+        return _guard(body)
 
     @server.resource(
         "heapspy://workflow",
