@@ -115,6 +115,15 @@ def _current_test(request: pytest.FixtureRequest) -> Iterator[None]:
     harness.CURRENT_TEST[0] = "?"
 
 
+@pytest.fixture(autouse=True)
+def _method_available(request: pytest.FixtureRequest) -> None:
+    method = (
+        request.node.callspec.params.get("method") if hasattr(request.node, "callspec") else None
+    )
+    if method == "minidump" and harness.procdump_binary() is None:
+        pytest.skip("procdump not found; set HEAPSPY_PROCDUMP")
+
+
 @pytest.fixture(scope="session")
 def heapspy_bin() -> Path:
     """``$HEAPSPY_BIN``, else ``cargo build --release`` and use target/release/heapspy."""

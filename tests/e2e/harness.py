@@ -1,7 +1,7 @@
 """Helpers for driving the heapspy binary against victim processes.
 
 Everything platform-specific is in this file and kept to a few functions:
-``gcore`` (Linux) and ``acquisition_methods``.
+``gcore`` (Linux), ``procdump`` (Windows) and ``acquisition_methods``.
 """
 
 from __future__ import annotations
@@ -32,11 +32,15 @@ READY_TIMEOUT = float(os.environ.get("HEAPSPY_E2E_READY_TIMEOUT", "180"))
 def acquisition_methods() -> list[str]:
     """How snapshots are taken on this platform.
 
-    - ``pid``: ``heapspy dump --pid`` (ptrace on Linux).
+    - ``pid``: ``heapspy dump --pid`` (ptrace on Linux; on Windows heapspy
+      writes a temporary minidump itself).
     - ``core``: ``gcore`` then ``heapspy dump --core`` (Linux).
+    - ``minidump``: ``procdump -ma`` then ``heapspy dump --minidump`` (Windows).
     """
     if IS_LINUX:
         return ["pid", "core"]
+    if IS_WINDOWS:
+        return ["pid", "minidump"]
     return ["pid"]
 
 
@@ -229,11 +233,39 @@ def gcore(pid: int, workdir: Path, *, step: str = "gcore") -> Path:
     return core
 
 
+def procdump_binary() -> str | None:
+    """Sysinternals procdump: ``$HEAPSPY_PROCDUMP``, else on PATH."""
+    configured = os.environ.get("HEAPSPY_PROCDUMP")
+    if configured:
+        return configured
+    for name in ("procdump64.exe", "procdump.exe", "procdump"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def procdump(pid: int, workdir: Path, *, step: str = "procdump") -> Path:
+    """Write a full-memory minidump with ``procdump -ma`` (Windows)."""
+    exe = procdump_binary()
+    if exe is None:
+        raise AssertionError("procdump not found; set HEAPSPY_PROCDUMP")
+    out = workdir / f"victim-{pid}.dmp"
+    r = run([exe, "-accepteula", "-ma", str(pid), str(out)], step=step)
+    # procdump exits with a non-zero status even on success on some versions;
+    # the file is what counts.
+    assert out.is_file(), r.describe()
+    return out
+
+
 def image_file(method: str, pid: int, workdir: Path) -> tuple[list[str], Path]:
     """Capture a memory image file of ``pid``; returns the dump args and the file."""
     if method == "core":
         core = gcore(pid, workdir)
         return ["--core", str(core)], core
+    if method == "minidump":
+        dmp = procdump(pid, workdir)
+        return ["--minidump", str(dmp)], dmp
     raise ValueError(method)
 
 
