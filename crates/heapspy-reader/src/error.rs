@@ -13,6 +13,11 @@ pub enum Error {
     #[error("address range {addr:#x}+{len} is not mapped in the image")]
     Unmapped { addr: u64, len: usize },
 
+    /// The target process does not exist (never did, or exited before it
+    /// could be stopped).
+    #[error("no such process: {0}")]
+    NoSuchProcess(String),
+
     /// Permission to read the target was denied (ptrace scope, SeDebugPrivilege, ...).
     #[error("permission denied: {0}")]
     PermissionDenied(String),

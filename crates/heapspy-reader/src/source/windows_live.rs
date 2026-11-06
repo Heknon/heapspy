@@ -199,10 +199,7 @@ fn open_process(pid: u32) -> Result<(OwnedHandle, bool)> {
             ERROR_ACCESS_DENIED if dup => continue,
             ERROR_ACCESS_DENIED => return Err(permission_hint(pid, "cannot open")),
             ERROR_INVALID_PARAMETER => {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no process with id {pid}"),
-                )))
+                return Err(Error::NoSuchProcess(format!("no process with id {pid}")))
             }
             code => return Err(Error::Io(io::Error::from_raw_os_error(code as i32))),
         }
