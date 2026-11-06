@@ -79,11 +79,11 @@ def test_mcp_tools_against_real_heapspy(heapspy_bin, start_victim, tmp_path, pyt
     is_error, refused = results["refused"]
     assert is_error and refused["error"]["reason"] == "not_allowlisted", refused
 
-    # An allowlisted process that is not Python: dump has no --json, so the
-    # server can only pass heapspy's stderr through as code "cli_failed".
+    # An allowlisted process that is not Python: the server reads heapspy's
+    # dump --json error document and passes its code through.
     is_error, not_python = results["not_python"]
     assert is_error, not_python
-    assert not_python["error"]["code"] == "cli_failed", not_python
+    assert not_python["error"]["code"] == "not_python", not_python
     assert "not a CPython process" in not_python["error"]["message"], not_python
 
     # Capture parses heapspy dump's summary line.
