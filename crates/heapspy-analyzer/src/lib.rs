@@ -9,6 +9,7 @@
 //! from the super-root gives shortest retaining paths. All per-object state
 //! is flat `u32`/`u64` arrays indexed by object index.
 
+pub mod allocations;
 mod analysis;
 mod diff;
 mod dominators;

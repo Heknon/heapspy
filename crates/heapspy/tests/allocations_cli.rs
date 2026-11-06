@@ -1,0 +1,246 @@
+//! `heapspy record` and `--allocations` on the command line.
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use heapspy_alloc::{EventKind, ProfileBuilder, PythonVersion};
+use heapspy_analyzer::report::{AnalyzeReport, DiffReport, RetainingPathReport, TypeQueryReport};
+use heapspy_snapshot::{RootKind, SnapshotBuilder};
+
+fn heapspy(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_heapspy"))
+        .args(args)
+        .output()
+        .expect("run heapspy")
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// A snapshot of pid 4242 on CPython 3.12.0, captured at Unix second 2000.
+fn write_snapshot(path: &Path) {
+    let mut b = SnapshotBuilder::new();
+    b.info_mut().source.reference = "4242".into();
+    b.info_mut().captured_at = 2000;
+    let m = b.ty("builtins", "module");
+    let d = b.ty("builtins", "dict");
+    let by = b.ty("builtins", "bytes");
+    b.object(0x1000, m, 72).attr(0x2000, "__dict__");
+    b.object(0x2000, d, 1000).dict_value(0x3000, "'CACHE'");
+    b.object(0x3000, d, 200).dict_value(0x4000, "'k'");
+    b.object(0x4000, by, 4096).untracked();
+    b.root(0x1000, RootKind::ModuleDict, "sys.modules['app']");
+    b.write_to(path).unwrap();
+}
+
+/// A profile recorded from `pid` on 3.12.`micro`, starting at second 1000.
+fn write_profile(path: &Path, pid: u32, micro: u8) {
+    let mut b = ProfileBuilder::new();
+    b.info_mut().pid = pid;
+    b.info_mut().python = PythonVersion::new(3, 12, micro);
+    b.info_mut().start_ns = 1000 * 1_000_000_000;
+    b.info_mut().end_ns = 1060 * 1_000_000_000;
+    let f = b.code_with_lines(0x7f00_1000, "fill", "app.py", 3, &[(16, 4)]);
+    b.sample(EventKind::LargeObject, 0x4000, 4096).frame(f, 2);
+    b.write_to(path).unwrap();
+}
+
+fn notes(v: &[heapspy_analyzer::report::Note]) -> Vec<&str> {
+    v.iter().map(|n| n.code.as_str()).collect()
+}
+
+#[test]
+fn record_is_not_implemented_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("a.hpya");
+    let out = heapspy(&[
+        "record",
+        "--pid",
+        &std::process::id().to_string(),
+        "--duration",
+        "1s",
+        "-o",
+        out_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let e = stderr(&out);
+    assert!(e.contains("not implemented yet"), "{e}");
+    assert!(e.contains("cannot record pid"), "{e}");
+    assert!(!out_path.exists());
+}
+
+#[test]
+fn record_argument_errors() {
+    // Missing --duration and malformed values are usage errors.
+    for args in [
+        &["record", "--pid", "1", "-o", "a.hpya"][..],
+        &[
+            "record",
+            "--pid",
+            "1",
+            "-o",
+            "a.hpya",
+            "--duration",
+            "later",
+        ],
+        &[
+            "record",
+            "--pid",
+            "1",
+            "-o",
+            "a.hpya",
+            "--duration",
+            "1s",
+            "--events",
+            "heap",
+        ],
+        &[
+            "record",
+            "--pid",
+            "1",
+            "-o",
+            "a.hpya",
+            "--duration",
+            "1s",
+            "--mechanism",
+            "x",
+        ],
+    ] {
+        assert_eq!(heapspy(args).status.code(), Some(2), "{args:?}");
+    }
+    // Out-of-range values are checked before anything is attached.
+    let out = heapspy(&["record", "--pid", "1", "-o", "a.hpya", "--duration", "0s"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("duration must be greater than zero"));
+    let out = heapspy(&[
+        "record",
+        "--pid",
+        "1",
+        "-o",
+        "a.hpya",
+        "--duration",
+        "1s",
+        "--max-frames",
+        "0",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("max frames"));
+}
+
+#[test]
+fn allocations_file_errors_are_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("a.hpy");
+    write_snapshot(&snap);
+    let s = snap.to_str().unwrap();
+    let bogus = dir.path().join("bogus.hpya");
+    std::fs::write(&bogus, b"definitely not a profile").unwrap();
+    let missing = dir.path().join("missing.hpya");
+    // A snapshot is not an allocation profile.
+    for (file, code) in [
+        (missing.to_str().unwrap(), "io"),
+        (bogus.to_str().unwrap(), "invalid_allocations"),
+        (s, "invalid_allocations"),
+    ] {
+        for cmd in [
+            vec!["analyze", s, "--json", "--allocations", file],
+            vec![
+                "query",
+                s,
+                "--type",
+                "dict",
+                "--json",
+                "--allocations",
+                file,
+            ],
+            vec!["diff", s, s, "--json", "--allocations", file],
+        ] {
+            let out = heapspy(&cmd);
+            assert_eq!(out.status.code(), Some(1), "{cmd:?}");
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["kind"], "error");
+            assert_eq!(v["error"]["code"], code, "{cmd:?}");
+            let e = stderr(&out);
+            assert!(e.contains("cannot open allocation profile"), "{e}");
+            assert!(!e.contains("panicked"), "{e}");
+        }
+    }
+    // Text mode: same failure, no JSON.
+    let out = heapspy(&["analyze", s, "--allocations", bogus.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(stderr(&out).contains("bad magic"));
+}
+
+#[test]
+fn matching_allocations_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("a.hpy");
+    let prof = dir.path().join("a.hpya");
+    write_snapshot(&snap);
+    write_profile(&prof, 4242, 0);
+    let (s, p) = (snap.to_str().unwrap(), prof.to_str().unwrap());
+
+    let out = heapspy(&["analyze", s, "--json", "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r: AnalyzeReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(notes(&r.notes).last(), Some(&"allocations_not_joined"));
+    assert!(!notes(&r.notes).iter().any(|c| c.ends_with("_mismatch")));
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+
+    let out = heapspy(&["query", s, "--type", "dict", "--json", "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r: TypeQueryReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(notes(&r.notes).contains(&"allocations_not_joined"));
+
+    let out = heapspy(&[
+        "query",
+        s,
+        "--retaining-path",
+        "0x4000",
+        "--json",
+        "--allocations",
+        p,
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let _: RetainingPathReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(stderr(&out).contains("not used by --retaining-path"));
+
+    let out = heapspy(&["diff", s, s, "--json", "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let _: DiffReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(stderr(&out).contains("not used by diff"));
+
+    // Text output works too.
+    let out = heapspy(&["analyze", s, "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Top retainers"));
+}
+
+#[test]
+fn mismatched_allocations_warn() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("a.hpy");
+    let prof = dir.path().join("other.hpya");
+    write_snapshot(&snap);
+    write_profile(&prof, 77, 9);
+    let (s, p) = (snap.to_str().unwrap(), prof.to_str().unwrap());
+
+    let out = heapspy(&["analyze", s, "--json", "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(
+        e.contains("warning: The allocation profile was recorded from pid 77"),
+        "{e}"
+    );
+    assert!(e.contains("CPython 3.12.9"), "{e}");
+    let r: AnalyzeReport = serde_json::from_slice(&out.stdout).unwrap();
+    let codes = notes(&r.notes);
+    assert!(codes.contains(&"allocations_pid_mismatch"), "{codes:?}");
+    assert!(codes.contains(&"allocations_python_mismatch"), "{codes:?}");
+
+    let out = heapspy(&["diff", s, s, "--json", "--allocations", p]);
+    let r: DiffReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(notes(&r.notes).contains(&"allocations_pid_mismatch"));
+}

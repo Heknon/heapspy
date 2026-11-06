@@ -7,10 +7,12 @@ use heapspy_snapshot::Snapshot;
 
 use crate::cli::Command;
 
+mod allocations;
 mod analyze;
 mod diff;
 mod dump;
 mod query;
+mod record;
 
 pub fn run(command: Command) -> anyhow::Result<()> {
     match command {
@@ -18,6 +20,7 @@ pub fn run(command: Command) -> anyhow::Result<()> {
         Command::Analyze(a) => analyze::run(a),
         Command::Query(a) => query::run(a),
         Command::Diff(a) => diff::run(a),
+        Command::Record(a) => record::run(a),
     }
 }
 

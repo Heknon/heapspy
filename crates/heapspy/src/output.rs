@@ -37,6 +37,21 @@ pub fn error_code(err: &anyhow::Error) -> &'static str {
         if let Some(e) = cause.downcast_ref::<heapspy_snapshot::Error>() {
             return snapshot_code(e);
         }
+        if let Some(e) = cause.downcast_ref::<heapspy_alloc::Error>() {
+            return alloc_code(e);
+        }
+        if let Some(e) = cause.downcast_ref::<heapspy_record::Error>() {
+            match e {
+                heapspy_record::Error::Unimplemented(_) => return "unimplemented",
+                heapspy_record::Error::PermissionDenied(_) => return "permission_denied",
+                heapspy_record::Error::InvalidOption(_) => return "invalid_argument",
+                heapspy_record::Error::Alloc(a) => return alloc_code(a),
+                heapspy_record::Error::Io(_) => return "io",
+                // The source error is next in the chain.
+                heapspy_record::Error::Reader(_) => continue,
+                heapspy_record::Error::Unsupported(_) => return "internal",
+            }
+        }
         if cause.is::<InvalidArgument>() {
             return "invalid_argument";
         }
@@ -45,6 +60,13 @@ pub fn error_code(err: &anyhow::Error) -> &'static str {
         }
     }
     "internal"
+}
+
+fn alloc_code(e: &heapspy_alloc::Error) -> &'static str {
+    match e {
+        heapspy_alloc::Error::Io(_) => "io",
+        _ => "invalid_allocations",
+    }
 }
 
 fn snapshot_code(e: &heapspy_snapshot::Error) -> &'static str {

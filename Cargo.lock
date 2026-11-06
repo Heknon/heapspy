@@ -182,8 +182,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "heapspy-alloc",
  "heapspy-analyzer",
  "heapspy-reader",
+ "heapspy-record",
  "heapspy-snapshot",
  "serde",
  "serde_json",
@@ -205,6 +207,7 @@ dependencies = [
 name = "heapspy-analyzer"
 version = "0.1.0"
 dependencies = [
+ "heapspy-alloc",
  "heapspy-snapshot",
  "proptest",
  "serde",
