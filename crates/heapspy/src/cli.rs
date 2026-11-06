@@ -76,7 +76,7 @@ pub struct AnalyzeArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("what").required(true).args(["type_name", "retaining_path"])))]
+#[command(group(clap::ArgGroup::new("what").required(true).args(["type_name", "retaining_path", "retaining_path_type"])))]
 pub struct QueryArgs {
     /// Snapshot file.
     #[arg(value_name = "SNAP")]
@@ -87,6 +87,15 @@ pub struct QueryArgs {
     /// The labelled chain of references keeping one object alive.
     #[arg(long, value_name = "ADDR")]
     pub retaining_path: Option<String>,
+    /// Retaining paths of the largest instances of a type (up to --top).
+    #[arg(long, value_name = "T")]
+    pub retaining_path_type: Option<String>,
+    /// Number of instances, holders, or path targets.
+    #[arg(long, value_name = "N", default_value_t = heapspy_analyzer::DEFAULT_TOP)]
+    pub top: usize,
+    /// Maximum number of retaining paths per object.
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    pub max_paths: usize,
     /// Print the JSON report (schema version 1) instead of text.
     #[arg(long)]
     pub json: bool,
@@ -100,6 +109,9 @@ pub struct DiffArgs {
     /// Later snapshot.
     #[arg(value_name = "AFTER")]
     pub after: PathBuf,
+    /// Number of rows in the by-type and by-site tables.
+    #[arg(long, value_name = "N", default_value_t = heapspy_analyzer::DEFAULT_TOP)]
+    pub top: usize,
     /// Print the JSON report (schema version 1) instead of text.
     #[arg(long)]
     pub json: bool,
