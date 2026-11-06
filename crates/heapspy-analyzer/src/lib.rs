@@ -10,6 +10,7 @@
 //! is flat `u32`/`u64` arrays indexed by object index.
 
 mod analysis;
+mod diff;
 mod dominators;
 mod graph;
 mod notes;
@@ -280,15 +281,17 @@ pub fn retaining_path(
     query::retaining_path(snap, path, target, opts)
 }
 
-/// Growth by type and by retaining site between two snapshots. **Stub.**
+/// Growth by type and by retaining site between two snapshots. Objects are
+/// matched by type name and by site (a label path through the dominator
+/// tree), never by address; see the `diff` module docs for the site rule.
 pub fn diff(
-    _before: &Snapshot,
-    _before_path: &str,
-    _after: &Snapshot,
-    _after_path: &str,
-    _opts: &DiffOptions,
+    before: &Snapshot,
+    before_path: &str,
+    after: &Snapshot,
+    after_path: &str,
+    opts: &DiffOptions,
 ) -> Result<DiffReport> {
-    Err(Error::Unimplemented("diff"))
+    diff::diff(before, before_path, after, after_path, opts)
 }
 
 #[cfg(test)]

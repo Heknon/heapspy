@@ -311,6 +311,32 @@ SiteGrowth:
 | `before_retained_objects`, `after_retained_objects` | integer | |
 | `delta_retained_objects` | signed integer | |
 
+How sites are built. A site is a position in the dominator tree, named by
+labels so that it can be found again in another dump:
+
+- The site of a root object is its root label. When an object is a root
+  more than once, one entry is chosen: `module_dict` first, then
+  `frame_local`, `thread_locals`, `interp`, `other`, ties broken by label.
+- The site of any other object is the site of its immediate dominator plus
+  the label of the edge into the object, joined as in a root path. If the
+  object's shortest-path parent is not its immediate dominator (it is
+  reached through several objects its dominator owns), the label is written
+  as `...` followed by the label of the last edge, e.g.
+  `sys.modules['app'].__dict__['PENDING']...[<index>]`.
+- List and tuple indices are generalised to `[<index>]`, since positions
+  shift as a container changes.
+- Only the first 6 levels of the dominator tree get sites (level 1 is the
+  root objects). Deeper objects are counted in the retained size of their
+  ancestor's site.
+- Objects that end up with the same site are summed: every value of a dict
+  with redacted keys of one length, every item of one list. `type` is the
+  type of the largest contributor.
+
+Which sites are listed: sites whose retained bytes and objects did not
+change are left out, and so is a site whose change is at least 90% in one of
+its child sites (with the same sign). Growth in `CACHE` also shows as growth
+in the module and the module's `__dict__`; only `CACHE` is listed.
+
 ## `error`
 
 Printed on stdout by any `--json` command that fails, followed by exit
