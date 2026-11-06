@@ -202,18 +202,20 @@ class HeapspyCLI:
         self, snapshot: Path, *, top: int, allocations: Path | None = None
     ) -> dict[str, Any]:
         args = ["analyze", str(snapshot), "--json", f"--top={top}"]
-        if allocations is not None:
-            args.append(f"--allocations={allocations}")
-        return self.run_json(args, "analyze")
+        if allocations is None:
+            return self.run_json(args, "analyze")
+        args.append(f"--allocations={allocations}")
+        return _require_join(self.run_json(args, "analyze"))
 
     def query_type(
         self, snapshot: Path, type_name: str, *, allocations: Path | None = None
     ) -> dict[str, Any]:
         # `--type=VALUE` so a value starting with '-' is not read as a flag.
         args = ["query", str(snapshot), f"--type={type_name}", "--json"]
-        if allocations is not None:
-            args.append(f"--allocations={allocations}")
-        return self.run_json(args, "type_query")
+        if allocations is None:
+            return self.run_json(args, "type_query")
+        args.append(f"--allocations={allocations}")
+        return _require_join(self.run_json(args, "type_query"))
 
     def retaining_path(self, snapshot: Path, address: str) -> dict[str, Any]:
         return self.run_json(
@@ -443,6 +445,26 @@ def _dump_from_stderr(output: Path, proc: subprocess.CompletedProcess[str]) -> D
         truncated=bool(stats.group("truncated")) if stats else None,
         stderr=_tail(proc.stderr or ""),
     )
+
+
+def _require_join(doc: dict[str, Any]) -> dict[str, Any]:
+    """Refuse a report from a heapspy that takes ``--allocations`` but has no join.
+
+    Such a heapspy (``feature/alloc-format``, PR #16, without PR #19) checks the
+    profile against the snapshot, then reports ``allocations`` and every
+    ``allocated_at`` as null with the note ``allocations_not_joined``.
+    """
+    notes = doc.get("notes")
+    if isinstance(notes, list) and any(
+        isinstance(n, dict) and n.get("code") == "allocations_not_joined" for n in notes
+    ):
+        raise HeapspyError(
+            "allocations_unsupported",
+            "this heapspy checks allocation profiles but does not join them with snapshots "
+            "(note allocations_not_joined)",
+            exit_status=0,
+        )
+    return doc
 
 
 def _parse_document(stdout: str, stderr: str | None, status: int) -> dict[str, Any]:
