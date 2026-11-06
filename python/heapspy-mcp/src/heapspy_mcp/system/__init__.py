@@ -30,7 +30,7 @@ from . import perf, probe, stalls, views, windows
 from . import procfs as pf
 from . import search as srch
 from .redact import redact_cmdline
-from .sampling import ProcessGone, identify, list_tids
+from .sampling import ProcessGone, identify, list_tids, sample_process
 
 T = TypeVar("T")
 
@@ -583,8 +583,6 @@ def register(server: MCPServer, config: Config) -> None:
 
     def sample_or_none(pid: int) -> Any:
         try:
-            from .sampling import sample_process
-
             return sample_process(d.proc_root, pid, grp.MAX_THREADS_PER_MEMBER)
         except ProcessGone:
             return None
