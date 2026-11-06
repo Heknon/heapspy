@@ -52,8 +52,12 @@
 //! (128) frames: `--max-frames` above 128 is clamped and such samples are
 //! marked `STACK_TRUNCATED`. For each frame it sends the code pointer, the
 //! instruction pointer and the object's type; user space keeps frames whose
-//! type is `code` (the `tp_name` test of `read_stack`) and computes the
-//! instruction offset. A thread with no thread state gives a sample without
+//! type is `code` and whose code object is not CPython's shim code (the
+//! `tp_name` and `co_flags` tests of `read_stack`, see
+//! [`heapspy_reader::cpython::frames`], "Shim frames") and computes the
+//! instruction offset. The `_Py_InitCleanup` frame of 3.13 and 3.14 is
+//! told apart in user space only: the kernel program copies it like any
+//! other frame. A thread with no thread state gives a sample without
 //! frames (`NO_THREAD_STATE`).
 //!
 //! # User space
@@ -518,7 +522,7 @@ mod imp {
             let fo = ctx.target.offsets;
             let mut frames = Vec::with_capacity(e.frames.len());
             for f in &e.frames {
-                if self.types.is_code(ctx.src, &fo, f.ob_type) {
+                if self.types.keep(ctx.src, &fo, f.ob_type, f.executable) {
                     frames.push(common::raw_frame(&fo, f.executable, f.instr_ptr));
                 }
             }

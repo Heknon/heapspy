@@ -228,6 +228,14 @@ slots from `co_nlocalsplus` up to the stack top are value-stack entries.
 
 ## Stacks for allocation recorders
 
+Frames that run no Python code of the program are skipped: entry frames by
+owner (`owner >= owner_first_shim`: `FRAME_OWNED_BY_CSTACK` = 3 on 3.12 and
+3.13, `FRAME_OWNED_BY_INTERPRETER` = 3 on 3.14), and on 3.13 and 3.14 the
+`_Py_InitCleanup` frame under a specialized class call's `__init__`, an
+ordinary `FRAME_OWNED_BY_THREAD` frame recognised by
+`CO_NO_MONITORING_EVENTS` (0x2000000) in its code object's `co_flags`
+(offset 48 on all three versions). See `cpython::frames`, "Shim frames".
+
 `heapspy record` (M7) reads each allocating thread's Python stack as
 (code object address, instruction offset) pairs.
 `cpython::frames::FrameOffsets` is the subset of the table it needs, with
