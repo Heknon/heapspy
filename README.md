@@ -100,6 +100,17 @@ heapspy diff before.hpy after.hpy
 
 `diff` reports growth by type and by retaining site. Object addresses change between dumps, so matching individual objects across snapshots is approximate. The output says so and reports aggregates.
 
+### Record where memory is allocated (M7, in progress)
+
+```sh
+# Sample allocations with their Python stacks for 60 s, then take a snapshot
+heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
+
+heapspy analyze app.hpy --allocations app.hpya
+```
+
+`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The command and the `--allocations` flag on `analyze`, `query` and `diff` are wired up, and the `.hpya` file format is final for version 1. The recorders and the join are not implemented yet: `record` exits with a "not implemented yet" error, and `--allocations` checks the file against the snapshot but adds no allocation data. See [docs/allocation-sampling.md](docs/allocation-sampling.md).
+
 ### JSON output
 
 Every analysis command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it.
@@ -185,8 +196,12 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `crates/heapspy-snapshot` | snapshot file format: types, streaming writer, mmap reader, test builder |
 | `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
 | `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
+| `crates/heapspy-alloc` | allocation profile format (`.hpya`): types, streaming writer, mmap reader, line tables, test builder |
+| `crates/heapspy-record` | `heapspy record`: recorder interface and options; eBPF, ptrace and Windows recorders (stubs) |
 | `crates/heapspy` | the `heapspy` command-line tool |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
+| `docs/alloc-format.md` | byte-level specification of `.hpya` files |
+| `docs/allocation-sampling.md` | M7 design: allocation sampling from outside the process |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and how CI is run.

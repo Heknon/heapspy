@@ -1,6 +1,6 @@
 # Allocation sampling (M7): design
 
-Status: proposed. Nothing here is implemented. This document fixes the goals and the mechanisms before the spike, and lists what the spike has to verify.
+Status: in progress. The shared contracts are in place: the `.hpya` format ([docs/alloc-format.md](alloc-format.md), `crates/heapspy-alloc`), the recorder interface (`crates/heapspy-record`), the frame offsets recorders read stacks with (`heapspy_reader::cpython::frames`), the `record` command and `--allocations` flags, and the report fields ([docs/json-schema.md](json-schema.md#allocations)). The recorders (M7a, M7b) and the join (M7c) are stubs. [Decisions](#decisions) records what was settled while building the contracts. The spike checklist at the end is still open.
 
 ## Why
 
@@ -84,7 +84,7 @@ Both need an elevated process with `SeDebugPrivilege`. ETW heap tracing on an al
 
 ## Sidecar format (`.hpya`)
 
-This uses the same container conventions as `.hpy`: magic `HPYA`, a versioned header, and a section table. It holds:
+Specified byte for byte in [docs/alloc-format.md](alloc-format.md). This uses the same container conventions as `.hpy`: magic `HPYA`, a versioned header, and a section table. It holds:
 
 - **header:** pid, python version, start and end time, the mechanisms used, sampling parameters, and the measured overhead
 - **string table** and **code table:** code address → qualname, filename, first line, and the line table bytes needed to map instruction offsets to lines
@@ -95,8 +95,54 @@ This uses the same container conventions as `.hpy`: magic `HPYA`, a versioned he
 
 - **By address.** If an object's address falls inside a sampled pool or large allocation, and no later sample covers that range, the object is linked to that sample. This gives a per-object `allocated_at` for some objects. Only some get one, because only a sample of allocations is recorded.
 - **By site.** Sampled growth bytes are aggregated by Python stack, and the stacks that produced the most growth are shown next to the top retainers. For each retainer, the stacks of the linked objects in its dominator subtree are summed.
-- **Report additions** (schema v1, additive): `allocations` on `AnalyzeReport` (top growth stacks, sampling parameters, the approximate flag) and `allocated_at` on retainer entries. Older consumers ignore both.
+- **Report additions** (schema v1, additive): `allocations` on `AnalyzeReport` (top growth stacks, sampling parameters, the approximate flag, coverage) and `allocated_at` on retainer entries and on `query --type` instances. Older consumers ignore both. Defined in [docs/json-schema.md](json-schema.md#allocations).
 - **MCP:** a new `allocation_sites` tool, and `heap_summary` passes `allocated_at` through when a sidecar is given.
+
+## Decisions
+
+Settled while building the shared contracts, before the recorders.
+
+**Crates.**
+- `heapspy-alloc` is the format: types, `AllocWriter`, `Profile`, the line-table decoder and `ProfileBuilder` for tests. It depends only on `heapspy-snapshot` (for `PythonVersion`, `Os`, `Arch`), so the analyzer can read profiles without pulling in recorders.
+- `heapspy-record` holds the recorders and what they share: `RecordOptions`, the `Recorder` trait, `Target`, `SampleSink`, and `record` / `record_with`, which own the header, the overhead fields and the file. It depends on `heapspy-reader` and `heapspy-alloc`. Platform crates (`aya`, ETW bindings) go here, behind `cfg`.
+- The join lives in `heapspy-analyzer::allocations` (`analyze_with_allocations`, `query_type_with_allocations`), next to the dominator tree it needs.
+
+**CPython offsets for recorders.** A recorder calls `Target::locate`, which runs `heapspy_reader::cpython::locate_runtime` and `cpython::frame_offsets` on a reader of the running process. That is the same code and the same per-version tables the snapshot walker uses, with `_Py_DebugOffsets` applied on 3.13+. `FrameOffsets` is the subset needed to go from `_PyRuntime` to each thread state, along the frame chain, and into code objects. It is plain `Copy` data, so the eBPF recorder copies it into a map. `cpython::frames::{thread_states, read_stack, read_code}` are the user-space reference for the same walk; the ptrace, debugger and ETW-sampler paths use them directly. Two fields were added to the offset table for this: `instr_ptr` (`prev_instr` on 3.12, 56 on all three versions) and `co_code_adaptive` (192, 200, 208). An ignored test reads the stack of running 3.12, 3.13 and 3.14 processes and checks every frame's function and line.
+
+**Reading a running process.** `heapspy dump`'s live sources stop the target, which a recorder must not do. `heapspy_record::live::open` is the seam for a reader that never stops it: `process_vm_readv` on Linux, `ReadProcessMemory` on Windows. It is a stub, with notes, for M7a and M7b to fill in.
+
+**Code objects.**
+- Frames are recorded as (code object address, instruction offset).
+- `SampleSink` reads each code object the first time its address appears, while the frame using it is executing and the object is alive. This replaces "after recording stops" above: by then a short-lived code object (a lambda, exec'd code) may be gone. The snapshot's `source_loc` extras remain a fallback for entries left unresolved.
+- Code entries are keyed by address but not unique: an address can be reused during the window, and a recorder that notices this starts a new entry (`SampleSink::refresh_code`). Frames refer to entries by id.
+
+**Instruction offsets and lines.**
+- The offset is `instr_ptr - _PyCode_CODE(code)` in bytes, which is `f_lasti` on every supported version.
+- The code table stores raw `co_linetable` bytes with a format code. Format 1, the 3.11 to 3.14 location table, is decoded in `heapspy_alloc::linetable` and checked against `co_positions()` of real code objects from 3.12, 3.13 and 3.14.
+- A frame that has not started (3.12 `prev_instr` before the code) has no offset and resolves to `co_firstlineno`, as `PyCode_Addr2Line` does.
+
+**Samples.**
+- Timestamps are Unix-epoch nanoseconds.
+- The file is sorted by time, so "a later sample covers this address" in the join is "a sample with a higher index".
+- Arena and pool samples weigh their size. Large objects use a Poisson byte sampler: keep with probability `1 - exp(-size / interval)` and weigh `size / p` (`heapspy_alloc::sampled_weight`).
+- Frames are innermost first, with flags for approximate frames (ETW), a truncated stack, and a native thread with no thread state.
+
+**Defaults.** `--events arena,large`, `--interval 512K`, `--max-frames 64` (at most 1024). The interval is provisional until the spike measures the uprobe overhead.
+
+**Mechanism selection.**
+- `--mechanism auto` on Linux tries eBPF, then ptrace. Each recorder's `probe` returns `Unsupported` or `PermissionDenied` to move on.
+- On Windows, `auto` runs ETW and debugger breakpoints together. `etw` or `debugger` runs one; with `debugger` alone, only arenas are recorded.
+- The ptrace fallback records arenas only. It notes the event kinds it skipped in the `heapspy.skipped_events` meta key instead of failing.
+
+**Failure handling.** A recording that fails writes no file; the writer only renames its temporary file into place on success.
+
+**Joining, until M7c.**
+- `--allocations` opens and validates the profile. It then checks the profile against the snapshot (`AFTER` for diff): the pid (for live-process snapshots), the CPython version, and that the snapshot was not taken before recording started.
+- A mismatch is a warning on stderr and a note in the report (`allocations_pid_mismatch`, `allocations_python_mismatch`, `allocations_after_snapshot`).
+- While the join is a stub, `analyze` and `query --type` print the plain report with an `allocations_not_joined` note. `diff` and `--retaining-path` have no allocation fields and only check the profile.
+- A missing profile is error code `io`. A corrupt one is `invalid_allocations`.
+
+**Report fields.** The new fields are always present in new documents (`null` without `--allocations`), as the schema rules require. They deserialize to `null` when missing, so documents from older versions still parse.
 
 ## Milestones
 
