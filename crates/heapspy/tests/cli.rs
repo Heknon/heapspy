@@ -200,3 +200,108 @@ fn usage_errors_exit_2() {
     assert_eq!(heapspy(&["dump", "-o", "x"]).status.code(), Some(2));
     assert_eq!(heapspy(&["frobnicate"]).status.code(), Some(2));
 }
+
+#[test]
+fn flamegraph_svg_and_folded() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.hpy");
+    write_cache(&p, 40);
+    let snap = p.to_str().unwrap();
+    let svg_path = dir.path().join("a.svg");
+    ok_stdout(&["flamegraph", snap, "-o", svg_path.to_str().unwrap()]);
+    let svg = std::fs::read_to_string(&svg_path).unwrap();
+    assert!(svg.starts_with("<?xml"), "{}", &svg[..100]);
+    assert!(svg.contains("heapspy retention flame graph"));
+    assert!(svg.contains("CPython 3.12.0"));
+    assert!(svg.contains("CACHE"));
+    assert!(svg.contains(" bytes, "));
+    // Deterministic, colors included.
+    let again = dir.path().join("b.svg");
+    ok_stdout(&["flamegraph", snap, "-o", again.to_str().unwrap()]);
+    assert_eq!(svg, std::fs::read_to_string(&again).unwrap());
+
+    let titled = dir.path().join("t.svg");
+    ok_stdout(&[
+        "flamegraph",
+        snap,
+        "--title",
+        "my service",
+        "-o",
+        titled.to_str().unwrap(),
+    ]);
+    assert!(std::fs::read_to_string(&titled)
+        .unwrap()
+        .contains("my service"));
+
+    let folded = ok_stdout(&["flamegraph", snap, "--folded", "--min-bytes", "0"]);
+    let total: u64 = folded
+        .lines()
+        .map(|l| l.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(total, 72 + 1000 + 100 + 8 * 40 + 40 * 1024);
+    assert!(folded
+        .contains("sys.modules['app'];.__dict__ dict;['CACHE'] dict;[<str len=9>] bytes 40960\n"));
+    let shallow = ok_stdout(&["flamegraph", snap, "--folded", "--max-depth", "1"]);
+    assert_eq!(
+        shallow,
+        format!(
+            "sys.modules['app'] 72\nsys.modules['app'];[other] {}\n",
+            total - 72
+        )
+    );
+}
+
+#[test]
+fn flamegraph_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b, a) = (dir.path().join("b.hpy"), dir.path().join("a.hpy"));
+    write_cache(&b, 3);
+    write_cache(&a, 30);
+    let (b, a) = (b.to_str().unwrap(), a.to_str().unwrap());
+    let folded = ok_stdout(&["flamegraph", "--diff", b, a, "--folded"]);
+    assert!(
+        folded.contains("['CACHE'] dict;[<str len=9>] bytes 3072 30720\n"),
+        "{folded}"
+    );
+    let svg_path = dir.path().join("d.svg");
+    ok_stdout(&[
+        "flamegraph",
+        "--diff",
+        b,
+        a,
+        "-o",
+        svg_path.to_str().unwrap(),
+    ]);
+    let svg = std::fs::read_to_string(&svg_path).unwrap();
+    assert!(svg.contains("heapspy retention flame graph (diff)"));
+    assert!(svg.contains("approximate"));
+    assert!(svg.contains("red grew, blue shrank"));
+}
+
+#[test]
+fn flamegraph_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("x.svg");
+    let out = heapspy(&[
+        "flamegraph",
+        "missing.hpy",
+        "-o",
+        out_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("cannot open snapshot missing.hpy"));
+    assert!(!out_path.exists());
+    assert_eq!(heapspy(&["flamegraph"]).status.code(), Some(2));
+    assert_eq!(
+        heapspy(&["flamegraph", "--diff", "a.hpy"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(
+        heapspy(&["flamegraph", "s.hpy", "--min-pct", "x"])
+            .status
+            .code(),
+        Some(2)
+    );
+}

@@ -25,6 +25,8 @@ pub enum Command {
     Query(QueryArgs),
     /// Growth by type and by retaining site between two snapshots.
     Diff(DiffArgs),
+    /// Retention flame graph (SVG or folded stacks), or a differential one.
+    Flamegraph(FlamegraphArgs),
 }
 
 impl Command {
@@ -35,6 +37,7 @@ impl Command {
             Command::Analyze(a) => a.json,
             Command::Query(a) => a.json,
             Command::Diff(a) => a.json,
+            Command::Flamegraph(_) => false,
         }
     }
 }
@@ -117,6 +120,51 @@ pub struct DiffArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct FlamegraphArgs {
+    /// Snapshot file.
+    #[arg(
+        value_name = "SNAP",
+        required_unless_present = "diff",
+        conflicts_with = "diff"
+    )]
+    pub snapshot: Option<PathBuf>,
+    /// Differential flame graph: frames that grew from BEFORE to AFTER are
+    /// red, frames that shrank are blue.
+    #[arg(long, num_args = 2, value_names = ["BEFORE", "AFTER"])]
+    pub diff: Option<Vec<PathBuf>>,
+    /// Output path. Without it the output goes to stdout.
+    #[arg(short = 'o', long = "output", value_name = "OUT")]
+    pub output: Option<PathBuf>,
+    /// Write folded stacks (`frame;frame bytes`, or `stack before after`
+    /// with --diff) instead of an SVG.
+    #[arg(long)]
+    pub folded: bool,
+    /// Fold frames narrower than N bytes into `[other]`.
+    #[arg(long, value_name = "N", conflicts_with = "min_pct")]
+    pub min_bytes: Option<u64>,
+    /// Fold frames narrower than P percent of the reachable bytes into
+    /// `[other]` [default: 0.01].
+    #[arg(long, value_name = "P", value_parser = parse_pct)]
+    pub min_pct: Option<f64>,
+    /// Fold objects more than N levels below a root into `[other]`.
+    #[arg(long, value_name = "N", default_value_t = heapspy_analyzer::flame::DEFAULT_MAX_DEPTH,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_depth: u32,
+    /// SVG title.
+    #[arg(long, value_name = "T")]
+    pub title: Option<String>,
+}
+
+fn parse_pct(s: &str) -> Result<f64, String> {
+    let p: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if (0.0..=100.0).contains(&p) {
+        Ok(p)
+    } else {
+        Err(format!("{p} is not between 0 and 100"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +224,42 @@ mod tests {
         assert!(
             Cli::try_parse_from(["heapspy", "query", "s.hpy", "--type", "a.B", "--json"]).is_ok()
         );
+    }
+
+    #[test]
+    fn flamegraph_takes_one_snapshot_or_a_diff() {
+        let ok = |a: &[&str]| Cli::try_parse_from(a).is_ok();
+        assert!(ok(&["heapspy", "flamegraph", "s.hpy", "-o", "x.svg"]));
+        assert!(ok(&[
+            "heapspy",
+            "flamegraph",
+            "--diff",
+            "a",
+            "b",
+            "-o",
+            "x.svg"
+        ]));
+        assert!(ok(&[
+            "heapspy",
+            "flamegraph",
+            "s.hpy",
+            "--folded",
+            "--min-pct",
+            "1"
+        ]));
+        assert!(!ok(&["heapspy", "flamegraph"]));
+        assert!(!ok(&["heapspy", "flamegraph", "s.hpy", "--diff", "a", "b"]));
+        assert!(!ok(&["heapspy", "flamegraph", "--diff", "a"]));
+        assert!(!ok(&[
+            "heapspy",
+            "flamegraph",
+            "s",
+            "--min-bytes",
+            "1",
+            "--min-pct",
+            "1"
+        ]));
+        assert!(!ok(&["heapspy", "flamegraph", "s", "--min-pct", "150"]));
+        assert!(!ok(&["heapspy", "flamegraph", "s", "--max-depth", "0"]));
     }
 }
