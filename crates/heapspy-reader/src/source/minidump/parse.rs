@@ -185,6 +185,17 @@ pub(super) struct DirEntry {
 
 pub(super) fn directory(file: Bytes, h: &Header) -> Result<Vec<DirEntry>> {
     const WHAT: &str = "stream directory";
+    let dir_end = h
+        .stream_count
+        .saturating_mul(DIRECTORY_ENTRY_SIZE)
+        .saturating_add(h.directory_rva);
+    if dir_end > file.len() {
+        return Err(Error::Truncated(format!(
+            "minidump: the stream directory ends at {dir_end:#x}, past the end of the file \
+             ({:#x} bytes)",
+            file.len()
+        )));
+    }
     file.records(h.directory_rva, h.stream_count, DIRECTORY_ENTRY_SIZE, WHAT)?;
     let mut out = Vec::with_capacity(h.stream_count as usize);
     for i in 0..h.stream_count {

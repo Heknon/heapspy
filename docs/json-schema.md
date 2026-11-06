@@ -418,7 +418,7 @@ status 1. Example: `docs/examples/error.json`.
 | `not_python` | dump: no CPython runtime in the target (no module exports `_PyRuntime`, or it could not be read) |
 | `unsupported_python` | dump: CPython was found, but its version or build is refused (outside 3.12 to 3.14, free-threaded, or debug) |
 | `invalid_image` | dump: the core or minidump is not one heapspy reads (not an ELF core or minidump, corrupt, 32-bit, big-endian, another CPU), or memory the runtime points to is not in the image |
-| `truncated_image` | dump: the image file ends before data its own headers describe (cut short by a size limit or a full disk), and the dump could not go on. A core cut only inside memory segments can still give a snapshot, marked `truncated` |
+| `truncated_image` | dump: the image file ends before data its own headers describe (cut short by a size limit or a full disk), and the dump could not go on. A core cut only inside memory segments can still give a snapshot, marked `truncated`. A minidump cut inside data that only a stream refers to (a module or thread name) is reported as `invalid_image` |
 | `unsupported` | dump: the request cannot be done here (dumping heapspy itself, a live process on a platform without a live backend, a target that keeps creating threads while it is being stopped) |
 | `internal` | a bug in heapspy |
 

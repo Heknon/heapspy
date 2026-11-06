@@ -446,15 +446,31 @@ fn every_truncation_errors() {
 
 #[test]
 fn a_cut_minidump_is_truncated() {
-    // Directory first, stream data after it: cutting the tail leaves a
-    // directory entry that points past the end of the file.
-    let full = DumpBuilder {
-        data_first: false,
-        ..sample()
+    // A cut that loses the directory, a stream or captured memory is
+    // Truncated. Data that only a stream points to (module names, CodeView
+    // records) is checked where it is read, as Format.
+    let mut truncated = 0;
+    for data_first in [false, true] {
+        let full = DumpBuilder {
+            data_first,
+            ..sample()
+        }
+        .build();
+        for len in parse::HEADER_SIZE as usize..full.len() {
+            match Minidump::from_bytes(full[..len].to_vec(), MinidumpOptions::default()) {
+                Err(Error::Truncated(_)) => truncated += 1,
+                Err(Error::Format(_)) => {}
+                r => panic!("prefix of {len} (data_first={data_first}): {:?}", r.err()),
+            }
+        }
+        if !data_first {
+            // Captured memory comes last, as MiniDumpWriteDump writes it.
+            let r =
+                Minidump::from_bytes(full[..full.len() - 1].to_vec(), MinidumpOptions::default());
+            assert!(matches!(r, Err(Error::Truncated(_))), "{:?}", r.err());
+        }
     }
-    .build();
-    let r = Minidump::from_bytes(full[..full.len() - 1].to_vec(), MinidumpOptions::default());
-    assert!(matches!(r, Err(Error::Truncated(_))), "{:?}", r.err());
+    assert!(truncated > 0);
 }
 
 #[test]
