@@ -175,6 +175,7 @@ dependencies = [
  "memmap2",
  "tempfile",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]

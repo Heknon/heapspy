@@ -9,6 +9,7 @@
 //! | [`elf_core`] | Linux ELF core file (`gcore`, kernel core dump) | stub |
 //! | [`linux_live`] | live Linux process via `process_vm_readv` | stub |
 //! | [`minidump`] | Windows full-memory minidump | implemented |
+//! | `windows_live` | live Windows process, via a temporary full minidump (`cfg(windows)`) | implemented |
 //! | [`mem`] | in-memory segments, for tests | implemented |
 //!
 //! # Contract for implementers
@@ -40,6 +41,8 @@ pub mod elf_core;
 pub mod linux_live;
 pub mod mem;
 pub mod minidump;
+#[cfg(windows)]
+pub mod windows_live;
 
 /// Static facts about the target, known as soon as the source is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,22 +329,29 @@ impl SourceSpec {
     }
 }
 
+/// Open the backend for `spec`. Same as [`open_in`] with the system
+/// temporary directory as the scratch directory.
+pub fn open(spec: &SourceSpec) -> Result<Box<dyn MemorySource>> {
+    open_in(spec, &std::env::temp_dir())
+}
+
 /// Open the backend for `spec`.
 ///
-/// `--pid` maps to [`linux_live`] on Linux. On Windows a live backend
-/// (`ReadProcessMemory`) is planned; until then it returns
-/// [`Error::Unimplemented`].
-pub fn open(spec: &SourceSpec) -> Result<Box<dyn MemorySource>> {
+/// `--pid` maps to [`linux_live`] on Linux. On Windows it writes a
+/// full-memory minidump of the target to a temporary file in `scratch_dir`
+/// (deleted when the source is dropped) and reads that; see
+/// `windows_live`. Pass the snapshot's output directory so the dump lands
+/// on a volume with room for it. Other backends ignore `scratch_dir`.
+pub fn open_in(
+    spec: &SourceSpec,
+    #[cfg_attr(not(windows), allow(unused_variables))] scratch_dir: &std::path::Path,
+) -> Result<Box<dyn MemorySource>> {
     Ok(match spec {
         SourceSpec::Core(p) => Box::new(elf_core::ElfCore::open(p)?),
         SourceSpec::Minidump(p) => Box::new(minidump::Minidump::open(p)?),
-        SourceSpec::Pid(pid) => {
-            if cfg!(windows) {
-                return Err(Error::Unimplemented(
-                    "live process reading on Windows (use --minidump)",
-                ));
-            }
-            Box::new(linux_live::LiveProcess::attach(*pid)?)
-        }
+        #[cfg(windows)]
+        SourceSpec::Pid(pid) => Box::new(windows_live::capture(*pid, scratch_dir)?),
+        #[cfg(not(windows))]
+        SourceSpec::Pid(pid) => Box::new(linux_live::LiveProcess::attach(*pid)?),
     })
 }

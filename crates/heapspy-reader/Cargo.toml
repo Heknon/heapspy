@@ -12,5 +12,8 @@ heapspy-snapshot.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 tempfile.workspace = true
