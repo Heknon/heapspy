@@ -139,9 +139,9 @@ Out of scope for v1: allocation call chains, per-object native or C-extension me
 
 ## Agent integration: heapspy-mcp
 
-A second package, `heapspy-mcp`, will expose heapspy to coding agents over the Model Context Protocol. It shells out to the `heapspy` binary and parses `--json`. The intended loop: capture a snapshot, summarize it, pick a suspect, trace what retains it, map the holder to `file:line` in your repo, read the code, diagnose.
+A second package, `heapspy-mcp` in [`python/heapspy-mcp`](python/heapspy-mcp/README.md), exposes heapspy to coding agents over the Model Context Protocol. It shells out to the `heapspy` binary and parses `--json`. The intended loop: capture a snapshot, summarize it, pick a suspect, trace what retains it, map the holder to `file:line` in your repo, read the code, diagnose. It is built and tested against the documented JSON schema; it becomes useful once `dump` and the analyzer work.
 
-Planned tools:
+Tools:
 
 | Tool | Purpose |
 |---|---|
@@ -187,6 +187,7 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `crates/heapspy` | the `heapspy` command-line tool |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
+| `python/heapspy-mcp` | the `heapspy-mcp` MCP server (Python) |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and how CI is run.
 
