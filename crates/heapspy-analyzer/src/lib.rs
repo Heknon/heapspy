@@ -12,6 +12,7 @@
 //! [`folded_stacks`] and [`folded_diff`] turn the dominator tree into folded
 //! stacks for a retention flame graph; see the [`flame`] module.
 
+pub mod allocations;
 mod analysis;
 mod diff;
 mod dominators;
@@ -202,6 +203,17 @@ fn memory_totals(snap: &Snapshot, graph_bytes: u64) -> Result<MemoryTotals> {
 /// Dominator tree, retained sizes, top retainers, type histogram.
 pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let a = Analysis::new(snap)?;
+    Ok(analyze_with(&a, path, opts)?.0)
+}
+
+/// The analyze report of an analysed snapshot, and the node of each entry
+/// of `top_retainers`, in order.
+pub(crate) fn analyze_with(
+    a: &Analysis,
+    path: &str,
+    opts: &AnalyzeOptions,
+) -> Result<(AnalyzeReport, Vec<u32>)> {
+    let snap = a.snap;
     let reachable_bytes = a.reachable_bytes();
     let reachable_objects = a.reachable_objects();
     let totals = Totals {
@@ -219,7 +231,8 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
     let memory = memory_totals(snap, a.shallow_total)?;
 
     let mut top_retainers = Vec::new();
-    for (i, v) in a.top_retainers(opts.top)?.into_iter().enumerate() {
+    let nodes = a.top_retainers(opts.top)?;
+    for (i, &v) in nodes.iter().enumerate() {
         let o = snap.object(v);
         let bytes = a.retained[v as usize];
         let (type_location, type_location_reason) = a.type_location(v)?;
@@ -232,6 +245,7 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
             retained_objects: a.retained_count[v as usize] as u64,
             retained_pct: pct(bytes, reachable_bytes),
             path: a.path(v)?.unwrap_or_default(),
+            allocated_at: None,
             type_location,
             type_location_reason,
         });
@@ -266,7 +280,7 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
         notes.push(notes::missing_roots(a.g.missing_roots));
     }
 
-    Ok(AnalyzeReport {
+    let report = AnalyzeReport {
         schema_version: SchemaVersion,
         kind: AnalyzeKind::Kind,
         snapshot: snapshot_summary(snap, path),
@@ -275,7 +289,9 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
         top_retainers,
         type_histogram,
         notes,
-    })
+        allocations: None,
+    };
+    Ok((report, nodes))
 }
 
 /// Instances of one type with sizes and sample holders. Fails with
@@ -286,7 +302,8 @@ pub fn query_type(
     type_name: &str,
     opts: &QueryOptions,
 ) -> Result<TypeQueryReport> {
-    query::query_type(snap, path, type_name, opts)
+    let a = Analysis::new(snap)?;
+    Ok(query::query_type(&a, path, type_name, opts)?.0)
 }
 
 /// Where the type, function or module named `module.qualname` is defined.

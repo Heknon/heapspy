@@ -1,0 +1,147 @@
+use std::sync::atomic::AtomicBool;
+
+use heapspy_alloc::SamplingParams;
+use heapspy_analyzer::report::{
+    OverheadInfo, RecordKind, RecordReport, SamplingInfo, SchemaVersion,
+};
+use heapspy_record::{RecordOptions, RecordStats};
+use heapspy_snapshot::SourceKind;
+
+use crate::cli::RecordArgs;
+use crate::output::{print_json, DumpSource};
+
+pub fn run(args: RecordArgs) -> anyhow::Result<()> {
+    let mut opts = RecordOptions::new(args.pid, args.duration, &args.output);
+    opts.sampling = SamplingParams {
+        events: args.events,
+        byte_interval: args.interval,
+        max_frames: args.max_frames,
+    };
+    opts.then_dump = args.then_dump;
+    opts.mechanism = args.mechanism;
+
+    let stop: &AtomicBool = heapspy_record::stop_on_signals();
+    // The source context lets error_code() treat I/O errors on the target
+    // as being about the process, as for `dump --pid`.
+    let stats = heapspy_record::record(&opts, stop).map_err(|e| {
+        anyhow::Error::from(e).context(DumpSource {
+            kind: SourceKind::Pid,
+            text: format!("cannot record pid {}", args.pid),
+        })
+    })?;
+
+    let mechanisms: Vec<&str> = stats.mechanisms.iter().map(|m| m.as_str()).collect();
+    eprintln!(
+        "wrote {}: {} samples, {} frames, {} code objects, {} bytes in {:.1}s via {}{}",
+        args.output.display(),
+        stats.samples,
+        stats.frames,
+        stats.codes,
+        stats.bytes_written,
+        stats.elapsed.as_secs_f64(),
+        mechanisms.join("+"),
+        if stats.truncated { " (truncated)" } else { "" }
+    );
+    eprintln!(
+        "overhead: {} probe hits, {} samples dropped, threads stopped {:.1} ms in total",
+        stats.overhead.probe_hits,
+        stats.overhead.samples_dropped,
+        stats.overhead.total_pause_ns as f64 / 1e6
+    );
+    if let (Some(path), Some(s)) = (&opts.then_dump, &stats.snapshot) {
+        eprintln!(
+            "wrote {}: {} objects, {} edges, {} roots, {} bytes{}",
+            path.display(),
+            s.objects,
+            s.edges,
+            s.roots,
+            s.bytes_written,
+            if s.truncated { " (truncated)" } else { "" }
+        );
+    }
+    if args.json {
+        print_json(&report(&opts, &stats))?;
+    }
+    Ok(())
+}
+
+fn report(opts: &RecordOptions, stats: &RecordStats) -> RecordReport {
+    let s = &opts.sampling;
+    RecordReport {
+        schema_version: SchemaVersion,
+        kind: RecordKind::Kind,
+        path: opts.output.display().to_string(),
+        pid: opts.pid,
+        python_version: stats.python.to_string(),
+        duration_ms: stats.elapsed.as_millis().min(u64::MAX as u128) as u64,
+        mechanisms: stats
+            .mechanisms
+            .iter()
+            .map(|m| m.as_str().to_string())
+            .collect(),
+        sampling: SamplingInfo {
+            events: s.events.iter().map(|k| k.as_str().to_string()).collect(),
+            byte_interval: s.byte_interval,
+            max_frames: s.max_frames,
+        },
+        samples: stats.samples,
+        bytes_written: stats.bytes_written,
+        overhead: OverheadInfo {
+            samples_taken: stats.overhead.samples_taken,
+            samples_dropped: stats.overhead.samples_dropped,
+            probe_hits: stats.overhead.probe_hits,
+            total_pause_ns: stats.overhead.total_pause_ns,
+        },
+        truncated: stats.truncated,
+        then_dump: stats
+            .snapshot
+            .as_ref()
+            .and(opts.then_dump.as_ref())
+            .map(|p| p.display().to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heapspy_alloc::{EventKind, EventKinds, Mechanism, Mechanisms, Overhead, PythonVersion};
+    use std::time::Duration;
+
+    fn stats() -> RecordStats {
+        RecordStats {
+            recorder: "fake",
+            python: PythonVersion::new(3, 12, 4),
+            mechanisms: Mechanisms::of(&[Mechanism::Ebpf]),
+            samples: 1932,
+            frames: 9000,
+            codes: 120,
+            code_read_errors: 0,
+            bytes_written: 81920,
+            overhead: Overhead {
+                samples_taken: 1932,
+                samples_dropped: 3,
+                probe_hits: 1_210_443,
+                total_pause_ns: 0,
+            },
+            truncated: false,
+            elapsed: Duration::from_millis(60_004),
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn report_fields() {
+        let mut opts = RecordOptions::new(1234, Duration::from_secs(60), "app.hpya");
+        opts.sampling.events = EventKinds::of(&[EventKind::Arena, EventKind::LargeObject]);
+        opts.then_dump = Some("app.hpy".into());
+        let r = report(&opts, &stats());
+        assert_eq!(r.path, "app.hpya");
+        assert_eq!(r.python_version, "3.12.4");
+        assert_eq!(r.duration_ms, 60_004);
+        assert_eq!(r.mechanisms, ["ebpf"]);
+        assert_eq!(r.sampling.events, ["arena", "large_object"]);
+        assert_eq!(r.overhead.samples_dropped, 3);
+        // No snapshot was taken, so no then_dump path is reported.
+        assert_eq!(r.then_dump, None);
+    }
+}

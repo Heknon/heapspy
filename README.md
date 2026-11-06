@@ -118,7 +118,7 @@ heapspy flamegraph app.hpy -o app.svg
 
 A retention flame graph shows the dominator tree. A snapshot has no call stacks, so a frame is not a function. Each frame is one hop of a retaining path, and its width is the bytes it retains: the objects in that frame and everything only reachable through them. The bottom row holds the roots (`sys.modules['__main__']`, frame locals, thread state). Each row above it names the reference that holds the next object. To find a leak, look for the widest frame you did not expect and read down to its root. In the image above, `.cell_contents bytearray` under `BUS.listeners` holds 70% of the heap: closures registered as listeners keep their buffers alive. `['SESSIONS'] dict` holds most of the rest.
 
-A CPU flame graph is different. Its widths count samples of time, and its frames are call stacks. An allocation flame graph (memray, tracemalloc) counts bytes allocated by each call stack, including memory freed long ago. A retention flame graph counts only memory that is alive in the snapshot, grouped by what keeps it alive, not by where it was allocated.
+A CPU flame graph is different. Its widths count samples of time, and its frames are call stacks. An allocation flame graph (memray, tracemalloc, or `heapspy flamegraph --allocations` below) counts bytes allocated by each call stack, including memory freed long ago. A retention flame graph counts only memory that is alive in the snapshot, grouped by what keeps it alive, not by where it was allocated.
 
 Frame format:
 
@@ -147,6 +147,47 @@ heapspy flamegraph --diff before.hpy after.hpy -o diff.svg
 ![Differential retention flame graph; the listener buffers grew](docs/images/flamegraph-diff.png)
 
 The differential graph matches frames between the two dumps by frame text, not by object identity, so the matching is approximate in the same way as `diff`. For example, sessions whose keys got one character longer show up as a new frame. `--diff ... --folded` writes `stack before after` lines, the input format of inferno's and FlameGraph's differential mode. The cutoff applies to the wider of the two sides, so a frame is folded in both snapshots or in neither.
+
+### Record where memory is allocated (M7)
+
+```sh
+# Sample allocations with their Python stacks for 60 s, then take a snapshot
+heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
+
+heapspy analyze app.hpy --allocations app.hpya
+heapspy query app.hpy --type Session --allocations app.hpya
+```
+
+`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The `.hpya` file format is final for version 1.
+
+How it records, without running code in the target:
+- **Linux, eBPF** (default; root or `CAP_BPF` + `CAP_PERFMON`, kernel 5.8+): arenas from `mmap` and sampled large objects from allocator uprobes, each with the Python stack read in the kernel at the event.
+- **Linux, ptrace** (fallback, or `--mechanism ptrace`): arenas only, with exact stacks, stopping at system calls.
+- **Windows** (elevated): arenas from ETW, with approximate frames, and from debugger breakpoints, with exact frames. It is implemented but not yet tested on Windows.
+
+Pools are never recorded, because pool carving is inlined in every build checked. Large objects cost one uprobe trap per allocator call above 512 bytes (about 0.5 µs). On an extreme benchmark that slowed the target by 30-50%; arenas alone cost a few percent. Numbers are in [docs/allocation-sampling.md](docs/allocation-sampling.md#measurements). Ctrl-C ends a recording early with a valid profile flagged truncated.
+
+`analyze --allocations` links snapshot objects to samples by address. Each object gets the latest sample whose range (an arena, a pool, or one large allocation) contains it. It then adds an "Allocated by" section: the stacks that allocated the most during the window, innermost frame first with `file:line`, with estimated bytes allocated and the bytes of live objects linked to each. Under each top retainer it shows the one or two stacks that allocated the memory it retains. `query --type --allocations` shows the same per instance. Read the numbers as an estimate of where growth came from:
+
+- Only allocations made while recording are covered. Memory allocated before recording started, and blocks reused from freed memory, have no stack.
+- Links through large-object samples are exact. Links through arena and pool samples are approximate: they name the most recent growth event that created the memory, not necessarily the call that allocated the object. The text output marks each stack `exact` or `approx`.
+- If the profile is from another pid or CPython version, or recording started after the snapshot, heapspy warns and links nothing.
+
+`diff --allocations` only checks the profile against AFTER for now; it does not add stacks to growth sites. The JSON fields are `allocations` and `allocated_at` ([docs/json-schema.md](docs/json-schema.md#allocations)), and the join is described in [docs/allocation-sampling.md](docs/allocation-sampling.md#joining-with-a-snapshot).
+
+### Allocation flame graph
+
+```sh
+# Width is estimated bytes allocated while recording
+heapspy flamegraph --allocations app.hpya -o alloc.svg
+
+# Width is the bytes still alive in the snapshot, by allocating stack
+heapspy flamegraph --allocations app.hpya --retained app.hpy -o alive.svg
+
+heapspy flamegraph --allocations app.hpya --folded > alloc.folded
+```
+
+This is a classic flame graph of the sampled stacks. Frames are Python functions written `function (file:line)`, the outermost frame is at the root, and width is bytes. Without `--retained`, the width is the estimated bytes allocated, which includes memory freed since. With `--retained SNAP`, the width is the bytes of the objects in the snapshot linked to each stack's samples, which shows where the memory still alive was allocated. The subtitle gives the recording length, the sample count, the mechanisms, and whether any frames were matched by time (approximate). `--min-bytes` and `--min-pct` fold narrow frames into `[other]` as for retention graphs. `--max-depth` does not apply.
 
 ### JSON output
 
@@ -234,7 +275,7 @@ See [docs/releasing.md](docs/releasing.md) for how releases are built and publis
 | M4 | Windows minidump backend | done |
 | M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
 | M6 | `heapspy-mcp` | done |
-| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
+| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | Linux done; Windows implemented, untested on Windows |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
 
@@ -245,9 +286,13 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `crates/heapspy-snapshot` | snapshot file format: types, streaming writer, mmap reader, test builder |
 | `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
 | `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
+| `crates/heapspy-alloc` | allocation profile format (`.hpya`): types, streaming writer, mmap reader, line tables, test builder |
+| `crates/heapspy-record` | `heapspy record`: recorder interface and options; eBPF (`bpf/` holds the committed BPF object and its source), ptrace and Windows recorders |
 | `crates/heapspy` | the `heapspy` command-line tool |
 | `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
+| `docs/alloc-format.md` | byte-level specification of `.hpya` files |
+| `docs/allocation-sampling.md` | M7 design: allocation sampling from outside the process |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
 | `python/heapspy-mcp` | the `heapspy-mcp` MCP server (Python) |
 | `docs/releasing.md` | how to cut a release and the one-time PyPI setup |

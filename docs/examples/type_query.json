@@ -79,6 +79,7 @@
           "source_loc_reason": null
         }
       ],
+      "allocated_at": null,
       "source_loc": null,
       "source_loc_reason": null
     }

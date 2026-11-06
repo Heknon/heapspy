@@ -425,9 +425,8 @@ For an absolute `co_filename` there is no guess; read the file at the line.
 
 Limits, also in each result's `caveats`:
 
-- Allocation data needs a recorded `.hpya` file. `heapspy record` exists, but
-  its recorders are not implemented yet (it fails with `unimplemented`), and
-  this server has no tool that records. Without a profile, heapspy says what
+- Allocation data needs a `.hpya` file recorded with `heapspy record` (this
+  server has no tool that records). Without a profile, heapspy says what
   keeps an object alive, not where it was allocated.
 - Samples are taken only for arena, pool and large-object events during the
   recording window. Objects allocated before recording started, and blocks

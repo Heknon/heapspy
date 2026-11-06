@@ -40,6 +40,42 @@ fn analyze_example() {
 }
 
 #[test]
+fn analyze_allocations_example() {
+    let r: AnalyzeReport = round_trip("analyze_allocations.json");
+    let a = r.allocations.as_ref().unwrap();
+    assert_eq!(a.mechanisms, ["ebpf"]);
+    assert_eq!(a.top_stacks[0].rank, 1);
+    assert_eq!(a.top_stacks[0].frames[0].location, "app/session.py:41");
+    let at = r.top_retainers[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.stacks[0].top_stack_rank, Some(1));
+    assert_eq!(at.stacks[0].frames, a.top_stacks[0].frames);
+    // Without --allocations the fields are present and null.
+    let plain: AnalyzeReport = round_trip("analyze.json");
+    assert!(plain.allocations.is_none());
+    assert!(plain.top_retainers.iter().all(|t| t.allocated_at.is_none()));
+}
+
+/// Documents written before the allocation fields existed still parse.
+#[test]
+fn documents_without_allocation_fields_parse() {
+    let mut v = example("analyze_allocations.json");
+    v.as_object_mut().unwrap().remove("allocations");
+    for t in v["top_retainers"].as_array_mut().unwrap() {
+        t.as_object_mut().unwrap().remove("allocated_at");
+    }
+    let r: AnalyzeReport = serde_json::from_value(v).unwrap();
+    assert!(r.allocations.is_none());
+    assert!(r.top_retainers.iter().all(|t| t.allocated_at.is_none()));
+
+    let mut v = example("type_query.json");
+    for t in v["top_instances"].as_array_mut().unwrap() {
+        t.as_object_mut().unwrap().remove("allocated_at");
+    }
+    let r: TypeQueryReport = serde_json::from_value(v).unwrap();
+    assert!(r.top_instances.iter().all(|t| t.allocated_at.is_none()));
+}
+
+#[test]
 fn type_query_example() {
     let r: TypeQueryReport = round_trip("type_query.json");
     assert_eq!(r.matched_type_locations.len(), r.matched_types.len());
@@ -114,6 +150,19 @@ fn dump_example() {
 }
 
 #[test]
+fn record_example() {
+    let r: RecordReport = round_trip("record.json");
+    assert_eq!(r.mechanisms, ["ebpf"]);
+    assert_eq!(r.overhead.samples_taken, r.samples);
+    assert_eq!(r.then_dump.as_deref(), Some("app.hpy"));
+    // Without --then-dump, then_dump is null.
+    let mut v = example("record.json");
+    v["then_dump"] = serde_json::Value::Null;
+    let r: RecordReport = serde_json::from_value(v).unwrap();
+    assert_eq!(r.then_dump, None);
+}
+
+#[test]
 fn error_example() {
     let _: ErrorReport = round_trip("error.json");
 }
@@ -131,10 +180,12 @@ fn every_example_is_tested() {
         names,
         [
             "analyze.json",
+            "analyze_allocations.json",
             "diff.json",
             "dump.json",
             "error.json",
             "locate.json",
+            "record.json",
             "retaining_path.json",
             "type_query.json"
         ]
@@ -153,6 +204,8 @@ fn wrong_schema_version_or_kind_rejected() {
     assert!(serde_json::from_value::<DiffReport>(example("analyze.json")).is_err());
     assert!(serde_json::from_value::<DumpReport>(example("analyze.json")).is_err());
     assert!(serde_json::from_value::<AnalyzeReport>(example("dump.json")).is_err());
+    assert!(serde_json::from_value::<RecordReport>(example("dump.json")).is_err());
+    assert!(serde_json::from_value::<DumpReport>(example("record.json")).is_err());
 }
 
 #[test]

@@ -72,6 +72,7 @@
           "source_loc_reason": null
         }
       ],
+      "allocated_at": null,
       "type_location": null,
       "type_location_reason": "type_not_in_snapshot"
     },
@@ -95,6 +96,7 @@
           "source_loc_reason": null
         }
       ],
+      "allocated_at": null,
       "type_location": null,
       "type_location_reason": "type_not_in_snapshot"
     }
@@ -131,5 +133,6 @@
       "code": "outside_graph",
       "message": "Python graph accounts for 448.0 MiB of 1.9 GiB RSS. The rest is outside the object graph (native allocations, C extensions, untracked objects)."
     }
-  ]
+  ],
+  "allocations": null
 }

@@ -39,6 +39,22 @@ pub fn error_code(err: &anyhow::Error) -> &'static str {
         if let Some(e) = cause.downcast_ref::<heapspy_snapshot::Error>() {
             return snapshot_code(e);
         }
+        if let Some(e) = cause.downcast_ref::<heapspy_alloc::Error>() {
+            return alloc_code(e);
+        }
+        if let Some(e) = cause.downcast_ref::<heapspy_record::Error>() {
+            match e {
+                heapspy_record::Error::Unimplemented(_) => return "unimplemented",
+                heapspy_record::Error::PermissionDenied(_) => return "permission_denied",
+                heapspy_record::Error::InvalidOption(_) => return "invalid_argument",
+                heapspy_record::Error::Alloc(a) => return alloc_code(a),
+                heapspy_record::Error::Io(_) => return "io",
+                // `Reader` is transparent: the wrapped error is not a link of
+                // its own in the chain, so map it here.
+                heapspy_record::Error::Reader(r) => return reader_code(r, source),
+                heapspy_record::Error::Unsupported(_) => return "unsupported",
+            }
+        }
         if cause.is::<InvalidArgument>() {
             return "invalid_argument";
         }
@@ -47,6 +63,29 @@ pub fn error_code(err: &anyhow::Error) -> &'static str {
         }
     }
     "internal"
+}
+
+/// Code for an error from `heapspy-alloc`. Reading a profile can only fail
+/// with I/O or a format error; the writer's own checks
+/// (`InvalidArgument`, `LimitExceeded`) only reach here through `record`.
+fn alloc_code(e: &heapspy_alloc::Error) -> &'static str {
+    use heapspy_alloc::Error as E;
+    match e {
+        E::Io(_) => "io",
+        E::BadMagic
+        | E::UnsupportedVersion { .. }
+        | E::Truncated(_)
+        | E::Corrupt(_)
+        | E::MissingSection(_)
+        | E::UnknownRequiredSection(_)
+        | E::InvalidString(_)
+        | E::InvalidBlob(_)
+        | E::InvalidCode(_) => "invalid_allocations",
+        // The recording is larger than the format can hold.
+        E::LimitExceeded(_) => "unsupported",
+        // A recorder passed the writer inconsistent data: a bug.
+        E::InvalidArgument(_) => "internal",
+    }
 }
 
 /// Code for an error from `heapspy-reader`. `source` is the kind of dump
@@ -228,6 +267,55 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("missing 10 bytes"), "{text}");
         assert!(text.contains("not a CPython process"), "{text}");
+    }
+
+    /// `heapspy_record::Error::Reader` is `#[error(transparent)]`, so the
+    /// reader error it wraps is not a separate link in the cause chain.
+    #[test]
+    fn record_errors_have_specific_codes() {
+        use heapspy_record::Error as R;
+        let cases = [
+            (R::Unimplemented("eBPF"), "unimplemented"),
+            (R::Unsupported("eBPF needs Linux".into()), "unsupported"),
+            (R::PermissionDenied("CAP_BPF".into()), "permission_denied"),
+            (R::InvalidOption("duration".into()), "invalid_argument"),
+            (
+                R::Reader(E::NoSuchProcess("pid 1".into())),
+                "no_such_process",
+            ),
+            (
+                R::Reader(E::NotPython("no _PyRuntime".into())),
+                "not_python",
+            ),
+            (
+                R::Reader(E::UnsupportedPython("debug build".into())),
+                "unsupported_python",
+            ),
+            (
+                R::Reader(E::PermissionDenied("ptrace".into())),
+                "permission_denied",
+            ),
+            (R::Reader(E::Unimplemented("live::open")), "unimplemented"),
+            (
+                R::Reader(io(ErrorKind::PermissionDenied)),
+                "permission_denied",
+            ),
+            (
+                R::Alloc(heapspy_alloc::Error::LimitExceeded("samples")),
+                "unsupported",
+            ),
+            (R::Io(std::io::Error::other("disk full")), "io"),
+        ];
+        for (e, code) in cases {
+            let text = e.to_string();
+            let err = Err::<(), _>(e)
+                .context(DumpSource {
+                    kind: SourceKind::Pid,
+                    text: "cannot record pid 1".into(),
+                })
+                .unwrap_err();
+            assert_eq!(error_code(&err), code, "{text}");
+        }
     }
 
     #[test]

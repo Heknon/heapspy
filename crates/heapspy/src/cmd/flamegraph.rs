@@ -1,19 +1,22 @@
-//! `heapspy flamegraph`: retention flame graphs rendered with inferno.
+//! `heapspy flamegraph`: retention and allocation flame graphs rendered with
+//! inferno.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
+use heapspy_analyzer::allocations::{folded_allocations, folded_allocations_linked, FlameWeight};
 use heapspy_analyzer::flame::DEFAULT_MIN_PCT;
-use heapspy_analyzer::render::{format_bytes, format_delta_bytes};
+use heapspy_analyzer::render::{format_bytes, format_delta_bytes, format_duration_ms};
 use heapspy_analyzer::{FlameOptions, MinWidth};
 use inferno::flamegraph::color::{BasicPalette, Palette};
 use inferno::flamegraph::{self, Options};
 
-use super::open_snapshot;
+use super::{display_path, open_snapshot};
 use crate::cli::FlamegraphArgs;
 
 pub const TITLE: &str = "heapspy retention flame graph";
+pub const ALLOC_TITLE: &str = "heapspy allocation flame graph";
 
 pub fn run(args: FlamegraphArgs) -> anyhow::Result<()> {
     let opts = FlameOptions {
@@ -27,9 +30,10 @@ pub fn run(args: FlamegraphArgs) -> anyhow::Result<()> {
     // Rendered in memory first (the output is bounded by the cutoffs), so a
     // failure leaves no half-written file behind.
     let mut buf = Vec::new();
-    match &args.diff {
-        Some(paths) => diff(&args, &paths[0], &paths[1], &opts, &mut buf)?,
-        None => {
+    match (&args.diff, &args.allocations) {
+        (Some(paths), _) => diff(&args, &paths[0], &paths[1], &opts, &mut buf)?,
+        (None, Some(path)) => allocations(&args, path, &opts, &mut buf)?,
+        (None, None) => {
             let path = args.snapshot.as_deref().expect("clap requires SNAP");
             single(&args, path, &opts, &mut buf)?
         }
@@ -106,6 +110,76 @@ fn single(
         .map(|l| format!("{} {}", l.stack, l.bytes))
         .collect();
     let mut o = svg_options(args.title.as_deref(), TITLE.to_string(), subtitle);
+    render(&mut o, &lines, out)
+}
+
+/// `--allocations`: a classic flame graph of the sampled allocation stacks.
+fn allocations(
+    args: &FlamegraphArgs,
+    path: &Path,
+    opts: &FlameOptions,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let profile = super::allocations::open_profile(path)?;
+    let (f, linked_to) = match &args.retained {
+        None => (folded_allocations(&profile, opts.min_width)?, None),
+        Some(snap_path) => {
+            let snap = open_snapshot(snap_path)?;
+            let f = folded_allocations_linked(&snap, &profile, opts.min_width)?;
+            super::allocations::warn(&f.notes);
+            (f, Some(display_path(snap_path)))
+        }
+    };
+    if args.folded {
+        f.write_to(out)?;
+        return Ok(());
+    }
+    if f.lines.is_empty() {
+        match f.weight {
+            FlameWeight::Estimated => anyhow::bail!("the allocation profile has no samples"),
+            FlameWeight::Linked => {
+                anyhow::bail!("no sampled allocation is linked to an object in the snapshot")
+            }
+        }
+    }
+    let info = profile.info();
+    let mechanisms: Vec<&str> = info.mechanisms.iter().map(|m| m.as_str()).collect();
+    let mechanisms = if mechanisms.is_empty() {
+        "no mechanism recorded".to_string()
+    } else {
+        mechanisms.join(", ")
+    };
+    let width = match &linked_to {
+        None => format!("{} estimated", format_bytes(f.total_bytes)),
+        Some(p) => format!("{} live in {p}", format_bytes(f.total_bytes)),
+    };
+    let approximate = if f.approximate {
+        "approximate: some frames matched by time"
+    } else {
+        "approximate: no"
+    };
+    let subtitle = format!(
+        "{}, {} samples ({mechanisms}), {width}, {approximate}{}",
+        format_duration_ms(info.duration_ns() / 1_000_000),
+        f.samples,
+        cutoff_text(f.min_bytes)
+    );
+    let lines: Vec<String> = f
+        .lines
+        .iter()
+        .map(|l| format!("{} {}", l.stack, l.bytes))
+        .collect();
+    let mut o = svg_options(args.title.as_deref(), ALLOC_TITLE.to_string(), subtitle);
+    o.name_type = "Function:".to_string();
+    o.notes = match linked_to {
+        None => "heapspy allocation flame graph: frames are Python functions, outermost at the \
+                 bottom; width is estimated bytes allocated while recording"
+            .to_string(),
+        Some(_) => "heapspy allocation flame graph: frames are Python functions, outermost at \
+                    the bottom; width is bytes of snapshot objects linked to the samples. Arena \
+                    and pool links are approximate"
+            .to_string(),
+    };
     render(&mut o, &lines, out)
 }
 

@@ -116,6 +116,9 @@ pub struct Offsets {
     pub co_name: u64,
     pub co_qualname: u64,
     pub co_linetable: u64,
+    /// `offsetof(PyCodeObject, co_code_adaptive)`: where the bytecode starts
+    /// (`_PyCode_CODE(co)`). Also `type(code).__basicsize__`.
+    pub co_code_adaptive: u64,
     /// `int co_framesize`: frame slots (specials + locals + stack), in words.
     pub co_framesize: u64,
 
@@ -134,6 +137,10 @@ pub struct Offsets {
     pub if_globals: u64,
     pub if_builtins: u64,
     pub if_locals: u64,
+    /// The executing instruction: `_Py_CODEUNIT *prev_instr` on 3.12,
+    /// `instr_ptr` on 3.13+. Its distance from `_PyCode_CODE(code)` is the
+    /// frame's `f_lasti` in bytes on every version.
+    pub if_instr_ptr: u64,
     /// 3.12 / 3.13: `int stacktop` (an index into `localsplus`).
     /// 3.14: `_PyStackRef *stackpointer`.
     pub if_stack: u64,
@@ -184,13 +191,16 @@ struct DebugLayout {
     ts_native_thread_id: u64,
     if_previous: u64,
     if_executable: u64,
+    if_instr_ptr: u64,
     if_localsplus: u64,
     if_owner: u64,
     co_filename: u64,
     co_name: u64,
     co_qualname: u64,
+    co_linetable: u64,
     co_firstlineno: u64,
     co_localsplusnames: u64,
+    co_code_adaptive: u64,
     tp_name: u64,
     tp_flags: u64,
     ma_keys: u64,
@@ -213,13 +223,16 @@ const DEBUG_313: DebugLayout = DebugLayout {
     ts_native_thread_id: 200,
     if_previous: 232,
     if_executable: 240,
+    if_instr_ptr: 248,
     if_localsplus: 256,
     if_owner: 264,
     co_filename: 280,
     co_name: 288,
     co_qualname: 296,
+    co_linetable: 304,
     co_firstlineno: 312,
     co_localsplusnames: 328,
+    co_code_adaptive: 344,
     tp_name: 376,
     tp_flags: 392,
     ma_keys: 456,
@@ -242,13 +255,16 @@ const DEBUG_314: DebugLayout = DebugLayout {
     ts_native_thread_id: 224,
     if_previous: 256,
     if_executable: 264,
+    if_instr_ptr: 272,
     if_localsplus: 280,
     if_owner: 288,
     co_filename: 320,
     co_name: 328,
     co_qualname: 336,
+    co_linetable: 344,
     co_firstlineno: 352,
     co_localsplusnames: 368,
+    co_code_adaptive: 384,
     tp_name: 424,
     tp_flags: 440,
     ma_keys: 536,
@@ -356,6 +372,7 @@ impl Offsets {
             co_name: 120,
             co_qualname: 128,
             co_linetable: 136,
+            co_code_adaptive: 192,
             co_framesize: 76,
             gi_name: 24,
             gi_qualname: 32,
@@ -370,6 +387,7 @@ impl Offsets {
             if_globals: 24,
             if_builtins: 32,
             if_locals: 40,
+            if_instr_ptr: 56,
             if_stack: 64,
             if_stack_is_pointer: false,
             if_owner: 70,
@@ -396,6 +414,7 @@ impl Offsets {
     fn v313() -> Offsets {
         Offsets {
             minor: 13,
+            co_code_adaptive: 200,
             dv_values: 8,
             frameobj_data: 64,
             dv_has_header: true,
@@ -418,6 +437,7 @@ impl Offsets {
     fn v314() -> Offsets {
         Offsets {
             minor: 14,
+            co_code_adaptive: 208,
             tuple_ob_item: 32,
             frameobj_data: 72,
             func_annotate: Some(120),
@@ -454,13 +474,16 @@ impl Offsets {
             (l.ts_native_thread_id, &mut self.ts_native_thread_id),
             (l.if_previous, &mut self.if_previous),
             (l.if_executable, &mut self.if_executable),
+            (l.if_instr_ptr, &mut self.if_instr_ptr),
             (l.if_localsplus, &mut self.if_localsplus),
             (l.if_owner, &mut self.if_owner),
             (l.co_filename, &mut self.co_filename),
             (l.co_name, &mut self.co_name),
             (l.co_qualname, &mut self.co_qualname),
+            (l.co_linetable, &mut self.co_linetable),
             (l.co_firstlineno, &mut self.co_firstlineno),
             (l.co_localsplusnames, &mut self.co_localsplusnames),
+            (l.co_code_adaptive, &mut self.co_code_adaptive),
             (l.tp_name, &mut self.tp_name),
             (l.tp_flags, &mut self.tp_flags),
             (l.ma_keys, &mut self.ma_keys),
@@ -560,5 +583,14 @@ mod tests {
         assert_eq!(Offsets::table(13, Os::Linux).unwrap().gc_lists[3], 104);
         let w = Offsets::table(12, Os::Windows).unwrap();
         assert_eq!(w.ts_native_thread_id, 140);
+        // Measured with `type(code).__basicsize__` on 3.12.3, 3.13.18, 3.14.6.
+        let adaptive: Vec<u64> = [12, 13, 14]
+            .iter()
+            .map(|&m| Offsets::table(m, Os::Linux).unwrap().co_code_adaptive)
+            .collect();
+        assert_eq!(adaptive, [192, 200, 208]);
+        for m in [12, 13, 14] {
+            assert_eq!(Offsets::table(m, Os::Linux).unwrap().if_instr_ptr, 56);
+        }
     }
 }

@@ -80,3 +80,7 @@ deliberately and update the docs in the same PR:
 - `MemorySource` trait: `crates/heapspy-reader/src/source/mod.rs`.
 - JSON report schema: `docs/json-schema.md`, `crates/heapspy-analyzer/src/report.rs`,
   examples in `docs/examples/`.
+- Allocation profile format: `docs/alloc-format.md`, `crates/heapspy-alloc`.
+- Recorder interface (`Recorder`, `RecordOptions`, `SampleSink`):
+  `crates/heapspy-record`; the frame offsets recorders use:
+  `crates/heapspy-reader/src/cpython/frames.rs`.

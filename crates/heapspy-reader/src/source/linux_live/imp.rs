@@ -55,6 +55,9 @@ pub(super) struct Inner {
     attach_time: Duration,
     tracees: Mutex<Option<Tracees>>,
     cache: Mutex<Cache>,
+    /// Reads go through the block cache. Only valid while the target is
+    /// stopped; [`Inner::open_running`] turns it off.
+    cached: bool,
 }
 
 fn errno() -> i32 {
@@ -311,12 +314,62 @@ impl Inner {
             attach_time,
             tracees: Mutex::new(Some(tracees)),
             cache: Mutex::new(Cache::default()),
+            cached: true,
         };
         if cfg!(target_arch = "aarch64") {
             inner.target.arch = heapspy_snapshot::Arch::Aarch64;
         }
         inner.modules = inner.build_modules();
         inner.summary = inner.build_summary();
+        Ok(inner)
+    }
+
+    /// Prepare to read `pid` without stopping it: no ptrace, no block
+    /// cache, no memory summary. Threads are listed without registers.
+    pub(super) fn open_running(pid: u32) -> Result<Inner> {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return Err(Error::NoSuchProcess(format!("no process with pid {pid}")));
+        }
+        let maps = parse_maps(&std::fs::read_to_string(format!("/proc/{pid}/maps"))?);
+        let threads = list_tids(pid)?
+            .into_iter()
+            .map(|tid| ThreadInfo {
+                tid: tid as u64,
+                name: std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
+                    .ok()
+                    .map(|s| s.trim_end().to_string()),
+                tls_base: None,
+                stack_pointer: None,
+            })
+            .collect();
+        let mut inner = Inner {
+            pid,
+            target: TargetInfo::LINUX_X86_64,
+            mem: File::open(format!("/proc/{pid}/mem")).ok(),
+            maps,
+            modules: Vec::new(),
+            threads,
+            summary: None,
+            captured_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            attach_time: Duration::ZERO,
+            tracees: Mutex::new(None),
+            cache: Mutex::new(Cache::default()),
+            cached: false,
+        };
+        if cfg!(target_arch = "aarch64") {
+            inner.target.arch = heapspy_snapshot::Arch::Aarch64;
+        }
+        // One probe read: a permission problem shows up here, not later.
+        let mut b = [0u8; 1];
+        if let Some(m) = inner.maps.iter().find(|m| m.perms.read) {
+            if let Err(e @ Error::PermissionDenied(_)) = inner.read_direct(m.start, &mut b) {
+                return Err(e);
+            }
+        }
+        inner.modules = inner.build_modules();
         Ok(inner)
     }
 
@@ -535,7 +588,7 @@ impl Inner {
                 len: buf.len(),
             });
         };
-        if buf.len() as u64 > BLOCK {
+        if !self.cached || buf.len() as u64 > BLOCK {
             return self.read_direct(addr, buf);
         }
         let mut cur = addr;

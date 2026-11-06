@@ -219,19 +219,34 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "heapspy-alloc",
  "heapspy-analyzer",
  "heapspy-reader",
+ "heapspy-record",
  "heapspy-snapshot",
  "inferno",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
 ]
 
 [[package]]
+name = "heapspy-alloc"
+version = "0.1.0"
+dependencies = [
+ "heapspy-snapshot",
+ "memmap2",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "heapspy-analyzer"
 version = "0.1.0"
 dependencies = [
+ "heapspy-alloc",
  "heapspy-snapshot",
  "proptest",
  "serde",
@@ -247,6 +262,20 @@ dependencies = [
  "heapspy-snapshot",
  "libc",
  "memmap2",
+ "object",
+ "tempfile",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
+name = "heapspy-record"
+version = "0.1.0"
+dependencies = [
+ "heapspy-alloc",
+ "heapspy-reader",
+ "heapspy-snapshot",
+ "libc",
  "object",
  "tempfile",
  "thiserror",

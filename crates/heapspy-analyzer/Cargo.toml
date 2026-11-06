@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 heapspy-snapshot.workspace = true
+heapspy-alloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

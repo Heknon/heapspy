@@ -1,7 +1,7 @@
 # JSON report schema, version 1
 
-`heapspy dump`, `analyze`, `query` and `diff` print a JSON document on
-stdout when given `--json`. This is the machine interface that tooling (including
+`heapspy dump`, `record`, `analyze`, `query` and `diff` print a JSON
+document on stdout when given `--json`. This is the machine interface that tooling (including
 `heapspy-mcp`) binds to. The Rust definitions are in
 `crates/heapspy-analyzer/src/report.rs`. Complete example documents are in
 `docs/examples/`; a test (`crates/heapspy-analyzer/tests/examples.rs`) checks
@@ -10,13 +10,16 @@ that each example matches the structs field for field.
 ## Rules
 
 - Every document has `"schema_version": 1` and a `"kind"`:
-  `"dump"`, `"analyze"`, `"type_query"`, `"retaining_path"`, `"locate"`,
+  `"dump"`, `"record"`, `"analyze"`, `"type_query"`, `"retaining_path"`, `"locate"`,
   `"diff"` or `"error"`.
 - Within version 1, fields are only added, never removed or redefined.
   Consumers must ignore fields they do not know. A breaking change means
   `schema_version: 2`.
 - Fields documented as nullable are always present, with `null` when the
   value is unknown. Fields are never omitted.
+- Fields added within version 1 (marked "added in M7" below) may be missing
+  from documents written by an older heapspy. Readers treat a missing
+  added field as `null`; the Rust types do this with `#[serde(default)]`.
 - Byte and object counts are non-negative JSON integers. Deltas (`delta_*`)
   are signed integers.
 - Addresses are strings: lowercase hex with a `0x` prefix, e.g.
@@ -204,6 +207,13 @@ Codes defined so far:
 | `unreachable_target` | a retaining-path target has no path from any root |
 | `image_incomplete` | dump: `image.missing_bytes` is non-zero |
 | `read_errors` | dump: `read_errors` is non-zero |
+| `allocations_pid_mismatch` | `--allocations`: the profile was recorded from another pid than the (live-process) snapshot |
+| `allocations_python_mismatch` | `--allocations`: the profile and the snapshot name different CPython versions |
+| `allocations_after_snapshot` | `--allocations`: the snapshot was taken before recording started, so no sampled allocation can be in it |
+| `allocations_not_linked` | `--allocations` on analyze and `query --type`: one of the three notes above applies, so no object was linked to a sample; `top_stacks` is still reported, with `linked_bytes` 0 |
+| `allocations_sampled` | always on analyze and `query --type` with `--allocations`: what the samples cover (allocations made while recording, sampled events only) and that arena and pool links are approximate |
+| `allocations_unlinked_reused` | `--allocations` on analyze and `query --type`, when `coverage.unlinked_reused_objects` (see Allocations) is not 0: how many reachable objects sit on memory of a sampled large allocation they do not match, and are therefore not linked |
+| `allocations_not_joined` | no longer emitted. heapspy versions before the join printed it when `--allocations` was given to analyze or `query --type` |
 
 `truncated_snapshot` is also used by dump, when `truncated` is true.
 
@@ -242,9 +252,49 @@ wrote OUT: N objects, N edges, N roots, N bytes (truncated)
 | `pause_ms` | float, nullable | how long a live target was stopped, in milliseconds; `null` for cores and minidumps, and on Windows, where the pause is inside the minidump write and not measured |
 | `notes` | array of Note | |
 
+## `record`
+
+`heapspy record --pid PID --duration D -o OUT.hpya [--then-dump SNAP] --json`.
+Added in M7. Example: `docs/examples/record.json`.
+
+Printed after the allocation profile (and the `--then-dump` snapshot, when
+asked for) has been written. The summary lines on stderr are printed with or
+without `--json`.
+
+On failure `record --json` prints an [error document](#error) and exits
+with status 1. The checks run in this order, and the first that fails gives
+the code:
+
+1. option values (`--duration 0s`, `--max-frames 0`, `--then-dump` equal to
+   `-o`): `invalid_argument`
+2. on Linux, whether a process has the PID: `no_such_process`
+3. the recorders for `--mechanism`, in order: `unsupported` when the
+   mechanism is not available here, `permission_denied` when none may run
+   (with `auto`, the first recorder's error is reported)
+4. finding CPython in the target: `not_python`, `unsupported_python`
+
+No profile file is written on failure. Ctrl-C (SIGINT, SIGTERM) ends the
+window early: the profile is written and `truncated` is `true`.
+
+| field | type | meaning |
+|---|---|---|
+| `schema_version` | 1 | |
+| `kind` | `"record"` | |
+| `path` | string | the allocation profile written, as given with `-o` |
+| `pid` | integer | the process recorded |
+| `python_version` | string | CPython version found in the target, `sys.version` style |
+| `duration_ms` | integer | measured length of the recording window, in milliseconds |
+| `mechanisms` | array of string | mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"` |
+| `sampling` | object | as `allocations.sampling` in [Allocations](#allocations-allocations): `events`, `byte_interval`, `max_frames` |
+| `samples` | integer | samples written to the profile |
+| `bytes_written` | integer | size of the profile file |
+| `overhead` | object | as `allocations.overhead`: `samples_taken`, `samples_dropped`, `probe_hits`, `total_pause_ns` |
+| `truncated` | bool | recording stopped early or lost samples that `overhead` does not count |
+| `then_dump` | string, nullable | the `--then-dump` snapshot written, as given; `null` without `--then-dump` |
+
 ## `analyze`
 
-`heapspy analyze SNAP --json [--top N]`. Example: `docs/examples/analyze.json`.
+`heapspy analyze SNAP --json [--top N] [--allocations FILE.hpya]`. Examples: `docs/examples/analyze.json`, and with allocations `docs/examples/analyze_allocations.json`.
 
 | field | type | meaning |
 |---|---|---|
@@ -256,6 +306,7 @@ wrote OUT: N objects, N edges, N roots, N bytes (truncated)
 | `top_retainers` | array of Retainer | objects with the largest `retained_bytes` |
 | `type_histogram` | array of TypeRow | types by `retained_bytes` |
 | `notes` | array of Note | |
+| `allocations` | Allocations, nullable | added in M7: the `--allocations` profile joined with the snapshot, see [Allocations](#allocations); `null` without `--allocations` |
 
 `totals`:
 
@@ -293,6 +344,7 @@ Retainer (`top_retainers[]`):
 | `retained_objects` | integer | number of objects it dominates, itself included |
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
+| `allocated_at` | AllocatedAt, nullable | added in M7: allocation stacks of the sampled objects this entry retains, see [AllocatedAt](#allocatedat); `null` without `--allocations` |
 | `type_location` | SourceLocation, nullable | where the object's type is defined ([Source locations](#source-locations)) |
 | `type_location_reason` | string, nullable | why `type_location` is `null` |
 
@@ -365,6 +417,7 @@ Instance:
 | `retained_bytes` | integer | |
 | `length` | integer, nullable | `len()` if recorded |
 | `path` | array of PathHop, nullable | shortest retaining path; `null` if unreachable |
+| `allocated_at` | AllocatedAt, nullable | added in M7: as on Retainer; `null` without `--allocations` |
 | `source_loc` | SourceLocation, nullable | where the instance itself is defined, when it is a function, method, code object, class or module (`query --type builtins.function`) |
 | `source_loc_reason` | string, nullable | why `source_loc` is `null` for such an instance |
 
@@ -383,6 +436,125 @@ Holder:
 | `type` | string | type of the referring object |
 | `edge` | string | edge label from referrer to instance, generalised: dict keys become `[<key>]` and indices `[<index>]`, so one container holding many instances is one row |
 | `count` | integer | instances held this way |
+
+## Allocations
+
+Added in M7. `heapspy analyze SNAP --allocations FILE.hpya --json` joins an
+allocation profile written by `heapspy record` (format:
+`docs/alloc-format.md`) with the snapshot. Example:
+`docs/examples/analyze_allocations.json`. `heapspy query --type T
+--allocations FILE.hpya` fills `allocated_at` on `top_instances`; the
+`retaining_path` and `diff` reports have no allocation fields and only
+check the profile (its notes are added).
+
+Samples are an estimate of where growth came from during the recording
+window, not a full allocation history: only arena, pool and large-object
+events are sampled, blocks reused from freed memory are not, and objects
+allocated before recording started have no sample. An object is *linked*
+to a sample when its address lies inside the sampled range and no later
+sample covers that address. For a `large_object` sample the object must
+also be that allocation: it starts at the sample's address plus 0, 16 or
+32 bytes (no GC header, the GC header, or the GC header and the managed
+dict and weakref words), and the sample's requested size is within 16
+bytes of the object's `shallow_size` (for a type object, at most 16 bytes
+above it). When the latest covering sample is a `large_object` sample the
+object does not match, the object is not linked at all and is counted in
+`coverage.unlinked_reused_*`. Samples taken after the snapshot's capture
+second are not used for linking. When the profile does not match the
+snapshot (the `allocations_*_mismatch` and `allocations_after_snapshot`
+notes), nothing is linked and the report carries `allocations_not_linked`.
+The algorithm is described in `docs/allocation-sampling.md`, "Joining with
+a snapshot".
+
+Links through `large_object` samples are *exact*: the sample is the
+object's own allocation. Links through `arena` and `pool` samples (and `other`) are
+*approximate*: the sample is the most recent growth event that created
+the memory, not necessarily the call that allocated the object. The
+`exact_linked_*` fields give the exact part of each linked count. The
+`approximate` flags mean something else: Python frames matched to the
+event by time (ETW).
+
+### Allocations (`allocations`)
+
+| field | type | meaning |
+|---|---|---|
+| `path` | string | profile path as given on the command line |
+| `pid` | integer | process the samples were recorded from |
+| `python_version` | string | CPython version recorded in the profile, `sys.version` style |
+| `started_at` | integer | Unix seconds when recording started |
+| `duration_ms` | integer | length of the recording window in milliseconds |
+| `mechanisms` | array of string | mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"` |
+| `sampling.events` | array of string | event kinds enabled: `"arena"`, `"pool"`, `"large_object"` |
+| `sampling.byte_interval` | integer | mean bytes between large-object samples; 0 means every one was kept |
+| `sampling.max_frames` | integer | most Python frames kept per sample |
+| `overhead.samples_taken` | integer | samples written |
+| `overhead.samples_dropped` | integer | samples lost before they were written (buffer full, stack unreadable) |
+| `overhead.probe_hits` | integer | times a probe fired, including events the byte sampler skipped |
+| `overhead.total_pause_ns` | integer | total time target threads were stopped, summed over threads (0 for eBPF and ETW) |
+| `truncated` | bool | recording stopped early or lost samples the overhead does not count |
+| `approximate` | bool | some frames were matched to events by time (ETW) rather than read at the event |
+| `samples` | integer | samples in the profile |
+| `estimated_bytes` | integer | sum of sample weights: estimated bytes allocated through sampled events during the window |
+| `coverage.linked_objects` | integer | reachable objects linked to a sample |
+| `coverage.linked_bytes` | integer | their shallow bytes |
+| `coverage.linked_pct` | float | `coverage.linked_bytes / totals.reachable_bytes * 100` |
+| `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` samples (exact links) |
+| `coverage.exact_linked_bytes` | integer | their shallow bytes |
+| `coverage.unlinked_reused_objects` | integer | reachable objects not linked because the latest sample over their address is a `large_object` sample they do not match: the sampled block was freed and the memory reused by an allocation that was not sampled. Added after the first M7 release; reads as 0 when missing |
+| `coverage.unlinked_reused_bytes` | integer | their shallow bytes; reads as 0 when missing |
+| `top_stacks` | array of AllocationStack | stacks by `estimated_bytes`, at most `--top` |
+
+AllocationStack (`top_stacks[]`):
+
+| field | type | meaning |
+|---|---|---|
+| `rank` | integer | 1-based position |
+| `frames` | array of StackFrame | innermost first: `frames[0]` is the function that allocated |
+| `estimated_bytes` | integer | sum of the weights of this stack's samples |
+| `samples` | integer | samples with this stack |
+| `events` | array of string | event kinds among them, sorted |
+| `linked_bytes` | integer | shallow bytes of reachable objects linked to these samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `approximate` | bool | any frame of any of these samples was approximate |
+
+Two samples have the same stack when their frames have the same
+`function` and `location` in the same order.
+
+StackFrame:
+
+| field | type | meaning |
+|---|---|---|
+| `function` | string | `co_qualname`, e.g. `"SessionStore.create"`; `"<unknown>"` if the code object could not be read |
+| `file` | string, nullable | `co_filename` |
+| `line` | integer, nullable | line of the executing instruction, from `co_linetable` |
+| `location` | string | `file:line`; `file:?` without a line; `"<unknown>"` without a file |
+| `approximate` | bool | this frame was matched to the event by time, not read at it |
+
+### AllocatedAt
+
+On a Retainer (`top_retainers[].allocated_at`) or an Instance
+(`top_instances[].allocated_at`): which stacks allocated the linked objects
+in the entry's dominator subtree, i.e. the memory it retains. With
+`--allocations`, every listed entry has one; an entry with no linked
+objects has `linked_objects: 0` and no stacks.
+
+| field | type | meaning |
+|---|---|---|
+| `linked_objects` | integer | objects in the subtree linked to a sample |
+| `linked_bytes` | integer | their shallow bytes |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `stacks` | array of AllocatedAtStack | by `linked_bytes`, at most 5 |
+| `approximate` | bool | any listed stack is approximate |
+
+AllocatedAtStack:
+
+| field | type | meaning |
+|---|---|---|
+| `frames` | array of StackFrame | innermost first |
+| `linked_objects` | integer | linked objects in the subtree allocated through this stack |
+| `linked_bytes` | integer | their shallow bytes |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `top_stack_rank` | integer, nullable | `rank` of the same stack in `allocations.top_stacks`, if it is listed there; always `null` on query reports |
 
 ## `retaining_path`
 
@@ -555,17 +727,18 @@ status 1. Example: `docs/examples/error.json`.
 | code | meaning |
 |---|---|
 | `unimplemented` | the command or feature is not built yet |
-| `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`) |
+| `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`), or a `record` option is out of range (`--duration 0s`, `--max-frames 0`) |
 | `not_found` | the requested address or type is not in the snapshot |
 | `invalid_snapshot` | the file is not a snapshot, is truncated or corrupt, or has an unsupported format version |
+| `invalid_allocations` | the `--allocations` file is not an allocation profile, is truncated or corrupt, or has an unsupported format version |
 | `io` | a file could not be read or written (missing core file, unreadable snapshot, full disk) |
-| `permission_denied` | reading the target process was refused: ptrace `EPERM` on Linux (needs root or `CAP_SYS_PTRACE`, see `kernel.yama.ptrace_scope`), access denied on Windows (needs `SeDebugPrivilege` or the same user) |
-| `no_such_process` | dump: no process has that PID, or it exited before it could be stopped |
-| `not_python` | dump: no CPython runtime in the target (no module exports `_PyRuntime`, or it could not be read) |
-| `unsupported_python` | dump: CPython was found, but its version or build is refused (outside 3.12 to 3.14, free-threaded, or debug) |
+| `permission_denied` | reading the target process was refused: ptrace `EPERM` on Linux (needs root or `CAP_SYS_PTRACE`, see `kernel.yama.ptrace_scope`), access denied on Windows (needs `SeDebugPrivilege` or the same user). For `record`, also a recorder that lacks its privileges (`CAP_BPF` and `CAP_PERFMON` for eBPF) |
+| `no_such_process` | dump, record: no process has that PID, or it exited before it could be stopped |
+| `not_python` | dump, record: no CPython runtime in the target (no module exports `_PyRuntime`, or it could not be read) |
+| `unsupported_python` | dump, record: CPython was found, but its version or build is refused (outside 3.12 to 3.14, free-threaded, or debug) |
 | `invalid_image` | dump: the core or minidump is not one heapspy reads (not an ELF core or minidump, corrupt, 32-bit, big-endian, another CPU), or memory the runtime points to is not in the image |
 | `truncated_image` | dump: the image file ends before data its own headers describe (cut short by a size limit or a full disk), and the dump could not go on. A core cut only inside memory segments can still give a snapshot, marked `truncated`. A minidump cut inside data that only a stream refers to (a module or thread name) is reported as `invalid_image` |
-| `unsupported` | dump: the request cannot be done here (dumping heapspy itself, a live process on a platform without a live backend, a target that keeps creating threads while it is being stopped) |
+| `unsupported` | dump, record: the request cannot be done here (dumping heapspy itself, a live process on a platform without a live backend, a target that keeps creating threads while it is being stopped; for `record`, a `--mechanism` this OS does not have, or a recording larger than the profile format holds) |
 | `internal` | a bug in heapspy |
 
 The codes are stable; `error.message` is for people and may change. New

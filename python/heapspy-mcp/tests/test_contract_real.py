@@ -444,3 +444,84 @@ def test_invalid_allocations_code(real_cli, features, contract_files) -> None:
     expected = "invalid_allocations" if features["allocations_flag"] else "allocations_unsupported"
     assert e.value.code == expected
     assert e.value.to_dict()["hint"]
+
+
+# -- a real recording ------------------------------------------------------------------
+
+RECORD_VICTIM = textwrap.dedent(
+    """
+    keep = []
+    leaked = []
+    def build_payload(i):
+        leaked.append([i] * 16)
+        return bytes(64 * 1024)
+    def handler(i):
+        keep.append(build_payload(i))
+        if len(keep) > 200:
+            del keep[0]
+    def noise():
+        return bytes(16 * 1024)
+    print("ready", flush=True)
+    i = 0
+    while True:
+        handler(i)
+        noise()
+        i += 1
+    """
+).lstrip()
+
+
+async def test_allocation_sites_on_a_real_recording(call, real_bin, features, tmp_path) -> None:
+    """heapspy record --then-dump on a live process, then allocation_sites:
+    the top stack is the known allocating chain. Needs a recorder that can
+    attach (root, or CAP_BPF + CAP_PERFMON, or ptrace rights)."""
+    if "--then-dump" not in _help("record") or not features["allocations"]:
+        pytest.skip("this heapspy has no record --then-dump or no allocation join")
+    if not PYTHON.is_file():
+        pytest.skip(f"{PYTHON} is not installed")
+    script = tmp_path / "record_victim.py"
+    script.write_text(RECORD_VICTIM)
+    prof, snap = tmp_path / "live.hpya", tmp_path / "live.hpy"
+    proc = _start([str(PYTHON), str(script)])
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        rec = subprocess.run(
+            [
+                str(real_bin),
+                "record",
+                "--json",
+                "--pid",
+                str(proc.pid),
+                "--duration",
+                "3s",
+                "--interval",
+                "64K",
+                "-o",
+                str(prof),
+                "--then-dump",
+                str(snap),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        _stop(proc)
+    if rec.returncode != 0:
+        doc = json.loads(rec.stdout or "{}")
+        if doc.get("error", {}).get("code") == "permission_denied":
+            pytest.skip("no rights to record the child process")
+        pytest.fail(rec.stdout + rec.stderr)
+    err, out = await call(
+        "allocation_sites", {"profile": str(prof), "snapshot": str(snap)}, heapspy_bin=real_bin
+    )
+    assert not err, out
+    top = out["top_stacks"][0]
+    functions = [f["function"] for f in top["frames"]]
+    assert functions[:2] == ["build_payload", "handler"], top
+    assert top["allocated_in"].endswith("record_victim.py:5") or top["allocated_in"].endswith(
+        "record_victim.py:4"
+    ), top
+    assert out["coverage"]["linked_objects"] > 0

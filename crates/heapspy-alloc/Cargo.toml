@@ -1,0 +1,18 @@
+[package]
+name = "heapspy-alloc"
+description = "The heapspy allocation sample file format (.hpya): types, streaming writer, mmap reader, line tables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+heapspy-snapshot.workspace = true
+memmap2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

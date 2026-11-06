@@ -74,6 +74,28 @@ impl LiveProcess {
         }
     }
 
+    /// Read `pid` **without** stopping it, for allocation recorders: no
+    /// ptrace, no block cache (memory changes under the reader), no memory
+    /// summary, threads without registers. [`MemorySource::release`] does
+    /// nothing. Reads may observe a changing image.
+    pub fn open_running(pid: u32) -> Result<LiveProcess> {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = imp::Inner::open_running(pid)?;
+            Ok(LiveProcess {
+                pid,
+                target: inner.target(),
+                inner,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::Unsupported(format!(
+                "reading a running process (pid {pid}) this way is only implemented on Linux"
+            )))
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }

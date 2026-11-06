@@ -15,6 +15,10 @@
 //!   values do not survive JSON number parsing in every language.
 //! - Percentages are floats in `0.0..=100.0`.
 //! - Arrays are ranked as documented (largest first) and bounded by `--top`.
+//! - Fields added within version 1 are `Option`s with `#[serde(default)]`,
+//!   so documents written before they existed still deserialize (to
+//!   `None`). They are serialized as `null` when absent, like every other
+//!   nullable field.
 
 use std::fmt;
 use std::str::FromStr;
@@ -78,6 +82,10 @@ kind_marker!(
 kind_marker!(
     /// `"kind": "dump"`
     DumpKind = "dump"
+);
+kind_marker!(
+    /// `"kind": "record"`
+    RecordKind = "record"
 );
 kind_marker!(
     /// `"kind": "error"`
@@ -245,6 +253,10 @@ pub struct AnalyzeReport {
     /// Types by retained bytes, largest first. At most `--top`.
     pub type_histogram: Vec<TypeRow>,
     pub notes: Vec<Note>,
+    /// What an allocation profile (`--allocations`) says about where the
+    /// memory came from. `null` without `--allocations`.
+    #[serde(default)]
+    pub allocations: Option<Allocations>,
 }
 
 /// Graph-wide counts (`totals`).
@@ -299,6 +311,10 @@ pub struct Retainer {
     pub retained_pct: f64,
     /// Shortest retaining path from a root to this object.
     pub path: RetainingPath,
+    /// Allocation stacks of the sampled objects this entry retains. `null`
+    /// without `--allocations`.
+    #[serde(default)]
+    pub allocated_at: Option<AllocatedAt>,
     /// Where the object's type (class) is defined.
     #[serde(default)]
     pub type_location: Option<SourceLocation>,
@@ -323,6 +339,158 @@ pub struct TypeRow {
     /// Why `type_location` is `null`.
     #[serde(default)]
     pub type_location_reason: Option<String>,
+}
+
+// ---------------------------------------------------------------- allocations
+
+/// `allocations` on an analyze report: the allocation profile given with
+/// `--allocations`, joined with the snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Allocations {
+    /// Path of the `.hpya` file as given on the command line.
+    pub path: String,
+    /// Process the samples were recorded from.
+    pub pid: u32,
+    /// `sys.version`-style CPython version recorded in the profile.
+    pub python_version: String,
+    /// Unix seconds when recording started.
+    pub started_at: u64,
+    /// Length of the recording window in milliseconds.
+    pub duration_ms: u64,
+    /// Mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"`.
+    pub mechanisms: Vec<String>,
+    pub sampling: SamplingInfo,
+    pub overhead: OverheadInfo,
+    /// Recording stopped early or lost samples the overhead does not count.
+    pub truncated: bool,
+    /// Some Python frames were matched to events by time (ETW) rather than
+    /// read at the event; stacks marked `approximate` may be off by a call.
+    pub approximate: bool,
+    /// Samples in the profile.
+    pub samples: u64,
+    /// Sum of sample weights: estimated bytes allocated through the sampled
+    /// events during the window.
+    pub estimated_bytes: u64,
+    /// How much of the snapshot the samples explain.
+    pub coverage: Coverage,
+    /// Allocation stacks by `estimated_bytes`, largest first. At most `--top`.
+    pub top_stacks: Vec<AllocationStack>,
+}
+
+/// `allocations.sampling`: how the recorder sampled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplingInfo {
+    /// Event kinds enabled: `"arena"`, `"pool"`, `"large_object"`.
+    pub events: Vec<String>,
+    /// Mean bytes between large-object samples; 0 means every one was kept.
+    pub byte_interval: u64,
+    /// Most Python frames kept per sample.
+    pub max_frames: u32,
+}
+
+/// `allocations.overhead`: what recording cost, as measured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverheadInfo {
+    pub samples_taken: u64,
+    pub samples_dropped: u64,
+    pub probe_hits: u64,
+    /// Total time target threads were stopped, summed over threads.
+    pub total_pause_ns: u64,
+}
+
+/// `allocations.coverage`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Reachable objects whose address falls in a sampled allocation.
+    pub linked_objects: u64,
+    /// Their shallow bytes.
+    pub linked_bytes: u64,
+    /// `linked_bytes / totals.reachable_bytes * 100`.
+    pub linked_pct: f64,
+    /// The part of `linked_objects` linked through large-object samples,
+    /// which cover exactly one allocation. The rest is linked through arena
+    /// and pool samples: the most recent growth event that created the
+    /// memory, not necessarily the call that allocated the object.
+    pub exact_linked_objects: u64,
+    /// Shallow bytes of `exact_linked_objects`.
+    pub exact_linked_bytes: u64,
+    /// Reachable objects that are not linked because the latest sample
+    /// covering their address is a large-object sample they do not match
+    /// (another start or size): the sampled block was freed and the memory
+    /// reused by an allocation that was not sampled. Missing (0) in
+    /// documents from heapspy versions before this field.
+    #[serde(default)]
+    pub unlinked_reused_objects: u64,
+    /// Shallow bytes of `unlinked_reused_objects`.
+    #[serde(default)]
+    pub unlinked_reused_bytes: u64,
+}
+
+/// One Python frame of an allocation stack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackFrame {
+    /// `co_qualname`, e.g. `"Cache.load"`; `"<unknown>"` if the code
+    /// object could not be read.
+    pub function: String,
+    /// `co_filename`; `null` if unknown.
+    pub file: Option<String>,
+    /// Line of the executing instruction; `null` if unknown.
+    pub line: Option<u32>,
+    /// `file:line`, `file:?` without a line, or `"<unknown>"`.
+    pub location: String,
+    /// Matched to the event by time, not read at the event.
+    pub approximate: bool,
+}
+
+/// One entry of `allocations.top_stacks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationStack {
+    /// 1-based position in the list.
+    pub rank: u32,
+    /// Innermost first: `frames[0]` is the function that allocated.
+    pub frames: Vec<StackFrame>,
+    /// Sum of the weights of this stack's samples.
+    pub estimated_bytes: u64,
+    pub samples: u64,
+    /// Event kinds among the samples, sorted: `"arena"`, `"pool"`, `"large_object"`.
+    pub events: Vec<String>,
+    /// Shallow bytes of reachable snapshot objects linked to these samples.
+    pub linked_bytes: u64,
+    /// The part of `linked_bytes` linked through large-object samples
+    /// (exact links); the rest came through arena and pool samples.
+    pub exact_linked_bytes: u64,
+    /// Any frame of any sample was approximate.
+    pub approximate: bool,
+}
+
+/// `allocated_at` on a retainer or instance: which stacks allocated the
+/// sampled objects in its dominator subtree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedAt {
+    /// Objects in the subtree linked to a sample.
+    pub linked_objects: u64,
+    /// Their shallow bytes.
+    pub linked_bytes: u64,
+    /// The part of `linked_bytes` linked through large-object samples.
+    pub exact_linked_bytes: u64,
+    /// Stacks by `linked_bytes`, largest first. At most 5.
+    pub stacks: Vec<AllocatedAtStack>,
+    /// Any listed stack is approximate.
+    pub approximate: bool,
+}
+
+/// One entry of `allocated_at.stacks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedAtStack {
+    /// Innermost first.
+    pub frames: Vec<StackFrame>,
+    /// Linked objects in the subtree allocated through this stack.
+    pub linked_objects: u64,
+    pub linked_bytes: u64,
+    /// The part of `linked_bytes` linked through large-object samples.
+    pub exact_linked_bytes: u64,
+    /// `rank` of the same stack in `allocations.top_stacks`, if listed there.
+    pub top_stack_rank: Option<u32>,
 }
 
 // ---------------------------------------------------------------- query --type
@@ -365,6 +533,10 @@ pub struct Instance {
     pub length: Option<u64>,
     /// Shortest retaining path; `null` if the instance is unreachable.
     pub path: Option<RetainingPath>,
+    /// Allocation stacks of the sampled objects this instance retains.
+    /// `null` without `--allocations`.
+    #[serde(default)]
+    pub allocated_at: Option<AllocatedAt>,
     /// Where the instance itself is defined, when it is a function, method,
     /// code object, class or module.
     #[serde(default)]
@@ -583,6 +755,38 @@ pub struct DumpImage {
     /// Bytes of memory the image's own headers describe but the file does
     /// not contain (a core cut short). 0 when complete or unknown.
     pub missing_bytes: u64,
+}
+
+// ---------------------------------------------------------------- record
+
+/// `heapspy record --json`, printed after the profile (and the
+/// `--then-dump` snapshot, if asked for) is written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordReport {
+    pub schema_version: SchemaVersion,
+    pub kind: RecordKind,
+    /// The allocation profile written, as given with `-o`.
+    pub path: String,
+    /// Process recorded.
+    pub pid: u32,
+    /// CPython version found in the target, `sys.version` style.
+    pub python_version: String,
+    /// Measured length of the recording window, in milliseconds.
+    pub duration_ms: u64,
+    /// Mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"`.
+    pub mechanisms: Vec<String>,
+    /// Same as `allocations.sampling` in the analyze report.
+    pub sampling: SamplingInfo,
+    /// Samples written to the profile.
+    pub samples: u64,
+    /// Size of the profile file.
+    pub bytes_written: u64,
+    /// Same as `allocations.overhead` in the analyze report.
+    pub overhead: OverheadInfo,
+    /// Recording stopped early or lost samples the overhead does not count.
+    pub truncated: bool,
+    /// The `--then-dump` snapshot written, as given; `null` without it.
+    pub then_dump: Option<String>,
 }
 
 // ---------------------------------------------------------------- error
