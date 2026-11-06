@@ -171,6 +171,45 @@ def test_throttling_explains_runqueue_wait_on_idle_host() -> None:
     assert any(e["signal"] == "cfs_throttled_ratio" for e in rq["evidence_against"])
 
 
+def test_throttling_explains_runqueue_wait_on_busy_host() -> None:
+    # Regression: with other load on the host (procs_running_per_core >= 1 and CPU PSI
+    # up), run-queue contention tied the quota even though throttled time made up
+    # nearly all of the process's run-queue wait.
+    res = rank(
+        {
+            "runqueue_wait_ratio": 4.0,
+            "runqueue_wait_seconds_per_s": 0.8,
+            "cfs_throttled_ratio": 1.0,
+            "tightest_limit_cores": 0.2,
+            "throttled_seconds_per_s": 0.75,
+            "process_cpu_cores_to_tightest_limit_ratio": 1.0,
+            "procs_running_per_core": 1.3,
+            "psi_cpu_some_window_pct": 60.0,
+            "nonvoluntary_switches_per_s": 150.0,
+            "voluntary_share": 0.1,
+        }
+    )
+    assert res[0]["id"] == "cfs_throttling"
+    rq = next(h for h in res if h["id"] == "runqueue_contention")
+    assert rq["score"] < res[0]["score"]
+    assert any(e["signal"] == "throttled_share_of_runqueue_wait" for e in rq["evidence_against"])
+
+
+def test_runqueue_wait_not_explained_by_light_throttling() -> None:
+    res = rank(
+        {
+            "runqueue_wait_ratio": 4.0,
+            "runqueue_wait_seconds_per_s": 0.8,
+            "cfs_throttled_ratio": 0.06,
+            "tightest_limit_cores": 4.0,
+            "throttled_seconds_per_s": 0.01,
+            "procs_running_per_core": 2.0,
+            "psi_cpu_some_window_pct": 60.0,
+        }
+    )
+    assert res[0]["id"] == "runqueue_contention"
+
+
 THRASH = {
     "major_faults_per_s": 150.0,
     "refaults_per_s": 1000.0,

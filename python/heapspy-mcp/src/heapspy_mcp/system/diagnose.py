@@ -46,6 +46,12 @@ THRESHOLDS: dict[str, tuple[float, str, str]] = {
     "cfs_throttled_ratio_some": (0.05, "ratio", "some CFS periods hit the quota"),
     "cfs_throttled_ratio_none": (0.01, "ratio", "throttling is rare"),
     "throttled_seconds_per_s_high": (0.10, "s/s", "100 ms of throttling per second"),
+    "throttled_share_of_runqueue_wait_high": (
+        0.50,
+        "ratio",
+        "cgroup throttled time is at least half of the process's run-queue wait: the wait "
+        "is mostly the quota, not other runnable tasks",
+    ),
     "usage_to_limit_ratio_high": (0.90, "ratio", "usage within 10% of the quota"),
     "voluntary_share_high": (0.70, "ratio", "most switches are the thread blocking itself"),
     "voluntary_share_low": (0.30, "ratio", "most switches are preemptions"),
@@ -236,6 +242,7 @@ def extract_signals(
             _get(view, "scheduler", "runqueue_wait_ratio"),
             unavailable.get("runqueue_wait_ratio"),
         ),
+        "runqueue_wait_seconds_per_s": _get(view, "scheduler", "runqueue_wait_seconds_per_s"),
         "mean_runnable_threads": round(states.get("running_or_runnable", 0) * threads, 2)
         if states
         else None,
@@ -417,7 +424,20 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
     _ge(h, "for", s, "psi_cpu_some_window_pct", "psi_cpu_some_window_pct_high", 1)
     ratio = s.get("cfs_throttled_ratio")
     prc = s.get("procs_running_per_core")
-    if (
+    thr = s.get("throttled_seconds_per_s")
+    rqw = s.get("runqueue_wait_seconds_per_s")
+    if thr and rqw and thr / rqw >= T("throttled_share_of_runqueue_wait_high"):
+        # Throttled time is counted as run-queue wait whatever the host load is, so a
+        # busy host must not make the quota look like contention.
+        h.add(
+            "against",
+            "throttled_share_of_runqueue_wait",
+            round(thr / rqw, 3),
+            "throttled_share_of_runqueue_wait_high",
+            3,
+            f"throttled_seconds_per_s={thr}, runqueue_wait_seconds_per_s={rqw}",
+        )
+    elif (
         ratio is not None
         and ratio >= T("cfs_throttled_ratio_high")
         and prc is not None
