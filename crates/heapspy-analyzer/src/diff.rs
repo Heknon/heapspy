@@ -73,6 +73,24 @@ fn site_edge_label(snap: &Snapshot, l: EdgeLabel) -> Result<String> {
     })
 }
 
+/// The shortest path to `v` as a site string: root label, then generalised
+/// edge labels, e.g. `sys.modules['app.a'].__dict__['SHARED']`.
+fn shortest_path_site(a: &Analysis, v: u32) -> Result<String> {
+    let mut s = String::new();
+    for (i, (_, e)) in a.bfs_chain(v).into_iter().enumerate() {
+        if i == 0 {
+            let r = a.g.root_entry(e).expect("a BFS path starts at a root");
+            s.push_str(a.snap.string(r.label)?);
+        } else {
+            push_edge(
+                &mut s,
+                &site_edge_label(a.snap, a.snap.edge(e as u64).label)?,
+            );
+        }
+    }
+    Ok(s)
+}
+
 fn render_site(sites: &[Site], mut id: u32) -> String {
     let mut labels = Vec::new();
     while id != NONE {
@@ -115,11 +133,12 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
                 Some(r) => (NONE, a.snap.string(r.label)?.to_string()),
                 // Dominated only by the super-root but reached through an
                 // ordinary edge: the object hangs off several roots and none
-                // of them owns it. Name the site by the edge alone.
-                None => {
-                    let l = site_edge_label(a.snap, a.snap.edge(e as u64).label)?;
-                    (NONE, format!("...{l}"))
-                }
+                // of them owns it. Name the site by its shortest path, which
+                // starts at the best-ranked root. The edge label alone is not
+                // enough: every module dict that is also some function's
+                // `__globals__` would be `....__dict__`, and globals of the
+                // same name in different modules would be summed.
+                None => (NONE, shortest_path_site(a, v)?),
             }
         } else {
             let l = site_edge_label(a.snap, a.snap.edge(e as u64).label)?;

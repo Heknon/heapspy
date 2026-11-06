@@ -1,0 +1,50 @@
+# Builds the `heapspy` wheel. The wheel contains only the Rust binary
+# (maturin `bindings = "bin"`), so it is tagged py3-none-<platform> and works
+# with any Python 3 interpreter. The version comes from Cargo: see
+# `[workspace.package] version` in Cargo.toml and docs/releasing.md.
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "heapspy"
+description = "Find what keeps memory alive in a CPython process, from the outside"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+dynamic = ["version"]
+keywords = ["memory", "leak", "heap", "profiler", "cpython", "debugging"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/Heknon/heapspy"
+Repository = "https://github.com/Heknon/heapspy"
+Issues = "https://github.com/Heknon/heapspy/issues"
+Documentation = "https://github.com/Heknon/heapspy#readme"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/heapspy/Cargo.toml"
+strip = true
+# maturin already adds the workspace crates the binary depends on. Keep
+# everything else that only matters in the git repository out of the sdist.
+exclude = [
+    { path = ".github/**", format = "sdist" },
+    { path = "docs/**", format = "sdist" },
+    { path = "python/**", format = "sdist" },
+    { path = "scripts/**", format = "sdist" },
+    { path = "crates/*/tests/**", format = "sdist" },
+]

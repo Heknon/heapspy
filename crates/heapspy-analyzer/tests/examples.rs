@@ -91,6 +91,19 @@ fn diff_example() {
 }
 
 #[test]
+fn dump_example() {
+    let r: DumpReport = round_trip("dump.json");
+    assert_eq!(r.source.kind, "pid");
+    assert_eq!(r.image.missing_bytes, 0);
+    assert!(r.pause_ms.is_some());
+    // A dump of a file source has no pause; null must parse.
+    let mut v = example("dump.json");
+    v["pause_ms"] = serde_json::Value::Null;
+    let r: DumpReport = serde_json::from_value(v).unwrap();
+    assert_eq!(r.pause_ms, None);
+}
+
+#[test]
 fn error_example() {
     let _: ErrorReport = round_trip("error.json");
 }
@@ -110,6 +123,7 @@ fn every_example_is_tested() {
             "analyze.json",
             "analyze_allocations.json",
             "diff.json",
+            "dump.json",
             "error.json",
             "retaining_path.json",
             "type_query.json"
@@ -127,6 +141,8 @@ fn wrong_schema_version_or_kind_rejected() {
     assert!(serde_json::from_value::<ErrorReport>(v).is_err());
     // A report of one kind does not parse as another.
     assert!(serde_json::from_value::<DiffReport>(example("analyze.json")).is_err());
+    assert!(serde_json::from_value::<DumpReport>(example("analyze.json")).is_err());
+    assert!(serde_json::from_value::<AnalyzeReport>(example("dump.json")).is_err());
 }
 
 #[test]

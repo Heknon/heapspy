@@ -1,0 +1,2 @@
+version 99
+cpu0 1 2 3
