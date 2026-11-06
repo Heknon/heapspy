@@ -305,8 +305,17 @@ mod live {
             .arg("--json")
             .uid(65534)
             .gid(65534)
-            .output()
-            .unwrap();
+            .output();
+        let out = match out {
+            Ok(out) => out,
+            // `nobody` cannot reach the binary (for example a build directory
+            // under a 0700 parent), so the test cannot run here.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipped: user nobody cannot execute the heapspy binary: {e}");
+                return;
+            }
+            Err(e) => panic!("spawning heapspy as nobody: {e}"),
+        };
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{stderr}");
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
