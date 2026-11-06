@@ -1,0 +1,5 @@
+12:pids:/kubepods/besteffort/pod0b8e2f61-9a4c-4d37-8e15-6c2a9f3b7d40/3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a
+11:cpu,cpuacct:/kubepods/besteffort/pod0b8e2f61-9a4c-4d37-8e15-6c2a9f3b7d40/3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a
+10:cpuset:/kubepods/besteffort/pod0b8e2f61-9a4c-4d37-8e15-6c2a9f3b7d40/3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a
+1:name=systemd:/kubepods/besteffort/pod0b8e2f61-9a4c-4d37-8e15-6c2a9f3b7d40/3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a
+0::/

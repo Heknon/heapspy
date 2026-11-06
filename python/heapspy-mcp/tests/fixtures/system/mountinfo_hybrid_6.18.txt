@@ -1,0 +1,12 @@
+23 28 0:22 / /proc rw,relatime - proc proc rw
+37 24 0:29 / /sys/fs/cgroup rw,relatime - tmpfs tmpfs rw,mode=755
+38 37 0:30 / /sys/fs/cgroup/cpu rw,relatime - cgroup cgroup rw,cpu
+39 37 0:31 / /sys/fs/cgroup/cpuacct rw,relatime - cgroup cgroup rw,cpuacct
+40 37 0:32 / /sys/fs/cgroup/cpuset rw,relatime - cgroup cgroup rw,cpuset
+41 37 0:33 / /sys/fs/cgroup/memory rw,relatime - cgroup cgroup rw,memory
+42 37 0:34 / /sys/fs/cgroup/devices rw,relatime - cgroup cgroup rw,devices
+43 37 0:35 / /sys/fs/cgroup/freezer rw,relatime - cgroup cgroup rw,freezer
+44 37 0:36 / /sys/fs/cgroup/blkio rw,relatime - cgroup cgroup rw,blkio
+45 37 0:37 / /sys/fs/cgroup/pids rw,relatime - cgroup cgroup rw,pids
+46 37 0:38 / /sys/fs/cgroup/systemd rw,relatime - cgroup cgroup rw,name=systemd
+47 37 0:39 / /sys/fs/cgroup/unified rw,relatime - cgroup2 cgroup2 rw
