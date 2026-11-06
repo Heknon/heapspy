@@ -102,10 +102,11 @@ heapspy diff before.hpy after.hpy
 
 ### JSON output
 
-Every analysis command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it.
+Every command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it. `dump --json` reports what was written; a failed command prints an error document with a stable code such as `not_python` or `permission_denied`. See [docs/json-schema.md](docs/json-schema.md).
 
 ```sh
 heapspy analyze app.hpy --json | jq '.top_retainers[0]'
+heapspy dump --pid 1234 -o app.hpy --json | jq '.objects, .pause_ms'
 ```
 
 ## Permissions
