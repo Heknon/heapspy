@@ -12,7 +12,11 @@ Environment:
                            for dump also dump_fail (text error, no document),
                            dump_no_file, dump_truncated, dump_no_json (exit 0, no
                            document), dump_usage (usage error naming --json in its
-                           Usage line), old_binary (a heapspy without dump --json)
+                           Usage line), old_binary (a heapspy without dump --json,
+                           --allocations or flamegraph);
+                           with --allocations also alloc_not_linked (a profile from
+                           another pid); a profile path containing "corrupt" fails with
+                           invalid_allocations, a missing one with io
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
 """
 
@@ -155,6 +159,94 @@ def dump(args: list[str]) -> None:
     emit(doc)
 
 
+def check_profile(args: list[str]) -> str | None:
+    """The --allocations path, after the checks heapspy makes when opening it."""
+    profile = opt(args, "allocations")
+    if profile is None:
+        return None
+    if MODE == "old_binary":
+        usage_error("--allocations", f"heapspy {args[0]} <SNAP>")
+    if "corrupt" in profile:
+        fail("invalid_allocations", f"{profile} is not an allocation profile")
+    if not Path(profile).is_file():
+        fail("io", f"cannot open {profile}: No such file or directory (os error 2)")
+    return profile
+
+
+NOT_LINKED_NOTES = [
+    {
+        "code": "allocations_pid_mismatch",
+        "message": "The allocation profile was recorded from pid 999, the snapshot from 1234.",
+    },
+    {
+        "code": "allocations_not_linked",
+        "message": "No object was linked to an allocation sample.",
+    },
+]
+
+
+def analyze_with_allocations(args: list[str], profile: str, top: int) -> dict:
+    doc = load_fixture("analyze_allocations")
+    doc["snapshot"]["path"] = args[1]
+    doc["allocations"]["path"] = profile
+    doc["top_retainers"] = doc["top_retainers"][:top]
+    doc["type_histogram"] = doc["type_histogram"][:top]
+    doc["allocations"]["top_stacks"] = doc["allocations"]["top_stacks"][:top]
+    if MODE == "alloc_not_linked":
+        cov = doc["allocations"]["coverage"]
+        for k in cov:
+            cov[k] = 0
+        for s in doc["allocations"]["top_stacks"]:
+            s["linked_bytes"] = s["exact_linked_bytes"] = 0
+        for r in doc["top_retainers"]:
+            r["allocated_at"] = {
+                "linked_objects": 0,
+                "linked_bytes": 0,
+                "exact_linked_bytes": 0,
+                "stacks": [],
+                "approximate": False,
+            }
+        doc["notes"] = [*doc["notes"], *NOT_LINKED_NOTES]
+    if MODE == "big":
+        stack = doc["allocations"]["top_stacks"][0]
+        frame = stack["frames"][0]
+        many = [{**frame, "function": "f" * 1000, "file": "x/" * 400 + "y.py"}] * 200
+        doc["allocations"]["top_stacks"] = [
+            {**copy.deepcopy(stack), "rank": i + 1, "frames": many} for i in range(top)
+        ]
+        at = doc["top_retainers"][0]["allocated_at"]
+        at["stacks"] = [{**copy.deepcopy(at["stacks"][0]), "frames": many}] * 5
+    return doc
+
+
+def flamegraph(args: list[str]) -> None:
+    """flamegraph --allocations FILE --folded, from the fixture's top stacks."""
+    if MODE == "old_binary":
+        print(
+            "error: unrecognized subcommand 'flamegraph'\n\nUsage: heapspy <COMMAND>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    profile = opt(args, "allocations")
+    if profile is None or "--folded" not in args:
+        sys.exit(2)
+    if "corrupt" in profile:
+        print(f"heapspy: error: {profile} is not an allocation profile", file=sys.stderr)
+        sys.exit(1)
+    doc = load_fixture("analyze_allocations")
+    lines = []
+    for stack in doc["allocations"]["top_stacks"]:
+        frames = [f"{f['function']} ({f['location']})" for f in reversed(stack["frames"])]
+        lines.append(f"{';'.join(frames)} {stack['estimated_bytes']}")
+    if MODE == "big":
+        lines = [f"main (app/main.py:1);f{i} (app/f.py:{i}) {i + 1}" for i in range(5000)]
+    # A stack without Python frames, and one split across two lines (merged by the reader).
+    lines.append("[no Python stack] 4096")
+    lines.append(lines[0].rsplit(" ", 1)[0] + " 1024")
+    print("\n".join(sorted(lines)))
+    sys.exit(0)
+
+
 def main() -> None:
     log = os.environ.get("FAKE_HEAPSPY_LOG")
     if log:
@@ -182,11 +274,16 @@ def main() -> None:
     cmd = args[0] if args else ""
     if cmd == "dump":
         dump(args)
+    if cmd == "flamegraph":
+        flamegraph(args)
 
     if "--json" not in args:
         sys.exit(2)
 
-    if cmd == "analyze":
+    profile = check_profile(args)
+    if cmd == "analyze" and profile is not None:
+        doc = analyze_with_allocations(args, profile, int(opt(args, "top") or 20))
+    elif cmd == "analyze":
         doc = big_analyze() if MODE == "big" else load("analyze")
         doc["snapshot"]["path"] = args[1]
         top = int(opt(args, "top") or 20)
@@ -199,6 +296,20 @@ def main() -> None:
         doc = load("type_query")
         doc["snapshot"]["path"] = args[1]
         doc["query"] = t
+        if profile is not None:
+            # As analyze_allocations' first retainer; query reports have no top_stacks.
+            at = copy.deepcopy(load_fixture("analyze_allocations")["top_retainers"][0])
+            at = at["allocated_at"]
+            for stack in at["stacks"]:
+                stack["top_stack_rank"] = None
+            for inst in doc["top_instances"]:
+                inst["allocated_at"] = at
+            sampled = load_fixture("analyze_allocations")["notes"][-1]
+            doc["notes"] = [*doc["notes"], sampled]
+            if MODE == "alloc_not_linked":
+                for inst in doc["top_instances"]:
+                    inst["allocated_at"] = {**at, "linked_objects": 0, "stacks": []}
+                doc["notes"] = [*doc["notes"], *NOT_LINKED_NOTES]
         if MODE == "big":
             inst = doc["top_instances"][0]
             doc["top_instances"] = [

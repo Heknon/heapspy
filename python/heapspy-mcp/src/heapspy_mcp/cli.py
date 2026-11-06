@@ -89,6 +89,11 @@ _HINTS = {
         "A file could not be read or written: check that the path exists and is readable, "
         "and that the snapshot directory has free space."
     ),
+    "allocations_unsupported": (
+        "Allocation profiles need a heapspy with the allocation join (analyze and query "
+        "--allocations, flamegraph --allocations). Upgrade heapspy, or leave out the "
+        "allocations argument."
+    ),
     "internal": "A bug in heapspy. The message and stderr say where it failed.",
 }
 
@@ -107,7 +112,8 @@ class HeapspyError(Exception):
     one added by this wrapper: ``binary_not_found``, ``timeout``,
     ``usage_error`` (exit status 2), ``bad_output`` (stdout is not JSON),
     ``schema_mismatch``, ``unexpected_kind``, ``cli_failed`` (non-zero exit
-    without an error document). ``cli_code`` holds a CLI code this server does
+    without an error document), ``allocations_unsupported`` (a heapspy
+    without ``--allocations``). ``cli_code`` holds a CLI code this server does
     not know; ``code`` is then ``internal``.
     """
 
@@ -148,6 +154,10 @@ def _tail(text: str, limit: int = _STDERR_LIMIT) -> str:
 
 # clap's message when `dump` does not know `--json` (heapspy before dump --json).
 _UNKNOWN_JSON_FLAG_RE = re.compile(r"unexpected argument '--json'")
+# clap's messages from a heapspy without the allocation join.
+_ALLOCATIONS_UNKNOWN_RE = re.compile(
+    r"unexpected argument '--allocations'|unrecognized subcommand 'flamegraph'"
+)
 
 
 @dataclass(frozen=True)
@@ -188,14 +198,22 @@ class HeapspyCLI:
 
     # -- analysis commands (JSON) -------------------------------------------------
 
-    def analyze(self, snapshot: Path, *, top: int) -> dict[str, Any]:
-        return self.run_json(["analyze", str(snapshot), "--json", f"--top={top}"], "analyze")
+    def analyze(
+        self, snapshot: Path, *, top: int, allocations: Path | None = None
+    ) -> dict[str, Any]:
+        args = ["analyze", str(snapshot), "--json", f"--top={top}"]
+        if allocations is not None:
+            args.append(f"--allocations={allocations}")
+        return self.run_json(args, "analyze")
 
-    def query_type(self, snapshot: Path, type_name: str) -> dict[str, Any]:
+    def query_type(
+        self, snapshot: Path, type_name: str, *, allocations: Path | None = None
+    ) -> dict[str, Any]:
         # `--type=VALUE` so a value starting with '-' is not read as a flag.
-        return self.run_json(
-            ["query", str(snapshot), f"--type={type_name}", "--json"], "type_query"
-        )
+        args = ["query", str(snapshot), f"--type={type_name}", "--json"]
+        if allocations is not None:
+            args.append(f"--allocations={allocations}")
+        return self.run_json(args, "type_query")
 
     def retaining_path(self, snapshot: Path, address: str) -> dict[str, Any]:
         return self.run_json(
@@ -251,6 +269,24 @@ class HeapspyCLI:
             raise self._failure(proc, json_expected=False)
         return _dump_from_stderr(output, proc)
 
+    # -- allocation profile without a snapshot -------------------------------------
+
+    def allocation_folded(self, profile: Path) -> str:
+        """``heapspy flamegraph --allocations PROFILE --folded`` on stdout.
+
+        heapspy has no JSON report for a profile on its own; the folded
+        stacks (``outer;...;inner bytes``, weighted by estimated bytes) are
+        the only profile-only output. ``--min-bytes=0`` turns off the
+        ``[other]`` folding so every stack is its own line.
+        """
+        proc = self._run(
+            ["flamegraph", f"--allocations={profile}", "--folded", "--min-bytes=0"],
+            timeout=self.timeout,
+        )
+        if proc.returncode != 0:
+            raise self._failure(proc, json_expected=False)
+        return proc.stdout
+
     # -- plumbing -----------------------------------------------------------------
 
     def run_json(self, args: list[str], expected_kind: str) -> dict[str, Any]:
@@ -302,6 +338,14 @@ class HeapspyCLI:
     def _failure(
         self, proc: subprocess.CompletedProcess[str], *, json_expected: bool
     ) -> HeapspyError:
+        if proc.returncode == 2 and _ALLOCATIONS_UNKNOWN_RE.search(proc.stderr or ""):
+            return HeapspyError(
+                "allocations_unsupported",
+                "this heapspy does not read allocation profiles (no --allocations or no "
+                "flamegraph command)",
+                exit_status=2,
+                stderr=proc.stderr,
+            )
         if proc.returncode == 2:
             return HeapspyError(
                 "usage_error",

@@ -66,3 +66,17 @@ class SnapshotStore:
             raise SnapshotRefError(f"snapshot file not found: {ref}")
         # Absolute, so the argument can never start with '-' on the heapspy command line.
         return Path(os.path.abspath(path))
+
+
+def resolve_profile(ref: str) -> Path:
+    """Turn a path to a ``.hpya`` allocation profile into an absolute path."""
+    ref = ref.strip()
+    if not ref:
+        raise SnapshotRefError("empty allocation profile path")
+    path = Path(ref).expanduser()
+    if path.suffix != ".hpya":
+        raise SnapshotRefError(f"{ref!r} is not a path to a .hpya allocation profile")
+    if not path.is_file():
+        raise SnapshotRefError(f"allocation profile not found: {ref}")
+    # Absolute, so the argument can never start with '-' on the heapspy command line.
+    return Path(os.path.abspath(path))

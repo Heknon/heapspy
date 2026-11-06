@@ -12,13 +12,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from . import allocations as A
 from . import capture as capture_mod
 from . import cpu as cpu_tools
 from . import processes, source_map
 from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
 from .config import Config
-from .snapshots import SnapshotRefError, SnapshotStore
+from .snapshots import SnapshotRefError, SnapshotStore, resolve_profile
 from .system import register as register_process_diagnostics
 
 log = logging.getLogger("heapspy_mcp")
@@ -41,9 +42,21 @@ The loop:
 8. For growth over time: capture twice and diff_snapshots(before, after). Objects are
    matched by type and retaining site, not by address, so per-object identity is approximate.
 
+"Where was this memory allocated?" needs an allocation profile (.hpya) recorded from the
+process before the snapshot was taken:
+- allocation_sites(profile, snapshot): the top allocating stacks with file:line, estimated
+  bytes, and the bytes still alive in the snapshot that link to each stack (exact for large
+  objects, approximate for arena and pool samples). Without a snapshot: estimated bytes only.
+- heap_summary(snapshot, allocations=profile) and type_detail(..., allocations=profile):
+  allocated_at on each top retainer or instance, the stacks that allocated what it retains.
+- Each stack has source_hints: file:line to read, and a qualname_guess for map_to_source.
+
 Limits:
-- No allocation history. heapspy cannot say where an object was allocated, only what keeps
-  it alive now. For allocation stacks use tracemalloc or memray from process start.
+- Allocation data exists only for a recorded .hpya profile. It covers sampled events
+  (arena, pool, large object) during the recording window, not objects allocated before it.
+  `heapspy record` is not implemented yet and this server has no tool that records; without
+  a profile, heapspy can say what keeps an object alive, not where it was allocated. For
+  allocation stacks from process start use tracemalloc or memray.
 - Untracked objects (bare ints, short strings, raw buffers) are seen only through a
   tracked container that references them.
 - Native memory (C extensions, malloc outside Python objects) is invisible to the object
@@ -103,6 +116,15 @@ SnapshotArg = Annotated[
 ]
 TopArg = Annotated[
     int, Field(description=f"How many ranked rows to return per list (1 to {S.MAX_TOP}).")
+]
+AllocationsArg = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Optional path to a .hpya allocation profile recorded from the same process "
+            "before the snapshot. Adds allocated_at (allocating stacks) to the result."
+        )
+    ),
 ]
 
 
@@ -204,18 +226,26 @@ def build_server(config: Config) -> MCPServer:
             "retained size, and memory accounting (RSS vs. bytes in the object graph). Start "
             "here after capture_snapshot. If memory.outside_graph_pct is high, most memory is "
             "native or untracked and the object graph cannot explain it. The report shows what "
-            "is retained now, not where it was allocated."
+            "is retained now. With allocations (a .hpya profile), each retainer also gets "
+            "allocated_at (the sampled stacks that allocated what it retains) and the result "
+            "gets an allocations block with the top allocating stacks and their caveats."
         ),
     )
-    def heap_summary(snapshot: SnapshotArg, top: TopArg = 10) -> dict[str, Any]:
+    def heap_summary(
+        snapshot: SnapshotArg, top: TopArg = 10, allocations: AllocationsArg = None
+    ) -> dict[str, Any]:
         def body() -> dict[str, Any]:
             n = S.clamp(top, 1, S.MAX_TOP)
             path = store.resolve(snapshot)
-            doc = cli.analyze(path, top=n)
-            return {
+            profile = resolve_profile(allocations) if allocations is not None else None
+            doc = cli.analyze(path, top=n, allocations=profile)
+            out = {
                 "snapshot_ref": store.handle_for(path) or str(path),
                 **S.summarize_analyze(doc, n),
             }
+            if profile is not None:
+                A.add_to_analyze(out, doc, n)
+            return out
 
         return _guard(body)
 
@@ -309,21 +339,91 @@ def build_server(config: Config) -> MCPServer:
             "instances with their root paths, and holders (which container types and edges "
             "reference the instances, grouped, e.g. builtins.dict [<key>] x 400000). Accepts a "
             "full name (app.session.Session) or an unqualified one (Session). Use it to judge "
-            "whether a type is leaking and who is accumulating it."
+            "whether a type is leaking and who is accumulating it. With allocations (a .hpya "
+            "profile), each instance gets allocated_at: the sampled stacks that allocated it "
+            "and what it retains."
         ),
     )
     def type_detail(
         snapshot: SnapshotArg,
         type: Annotated[str, Field(description="Type name, module.qualname or unqualified.")],
         top: TopArg = 10,
+        allocations: AllocationsArg = None,
     ) -> dict[str, Any]:
         def body() -> dict[str, Any]:
             n = S.clamp(top, 1, S.MAX_TOP)
             path = store.resolve(snapshot)
-            doc = cli.query_type(path, _clean_type(type))
-            return {
+            profile = resolve_profile(allocations) if allocations is not None else None
+            doc = cli.query_type(path, _clean_type(type), allocations=profile)
+            out = {
                 "snapshot_ref": store.handle_for(path) or str(path),
                 **S.summarize_type_query(doc, n),
+            }
+            if profile is not None:
+                A.add_to_type_query(out, doc)
+            return out
+
+        return _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Where memory was allocated, from a .hpya allocation profile: the top allocating "
+            "Python stacks (innermost frame first, each with file:line) by estimated bytes. "
+            "With snapshot (taken from the same process after recording), each stack also "
+            "has linked_bytes, the bytes of objects still alive in the snapshot that were "
+            "allocated there (exact_linked_bytes: the exact part, through large-object "
+            "samples; arena and pool links are approximate), plus coverage, the recording "
+            "mechanisms, sampling parameters and notes. Without snapshot only estimated "
+            "bytes per stack are available. Each stack has source_hints (file:line, "
+            "qualname_guess for map_to_source). The data is sampled and covers the recording "
+            "window only; see caveats in the result."
+        ),
+    )
+    def allocation_sites(
+        profile: Annotated[str, Field(description="Path to a .hpya allocation profile.")],
+        snapshot: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional snapshot handle or .hpy path of the same process, taken after "
+                    "recording, to link stacks to live memory."
+                )
+            ),
+        ] = None,
+        top: TopArg = 10,
+    ) -> dict[str, Any]:
+        def body() -> dict[str, Any]:
+            n = S.clamp(top, 1, S.MAX_TOP)
+            prof = resolve_profile(profile)
+            if snapshot is None:
+                text = cli.allocation_folded(prof)
+                return {
+                    "profile": str(prof),
+                    "mode": "profile_only",
+                    **A.summarize_folded(text, n),
+                    "note": (
+                        "Without a snapshot, heapspy gives only folded stacks (flamegraph "
+                        "--allocations --folded), aggregated here: estimated bytes per stack. "
+                        "Sample counts, event kinds, the recording header (mechanisms, "
+                        "sampling parameters, overhead) and linked bytes need a snapshot."
+                    ),
+                    "caveats": list(A.CAVEATS),
+                }
+            path = store.resolve(snapshot)
+            doc = cli.analyze(path, top=n, allocations=prof)
+            summary = A.summarize_allocations(doc.get("allocations"), doc.get("notes"), n)
+            if summary is None:
+                raise HeapspyError(
+                    "bad_output",
+                    "heapspy analyze --allocations returned no allocations block",
+                )
+            return {
+                "profile": str(prof),
+                "snapshot_ref": store.handle_for(path) or str(path),
+                "snapshot": S.snapshot_summary(doc.get("snapshot")),
+                "mode": "joined",
+                **summary,
             }
 
         return _guard(body)
