@@ -27,13 +27,31 @@
 //! memory (the heap, the order, and the ranges) plus one `u32` per object
 //! for the result.
 //!
-//! Links through large-object samples are exact: the range is one
-//! allocation. Links through arena and pool samples (and unknown event
-//! kinds) are approximate: they name the most recent growth event that
-//! created the memory, not necessarily the call that allocated the object.
-//! The report keeps the two apart with `exact_linked_*` fields; the
+//! A large-object sample describes one allocation: its address and its
+//! requested size. An object is that allocation only if it starts there
+//! and has that size ([`matches_large_object`]). When the latest covering
+//! sample is a large-object sample the object does not match, the sampled
+//! block was freed and the memory reused by an allocation that was not
+//! sampled, so the object is not linked at all: older samples over the
+//! same address describe even earlier allocations. Such objects are
+//! counted in `coverage.unlinked_reused_*`. Links through large-object
+//! samples are exact. Links through arena and pool samples (and unknown
+//! event kinds) are approximate: they name the most recent growth event
+//! that created the memory, not necessarily the call that allocated the
+//! object. The report keeps the two apart with `exact_linked_*` fields; the
 //! `approximate` flags keep their schema meaning (frames matched to events
 //! by time).
+//!
+//! A large-object sample never shadows a legitimate arena link. Blocks from
+//! the system allocator (the `brk` heap, or their own `mmap`) and pymalloc
+//! arenas (1 MiB `mmap`s) do not overlap while both are mapped. A sample
+//! range overlaps an arena range only when one was unmapped and the
+//! address range mapped again for the other, and every arena mapping is
+//! recorded (arena events are not sampled), so the later arena sample is
+//! the one that covers objects carved from the new arena. Only a recording
+//! without arena events (`--events large`) leaves pymalloc objects under a
+//! stale large-object sample, and those are then not linked rather than
+//! linked wrongly.
 //!
 //! Samples taken after the snapshot (timestamp past the snapshot's capture
 //! second) are not used for linking: they describe memory the snapshot has
@@ -64,7 +82,7 @@
 use std::collections::{BinaryHeap, HashMap};
 
 use heapspy_alloc::{EventKind, Profile, SampleFlags};
-use heapspy_snapshot::{Snapshot, SourceKind};
+use heapspy_snapshot::{Object, ObjectFlags, Snapshot, SourceKind};
 
 use crate::analysis::Analysis;
 use crate::flame::{sanitise, FoldedLine, FxMap, MinWidth, TextTree};
@@ -149,9 +167,71 @@ pub fn sampled_note() -> Note {
          events (arena, pool, large object); objects allocated before recording started have no \
          stack. Links through arena and pool samples are approximate: they name the most recent \
          growth event that created the memory, not necessarily the call that allocated the \
-         object. Links through large-object samples are exact."
+         object. Links through large-object samples are exact: the object starts where the \
+         sampled allocation starts and has its size."
             .to_string(),
     )
+}
+
+/// The note added when some objects sit on memory of a sampled large
+/// allocation they do not match, and are therefore not linked.
+pub fn reused_note(objects: u64, bytes: u64) -> Note {
+    note(
+        "allocations_unlinked_reused",
+        format!(
+            "{objects} reachable objects ({bytes} bytes) are not linked: the latest sample over \
+             their address is a large allocation with another start or size, so that block was \
+             freed and the memory reused by an allocation that was not sampled (or resized in \
+             place by a realloc that was not sampled). Older samples at the address describe \
+             even earlier allocations."
+        ),
+    )
+}
+
+/// Bytes a CPython object's allocation can start before the object
+/// (`_PyType_PreHeaderSize`, the same on 3.12, 3.13 and 3.14): 0 without
+/// `Py_TPFLAGS_HAVE_GC`, 16 for the GC header, 32 for the GC header plus
+/// the managed dict and weakref words (`Py_TPFLAGS_MANAGED_DICT` and
+/// `Py_TPFLAGS_MANAGED_WEAKREF` require `Py_TPFLAGS_HAVE_GC`). The snapshot
+/// does not record type flags, and a GC object the collector untracked
+/// (an atomic tuple) has no `GC_TRACKED` flag, so any of the three is
+/// accepted, except 0 for a tracked object.
+pub const PRE_HEADERS: [u64; 3] = [0, 16, 32];
+
+/// How far a large-object sample's requested size may be from the object's
+/// shallow size (which includes the pre-header, as the request does). On
+/// 3.12, 3.13 and 3.14 the request is larger than `shallow_size` by up to
+/// one item plus rounding to 8 for instances of variable-size subclasses
+/// (`PyType_GenericAlloc` allocates one item more; 4 bytes for an `int`
+/// subclass, 8 for a `tuple` subclass) and by a few digits for an `int`
+/// normalised after allocation. Everything else measured matched exactly,
+/// apart from blocks resized in place by a `realloc` that was not sampled.
+pub const SIZE_SLACK: u64 = 16;
+
+/// Whether `obj` can be the allocation of a large-object sample at
+/// `address` with requested `size`.
+///
+/// - Start: `obj.addr - address` is one of [`PRE_HEADERS`] (not 0 for a
+///   GC-tracked object).
+/// - Size: `size` is within [`SIZE_SLACK`] of `obj.shallow_size`. For a type
+///   object only the upper bound applies, because its shallow size also
+///   counts the shared-keys table, a separate allocation.
+///
+/// Objects whose shallow size counts other separate allocations (a `str`
+/// with a cached UTF-8 copy, a block shrunk or grown in place by a
+/// `realloc` that was not sampled) fail the size check and stay unlinked:
+/// a missed exact link, never a wrong one.
+pub fn matches_large_object(obj: &Object, address: u64, size: u64) -> bool {
+    let Some(pre) = obj.addr.checked_sub(address) else {
+        return false;
+    };
+    let tracked = obj.flags.contains(ObjectFlags::GC_TRACKED);
+    if !PRE_HEADERS.contains(&pre) || (pre == 0 && tracked) {
+        return false;
+    }
+    let s = obj.shallow_size;
+    let below = obj.flags.contains(ObjectFlags::IS_TYPE) || size.saturating_add(SIZE_SLACK) >= s;
+    below && size <= s.saturating_add(SIZE_SLACK)
 }
 
 /// The note added when the profile does not line up with the snapshot and
@@ -443,6 +523,15 @@ impl<'a, 's> Join<'a, 's> {
         let snap = a.snap;
         let mut stacks = Stacks::new(profile)?;
         let mut notes = compatibility(snap, profile);
+        let mut coverage = Coverage {
+            linked_objects: 0,
+            linked_bytes: 0,
+            linked_pct: 0.0,
+            exact_linked_objects: 0,
+            exact_linked_bytes: 0,
+            unlinked_reused_objects: 0,
+            unlinked_reused_bytes: 0,
+        };
         let link = if notes.is_empty() {
             // Samples after the snapshot's capture second cannot describe it.
             let cutoff = snap
@@ -461,20 +550,35 @@ impl<'a, 's> Join<'a, 's> {
                 })
                 .collect();
             let n = snap.object_count() as u32;
-            latest_covering((0..n).map(|i| snap.object_addr(i)), &ranges)?
+            let mut link = latest_covering((0..n).map(|i| snap.object_addr(i)), &ranges)?;
+            // A large-object sample links only the allocation it describes.
+            for (v, l) in link.iter_mut().enumerate() {
+                if *l == NO_LINK || stacks.of_sample[*l as usize] & EXACT_BIT == 0 {
+                    continue;
+                }
+                let (start, end) = ranges[*l as usize];
+                let obj = snap.object(v as u32);
+                if !matches_large_object(&obj, start, end - start) {
+                    *l = NO_LINK;
+                    if a.reachable(v as u32) {
+                        coverage.unlinked_reused_objects += 1;
+                        coverage.unlinked_reused_bytes += obj.shallow_size;
+                    }
+                }
+            }
+            link
         } else {
             notes.push(not_linked_note());
             Vec::new()
         };
         notes.push(sampled_note());
+        if coverage.unlinked_reused_objects > 0 {
+            notes.push(reused_note(
+                coverage.unlinked_reused_objects,
+                coverage.unlinked_reused_bytes,
+            ));
+        }
 
-        let mut coverage = Coverage {
-            linked_objects: 0,
-            linked_bytes: 0,
-            linked_pct: 0.0,
-            exact_linked_objects: 0,
-            exact_linked_bytes: 0,
-        };
         // Linked objects scattered to their preorder slot, then compacted:
         // O(n) instead of a sort by tin.
         let mut by_tin = if link.is_empty() {

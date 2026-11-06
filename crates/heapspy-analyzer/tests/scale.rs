@@ -419,7 +419,13 @@ fn join_ten_million_objects_one_million_samples() {
         assert_eq!(x.address, y.address);
         assert_eq!(x.retained_bytes, y.retained_bytes);
     }
-    // Every object is in an arena, so every reachable object is linked.
-    assert_eq!(a.coverage.linked_objects, r.totals.reachable_objects);
+    // Every object is in an arena, so every reachable object is linked,
+    // except those under a later large-object sample of another size
+    // (64-byte samples 16 bytes before objects of random sizes).
+    assert_eq!(
+        a.coverage.linked_objects + a.coverage.unlinked_reused_objects,
+        r.totals.reachable_objects
+    );
     assert!(a.coverage.exact_linked_objects > 0);
+    assert!(a.coverage.unlinked_reused_objects > 0);
 }

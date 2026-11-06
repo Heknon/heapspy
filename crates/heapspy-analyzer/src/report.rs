@@ -414,6 +414,16 @@ pub struct Coverage {
     pub exact_linked_objects: u64,
     /// Shallow bytes of `exact_linked_objects`.
     pub exact_linked_bytes: u64,
+    /// Reachable objects that are not linked because the latest sample
+    /// covering their address is a large-object sample they do not match
+    /// (another start or size): the sampled block was freed and the memory
+    /// reused by an allocation that was not sampled. Missing (0) in
+    /// documents from heapspy versions before this field.
+    #[serde(default)]
+    pub unlinked_reused_objects: u64,
+    /// Shallow bytes of `unlinked_reused_objects`.
+    #[serde(default)]
+    pub unlinked_reused_bytes: u64,
 }
 
 /// One Python frame of an allocation stack.

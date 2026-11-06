@@ -163,7 +163,8 @@ fn allocations_section(out: &mut String, a: &Allocations) {
         "  This covers only allocations made while recording. Memory allocated before\n  \
          recording started has no stack. Arena and pool links are approximate: they name\n  \
          the most recent growth event that created the memory, not necessarily the call\n  \
-         that allocated each object. Large-object links are exact.\n",
+         that allocated each object. Large-object links are exact: the object is the\n  \
+         sampled allocation itself.\n",
     );
     let c = &a.coverage;
     let _ = writeln!(
@@ -174,6 +175,15 @@ fn allocations_section(out: &mut String, a: &Allocations) {
         c.linked_pct,
         format_bytes(c.exact_linked_bytes)
     );
+    if c.unlinked_reused_objects > 0 {
+        let _ = writeln!(
+            out,
+            "  Not linked: {} reachable objects ({}) on memory of sampled large allocations they\n  \
+             do not match (another start or size): the memory was reused by unsampled allocations.",
+            c.unlinked_reused_objects,
+            format_bytes(c.unlinked_reused_bytes)
+        );
+    }
     if a.truncated {
         out.push_str(
             "  The recording stopped early or lost samples; the numbers are lower bounds.\n",

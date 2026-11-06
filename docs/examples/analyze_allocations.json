@@ -198,7 +198,11 @@
     },
     {
       "code": "allocations_sampled",
-      "message": "Allocation stacks cover only allocations made while recording, and only the sampled events (arena, pool, large object); objects allocated before recording started have no stack. Links through arena and pool samples are approximate: they name the most recent growth event that created the memory, not necessarily the call that allocated the object. Links through large-object samples are exact."
+      "message": "Allocation stacks cover only allocations made while recording, and only the sampled events (arena, pool, large object); objects allocated before recording started have no stack. Links through arena and pool samples are approximate: they name the most recent growth event that created the memory, not necessarily the call that allocated the object. Links through large-object samples are exact: the object starts where the sampled allocation starts and has its size."
+    },
+    {
+      "code": "allocations_unlinked_reused",
+      "message": "12 reachable objects (98700 bytes) are not linked: the latest sample over their address is a large allocation with another start or size, so that block was freed and the memory reused by an allocation that was not sampled (or resized in place by a realloc that was not sampled). Older samples at the address describe even earlier allocations."
     }
   ],
   "allocations": {
@@ -233,7 +237,9 @@
       "linked_bytes": 63963136,
       "linked_pct": 13.62,
       "exact_linked_objects": 1024,
-      "exact_linked_bytes": 1048576
+      "exact_linked_bytes": 1048576,
+      "unlinked_reused_objects": 12,
+      "unlinked_reused_bytes": 98700
     },
     "top_stacks": [
       {
