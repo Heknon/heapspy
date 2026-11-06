@@ -546,3 +546,55 @@ fn opens_from_disk_through_source_open() {
         Err(Error::Io(_))
     ));
 }
+
+#[test]
+fn resolves_py_runtime_from_a_pe_image_in_the_dump() {
+    use crate::symbols::pe::test_image::{build, Target};
+    use crate::symbols::{find_python_module, pe};
+
+    const BASE: u64 = 0x7ffa_0000_0000;
+    let image = build(
+        BASE,
+        "python313.dll",
+        &[
+            ("_PyRuntime", Target::Rva(0x2a00)),
+            ("PyFwd", Target::Forward("KERNEL32.HeapAlloc")),
+        ],
+    );
+    // Split the image over two adjacent ranges, as a dump splits regions
+    // with different protections.
+    let mut dll = SynthModule::new(BASE, image.len() as u32, r"C:\Python313\python313.dll");
+    dll.file_version = Some(((3 << 16) | 13, (5150 << 16) | 1013));
+    let b = DumpBuilder {
+        memory64: Some(vec![
+            (BASE, image[..0x1000].to_vec()),
+            (BASE + 0x1000, image[0x1000..].to_vec()),
+        ]),
+        modules: Some(vec![
+            SynthModule::new(0x7ff6_0000_0000, 0x1000, r"C:\Python313\python.exe"),
+            SynthModule::new(0x7ff9_0000_0000, 0x1000, r"C:\Python313\python3.dll"),
+            dll,
+        ]),
+        ..DumpBuilder::default()
+    };
+    let d = Minidump::from_bytes(b.build(), MinidumpOptions::default()).unwrap();
+    let mods = d.modules().unwrap();
+    let py = find_python_module(&mods).unwrap();
+    assert_eq!(py.name, "python313.dll");
+    assert_eq!(
+        d.find_symbol(py, "_PyRuntime").unwrap(),
+        Some(BASE + 0x2a00)
+    );
+    assert_eq!(d.find_symbol(py, "PyFwd").unwrap(), None);
+    // python.exe has no image bytes in this dump.
+    assert!(matches!(
+        d.find_symbol(&mods[0], "_PyRuntime"),
+        Err(Error::Unmapped { .. })
+    ));
+
+    let dll = pe::python_dll(&py.name).unwrap();
+    assert_eq!((dll.major, dll.minor, dll.free_threaded), (3, 13, false));
+    let fv = d.module_details()[2].file_version.unwrap();
+    let v = pe::python_version_from_file_version(fv).unwrap();
+    assert_eq!(v.to_string(), "3.13.5");
+}
