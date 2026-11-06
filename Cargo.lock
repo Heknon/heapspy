@@ -212,6 +212,7 @@ dependencies = [
  "object",
  "tempfile",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
