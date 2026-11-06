@@ -35,6 +35,8 @@ fn analyze_example() {
     assert_eq!(r.top_retainers[0].path[0].edge, None);
     assert!(r.top_retainers[0].path[0].root_label.is_some());
     assert_eq!(r.top_retainers[0].address, Address(0x7f3a2c41b0d0));
+    let session = &r.type_histogram[1];
+    assert_eq!(session.type_location.as_ref().unwrap().line, Some(14));
 }
 
 #[test]
@@ -75,7 +77,51 @@ fn documents_without_allocation_fields_parse() {
 
 #[test]
 fn type_query_example() {
-    let _: TypeQueryReport = round_trip("type_query.json");
+    let r: TypeQueryReport = round_trip("type_query.json");
+    assert_eq!(r.matched_type_locations.len(), r.matched_types.len());
+}
+
+#[test]
+fn locate_example() {
+    let r: LocateReport = round_trip("locate.json");
+    assert_eq!(r.matches[0].kind, "function");
+    assert!(r.matches[0].source_loc.as_ref().unwrap().exact);
+}
+
+/// Documents written before the location fields were added still parse:
+/// the fields are additive within schema version 1.
+#[test]
+fn examples_without_location_fields_parse() {
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(m) => {
+                for k in [
+                    "source_loc",
+                    "source_loc_reason",
+                    "type_location",
+                    "type_location_reason",
+                    "matched_type_locations",
+                ] {
+                    m.remove(k);
+                }
+                m.values_mut().for_each(strip);
+            }
+            Value::Array(a) => a.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut v = example("analyze.json");
+    strip(&mut v);
+    let r: AnalyzeReport = serde_json::from_value(v).unwrap();
+    assert_eq!(r.type_histogram[1].type_location, None);
+    let mut v = example("type_query.json");
+    strip(&mut v);
+    let r: TypeQueryReport = serde_json::from_value(v).unwrap();
+    assert!(r.matched_type_locations.is_empty());
+    let mut v = example("retaining_path.json");
+    strip(&mut v);
+    let r: RetainingPathReport = serde_json::from_value(v).unwrap();
+    assert_eq!(r.targets[0].paths[0][0].source_loc, None);
 }
 
 #[test]
@@ -138,6 +184,7 @@ fn every_example_is_tested() {
             "diff.json",
             "dump.json",
             "error.json",
+            "locate.json",
             "record.json",
             "retaining_path.json",
             "type_query.json"

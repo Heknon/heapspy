@@ -94,6 +94,9 @@ def compact_hops(hops: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         if i == 0:
             out["root_label"] = clip(hop.get("root_label"))
             out["root_kind"] = hop.get("root_kind")
+        loc = compact_location(hop.get("source_loc"))
+        if loc is not None:
+            out["source_loc"] = loc
         return out
 
     if len(hops) <= MAX_HOPS:
@@ -103,6 +106,70 @@ def compact_hops(hops: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     head = [one(i, h) for i, h in enumerate(hops[:HEAD_HOPS])]
     tail = [one(len(hops) - keep_tail + i, h) for i, h in enumerate(hops[-keep_tail:])]
     return [*head, {"elided_hops": elided}, *tail]
+
+
+def compact_location(loc: Any) -> dict[str, Any] | None:
+    """A SourceLocation from a report, clipped, with a ``location`` string.
+
+    ``location`` is ``file:line``, ``file:~line`` when the line is derived
+    (a class located through its methods; the class statement is at or
+    before it), or ``file`` alone for a module.
+    """
+    if not isinstance(loc, dict) or not isinstance(loc.get("file"), str):
+        return None
+    file = clip(loc["file"], 400)
+    line = loc.get("line") if isinstance(loc.get("line"), int) else None
+    exact = bool(loc.get("exact"))
+    suffix = "" if line is None else f":{line}" if exact else f":~{line}"
+    text = f"{file}{suffix}"
+    return {
+        "location": text,
+        "file": file,
+        "line": line,
+        "exact": exact,
+        "via": clip(loc.get("via"), 40),
+    }
+
+
+def with_location(item: dict[str, Any], src: dict[str, Any], key: str) -> dict[str, Any]:
+    """Copy ``key`` (``type_location`` or ``source_loc``) and its reason from a
+    report entry, compacted. Nothing is added when the report has no such
+    field (a heapspy from before source locations)."""
+    if key in src:
+        item[key] = compact_location(src.get(key))
+        item[f"{key}_reason"] = clip(src.get(f"{key}_reason"), 60)
+    return item
+
+
+def source_locations(
+    hops: list[dict[str, Any]] | None,
+    type_location: Any = None,
+    type_name: Any = None,
+) -> list[dict[str, Any]]:
+    """Locations recorded in the snapshot for a path: the target's type first,
+    then each located hop (functions, classes, code objects, modules), from
+    the target back to the root. Each entry can be read directly, or its
+    ``name`` passed to ``map_to_source`` with the snapshot for an excerpt."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(entry: dict[str, Any] | None, **extra: Any) -> None:
+        if entry is None or entry["location"] in seen or len(out) >= MAX_SOURCE_HINTS:
+            return
+        seen.add(entry["location"])
+        out.append({**extra, **entry})
+
+    if isinstance(type_name, str):
+        add(compact_location(type_location), of="type", name=clip(type_name, MAX_NAME))
+    for hop in reversed(hops or []):
+        add(
+            compact_location(hop.get("source_loc")),
+            of="hop",
+            type=clip(hop.get("type"), MAX_NAME),
+            address=hop.get("address"),
+            edge=clip(hop.get("edge")),
+        )
+    return out
 
 
 def source_hints(hops: list[dict[str, Any]] | None) -> list[str]:
@@ -152,13 +219,24 @@ def source_hints(hops: list[dict[str, Any]] | None) -> list[str]:
     return hints[:MAX_SOURCE_HINTS]
 
 
-def path_summary(hops: list[dict[str, Any]] | None, *, with_hops: bool) -> dict[str, Any]:
+def path_summary(
+    hops: list[dict[str, Any]] | None,
+    *,
+    with_hops: bool,
+    target: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """``target`` is the report entry the path belongs to; its ``type`` and
+    ``type_location`` lead ``source_locations``."""
     out: dict[str, Any] = {
         "rendered": render_path(hops),
         "length": len(hops or []),
         "root_kind": (hops or [{}])[0].get("root_kind") if hops else None,
         "source_hints": source_hints(hops),
     }
+    # Only from a heapspy whose reports have locations.
+    if any("source_loc" in h for h in hops or []) or (target and "type_location" in target):
+        t = target or {}
+        out["source_locations"] = source_locations(hops, t.get("type_location"), t.get("type"))
     if hops and len(hops) >= 2:
         holder = hops[-2]
         out["direct_holder"] = {
@@ -217,8 +295,9 @@ def summarize_analyze(doc: dict[str, Any], top: int) -> dict[str, Any]:
             "retained_pct": r.get("retained_pct"),
             "retained_objects": r.get("retained_objects"),
             "shallow_bytes": r.get("shallow_bytes"),
-            "path": path_summary(r.get("path"), with_hops=False),
+            "path": path_summary(r.get("path"), with_hops=False, target=r),
         }
+        with_location(item, r, "type_location")
         retainers.append(with_human(item, "retained_bytes"))
     histogram = []
     for row in (doc.get("type_histogram") or [])[:top]:
@@ -228,6 +307,7 @@ def summarize_analyze(doc: dict[str, Any], top: int) -> dict[str, Any]:
             "shallow_bytes": row.get("shallow_bytes"),
             "retained_bytes": row.get("retained_bytes"),
         }
+        with_location(item, row, "type_location")
         histogram.append(with_human(item, "retained_bytes"))
     memory = dict(doc.get("memory") or {})
     with_human(memory, "rss_bytes", "graph_bytes", "outside_graph_bytes")
@@ -245,18 +325,24 @@ def summarize_analyze(doc: dict[str, Any], top: int) -> dict[str, Any]:
 
 def summarize_type_query(doc: dict[str, Any], top: int) -> dict[str, Any]:
     matched = doc.get("matched_types") or []
+    type_locs = [t for t in doc.get("matched_type_locations") or [] if isinstance(t, dict)]
+    by_type = {t.get("type"): t for t in type_locs}
     instances = []
     for inst in (doc.get("top_instances") or [])[:top]:
+        # The instance's type location, for its path's source_locations.
+        target = {"type": inst.get("type"), **by_type.get(inst.get("type"), {})}
         item = {
             "address": inst.get("address"),
             "type": clip(inst.get("type"), MAX_NAME),
             "shallow_bytes": inst.get("shallow_bytes"),
             "retained_bytes": inst.get("retained_bytes"),
             "length": inst.get("length"),
-            "path": path_summary(inst.get("path"), with_hops=False)
+            "path": path_summary(inst.get("path"), with_hops=False, target=target)
             if inst.get("path") is not None
             else None,
         }
+        if inst.get("source_loc") is not None:
+            item["source_loc"] = compact_location(inst.get("source_loc"))
         instances.append(with_human(item, "retained_bytes"))
     holders = [
         {
@@ -278,6 +364,11 @@ def summarize_type_query(doc: dict[str, Any], top: int) -> dict[str, Any]:
         "holders": holders,
         "notes": notes(doc.get("notes")),
     }
+    if "matched_type_locations" in doc:
+        out["type_locations"] = [
+            with_location({"type": clip(t.get("type"), MAX_NAME)}, t, "type_location")
+            for t in type_locs[:MAX_MATCHED_TYPES]
+        ]
     return with_human(out, "shallow_bytes", "retained_bytes")
 
 
@@ -289,9 +380,10 @@ def summarize_target(target: dict[str, Any], max_paths: int) -> dict[str, Any]:
         "shallow_bytes": target.get("shallow_bytes"),
         "retained_bytes": target.get("retained_bytes"),
         "reachable": target.get("reachable"),
-        "paths": [path_summary(p, with_hops=True) for p in paths[:max_paths]],
+        "paths": [path_summary(p, with_hops=True, target=target) for p in paths[:max_paths]],
         "paths_total": len(paths),
     }
+    with_location(item, target, "type_location")
     return with_human(item, "retained_bytes")
 
 

@@ -8,7 +8,8 @@ use heapspy_snapshot::{EdgeLabel, ObjectFlags, Snapshot, TypeId};
 
 use crate::dominators::{self, NONE};
 use crate::graph::{self, ObjectGraph};
-use crate::report::{Address, PathHop, RetainingPath, TypeRow};
+use crate::report::{Address, PathHop, RetainingPath, SourceLocation, TypeRow};
+use crate::source::Locator;
 use crate::Result;
 
 /// Types grouped by display name (`module.qualname`). Two type objects with
@@ -24,7 +25,7 @@ pub struct TypeTable {
 }
 
 impl TypeTable {
-    fn new(snap: &Snapshot) -> Result<TypeTable> {
+    pub(crate) fn new(snap: &Snapshot) -> Result<TypeTable> {
         let mut names = Vec::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let mut group_of = Vec::with_capacity(snap.type_count());
@@ -53,6 +54,15 @@ impl TypeTable {
             .get(t.0 as usize)
             .copied()
             .unwrap_or(self.names.len() as u32 - 1)
+    }
+
+    /// The type ids in group `g`, in id order.
+    pub fn type_ids(&self, g: u32) -> impl Iterator<Item = TypeId> + '_ {
+        self.group_of
+            .iter()
+            .enumerate()
+            .filter(move |&(_, &x)| x == g)
+            .map(|(t, _)| TypeId(t as u32))
     }
 
     pub fn find(&self, name: &str) -> Option<u32> {
@@ -105,6 +115,8 @@ pub struct Analysis<'s> {
     /// BFS distance from the super-root in edges; [`NONE`] if unreachable.
     pub dist: Vec<u32>,
     pub shallow_total: u64,
+    /// Source locations, computed on demand for what a report shows.
+    pub(crate) loc: Locator<'s>,
 }
 
 impl<'s> Analysis<'s> {
@@ -149,7 +161,23 @@ impl<'s> Analysis<'s> {
             via,
             dist,
             shallow_total,
+            loc: Locator::new(snap)?,
         })
+    }
+
+    /// `(source_loc, source_loc_reason)` of object `v` itself.
+    pub fn source_loc(&self, v: u32) -> Result<(Option<SourceLocation>, Option<String>)> {
+        Ok(self.loc.object(v)?.split())
+    }
+
+    /// `(type_location, type_location_reason)` of type group `g`.
+    pub fn group_location(&self, g: u32) -> Result<(Option<SourceLocation>, Option<String>)> {
+        Ok(self.loc.types(self.types.type_ids(g))?.split())
+    }
+
+    /// `(type_location, type_location_reason)` of the type of object `v`.
+    pub fn type_location(&self, v: u32) -> Result<(Option<SourceLocation>, Option<String>)> {
+        self.group_location(self.group(v))
     }
 
     #[inline]
@@ -195,6 +223,7 @@ impl<'s> Analysis<'s> {
     /// One hop: object `v` entered by CSR edge `e`.
     fn hop(&self, v: u32, e: u32) -> Result<PathHop> {
         let o = self.snap.object(v);
+        let (source_loc, source_loc_reason) = self.source_loc(v)?;
         let mut hop = PathHop {
             address: Address(o.addr),
             type_name: self.types.names[self.types.group(o.type_id) as usize].clone(),
@@ -202,6 +231,8 @@ impl<'s> Analysis<'s> {
             edge: None,
             root_label: None,
             root_kind: None,
+            source_loc,
+            source_loc_reason,
         };
         match self.edge_label(e) {
             Some(l) => hop.edge = Some(self.snap.render_label(l)?),
@@ -291,6 +322,9 @@ impl<'s> Analysis<'s> {
                 count: count[g],
                 shallow_bytes: shallow[g],
                 retained_bytes: retained[g],
+                // Filled in by the report builder for the rows it keeps.
+                type_location: None,
+                type_location_reason: None,
             })
             .collect()
     }

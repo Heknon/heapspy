@@ -10,7 +10,7 @@ that each example matches the structs field for field.
 ## Rules
 
 - Every document has `"schema_version": 1` and a `"kind"`:
-  `"dump"`, `"record"`, `"analyze"`, `"type_query"`, `"retaining_path"`,
+  `"dump"`, `"record"`, `"analyze"`, `"type_query"`, `"retaining_path"`, `"locate"`,
   `"diff"` or `"error"`.
 - Within version 1, fields are only added, never removed or redefined.
   Consumers must ignore fields they do not know. A breaking change means
@@ -80,6 +80,8 @@ frame also reaches it through a function's `__globals__`.
 | `edge` | string, nullable | rendered label of the reference from the previous hop to this one; `null` on the first hop |
 | `root_label` | string, nullable | root description, first hop only, e.g. `"sys.modules['app.cache']"` |
 | `root_kind` | string, nullable | first hop only: `"module_dict"`, `"thread_locals"`, `"frame_local"`, `"interp"`, `"other"` |
+| `source_loc` | SourceLocation, nullable | where the object at this hop is defined, when it is a function, method, code object, class or module (see [Source locations](#source-locations)); `null` for other objects |
+| `source_loc_reason` | string, nullable | why `source_loc` is `null` for an object of one of those kinds; `null` otherwise |
 
 Edge labels are rendered as follows (see `docs/snapshot-format.md`, "Edge
 labels"):
@@ -101,6 +103,88 @@ Joining `root_label` and the `edge` strings of the following hops gives the
 rendered root path used as the `site` key in diffs, e.g.
 `sys.modules['app.cache'].__dict__['CACHE']`. (Hops whose `edge` starts with
 a letter, such as `local 'x'` or `<key ...>`, are joined with a space.)
+
+### Source locations
+
+`source_loc` (on path hops, `query --type` instances and `locate` matches)
+is where an object itself is defined. `type_location` (on top retainers,
+type-histogram rows, `query --type` matched types and retaining-path
+targets) is where the object's type is defined: the location of the type
+object that the object's `ob_type` points to. Both are a SourceLocation or
+`null`, each with a `*_reason` field next to it.
+
+SourceLocation:
+
+| field | type | meaning |
+|---|---|---|
+| `file` | string | `co_filename`, or a module's `__file__`, exactly as the target recorded it |
+| `line` | integer, nullable | 1-based line; `null` for a module |
+| `exact` | bool | `true` for the object's own recorded location; `false` when derived (a class) |
+| `via` | string | how it was found, below |
+
+| object | `via` | how | `exact` |
+|---|---|---|---|
+| code object | `"code_object"` | its `co_filename` and `co_firstlineno` | true |
+| function | `"function"` | the code object reached by its `.__code__` edge | true |
+| bound method, `classmethod`, `staticmethod` | `"method"` | the function reached by `.__func__`, then its code object | true |
+| class (type object) | `"methods"` | the functions defined in the class body, below | false |
+| module | `"module_file"` | the str in `__dict__['__file__']` | true |
+
+A class has no code object at runtime, so its location is derived from its
+methods: the function objects in the type's `__dict__` (`tp_dict`),
+directly or inside a `classmethod`, `staticmethod` or `property`, whose
+code object's `co_qualname` is `<class qualname>.<name>`. Functions
+assigned to a class attribute from elsewhere, and decorator wrappers made
+with `functools.wraps` (they copy `__qualname__` but not the code), are
+left out, and so are functions with a generated filename starting with `<`
+(the `__init__` that `dataclasses` builds with `exec` has `<string>`). When
+all the remaining functions have the same `file`, that file is reported
+with the smallest `co_firstlineno` as `line`. The class statement is at or
+before that line: above it are the class line, the docstring and class
+attributes. Decorators count: the first line of a decorated method is its
+first decorator.
+
+`co_firstlineno` of a decorated function is the line of its first
+decorator, so a function's `line` may be above its `def`.
+
+`file` is not normalised, and it is a path on the machine (or in the
+container) the target ran on. On CPython 3.12 to 3.14 a script started as
+`python app/main.py` and modules imported from `sys.path` have absolute
+paths, also when the path entry was relative. Relative or otherwise
+unusual names come from code compiled with an explicit filename
+(`compile(src, "app/x.py", "exec")`, template engines), from `.pyc` files
+compiled with `compileall -d` and run without sources, from zip imports
+(`/srv/app.zip/app/x.py`), from `python -c` (`<string>`), and from frozen
+modules (`<frozen ...>`). A tool that maps a location to a checkout of the
+repository has to resolve the path itself.
+
+Reasons (`source_loc_reason`, `type_location_reason`):
+
+| code | when |
+|---|---|
+| `no_code_object` | a function or method whose code object is not in the snapshot or has no recorded location |
+| `no_python_methods` | a class with no Python function defined in its body (only attributes, or only generated methods) |
+| `methods_disagree` | a class whose methods were compiled from more than one file |
+| `contents_not_captured` | a module, in a snapshot taken without `--capture-contents` |
+| `no_file` | a module whose `__dict__` has no `__file__` str (built-in modules, `__main__` of `python -c`) |
+| `content_truncated` | a module whose `__file__` text was cut at `--max-str` |
+| `type_not_in_snapshot` | the type object is not in the snapshot; this is the usual case for types implemented in C (`builtins.dict`), which are not GC objects |
+| `unknown_type` | the object's type could not be read |
+
+New codes may be added in version 1.
+
+Redaction: `co_filename` and `co_firstlineno` are code metadata, not data
+the program handles, and the walker stores a code object's and a
+function's `source_loc` with or without `--capture-contents` (see
+"Redaction policy" in `docs/snapshot-format.md`). Code and class locations
+are therefore available in every snapshot. A module's `__file__` is the
+text of an ordinary str object, which is only stored with contents
+capture, so module locations need `--capture-contents`.
+
+Cost: locations are computed only for the objects and types a report
+lists (path hops, the listed retainers, rows, instances and targets), not
+for the whole heap. A class location looks at the entries of one type's
+`__dict__`.
 
 ### Note
 
@@ -259,6 +343,8 @@ Retainer (`top_retainers[]`):
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
 | `allocated_at` | AllocatedAt, nullable | added in M7: allocation stacks of the sampled objects this entry retains, see [AllocatedAt](#allocatedat); `null` without `--allocations` |
+| `type_location` | SourceLocation, nullable | where the object's type is defined ([Source locations](#source-locations)) |
+| `type_location_reason` | string, nullable | why `type_location` is `null` |
 
 Which objects are listed:
 
@@ -287,6 +373,8 @@ TypeRow (`type_histogram[]`):
 | `count` | integer | instances |
 | `shallow_bytes` | integer | sum of instance shallow sizes |
 | `retained_bytes` | integer | retained size of the set of instances: sum of `retained_bytes` over instances not dominated by another instance of the same type |
+| `type_location` | SourceLocation, nullable | where the type is defined; when several type objects share the name, the first one with a location |
+| `type_location_reason` | string, nullable | why `type_location` is `null` |
 
 The `retained_bytes` rule means nested instances are not counted twice: for
 a dict of dicts, only the outer dict's retained size counts, since it already
@@ -309,6 +397,7 @@ name, so two type objects with the same `module.qualname` are one row.
 | `snapshot` | SnapshotSummary | |
 | `query` | string | `T` as given |
 | `matched_types` | array of string | full names of matching types, sorted; empty means no match (the command then fails with `not_found`) |
+| `matched_type_locations` | array of TypeLocation | one per entry of `matched_types`, in the same order |
 | `instances` | integer | instances of the matched types |
 | `shallow_bytes` | integer | their shallow sizes |
 | `retained_bytes` | integer | retained size of the set, as for TypeRow |
@@ -327,6 +416,16 @@ Instance:
 | `length` | integer, nullable | `len()` if recorded |
 | `path` | array of PathHop, nullable | shortest retaining path; `null` if unreachable |
 | `allocated_at` | AllocatedAt, nullable | added in M7: as on Retainer; `null` without `--allocations` |
+| `source_loc` | SourceLocation, nullable | where the instance itself is defined, when it is a function, method, code object, class or module (`query --type builtins.function`) |
+| `source_loc_reason` | string, nullable | why `source_loc` is `null` for such an instance |
+
+TypeLocation:
+
+| field | type | meaning |
+|---|---|---|
+| `type` | string | a matched type |
+| `type_location` | SourceLocation, nullable | where it is defined |
+| `type_location_reason` | string, nullable | why `type_location` is `null` |
 
 Holder:
 
@@ -461,9 +560,56 @@ PathTarget:
 | `retained_bytes` | integer | |
 | `reachable` | bool | false if no root reaches the object; `paths` is then empty |
 | `paths` | array of array of PathHop | shortest first, at most 3 by default; each path differs from the others in at least one hop |
+| `type_location` | SourceLocation, nullable | where the object's type is defined |
+| `type_location_reason` | string, nullable | why `type_location` is `null` |
 
 An address that is not an object in the snapshot is an error (`not_found`),
 not an empty report.
+
+## `locate`
+
+`heapspy query SNAP --locate NAME --json`. Example:
+`docs/examples/locate.json`.
+
+Where the type, function or module with the full name `NAME` is defined.
+`NAME` is `module.qualname` as reports show it: `app.session.Session`,
+`app.session.Session.__init__`, `app.cache.make_key`,
+`__main__.main.<locals>.handler`, or a module name such as `app.cache`.
+Unqualified names are not matched. This query does not build the dominator
+tree, so it is cheaper than the others.
+
+| field | type | meaning |
+|---|---|---|
+| `schema_version` | 1 | |
+| `kind` | `"locate"` | |
+| `snapshot` | SnapshotSummary | |
+| `query` | string | `NAME` as given |
+| `matches` | array of LocateMatch | types first, then functions, then modules; at most `--top`. No match is an error (`not_found`) |
+| `notes` | array of Note | |
+
+LocateMatch:
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | string | `"type"`, `"function"` or `"module"` |
+| `name` | string | the full name; equal to `query` |
+| `module` | string | the module part of `name`; for a module, `name` itself |
+| `qualname` | string | the rest of `name`; empty for a module |
+| `address` | string | the type object, function or module |
+| `source_loc` | SourceLocation, nullable | as for path hops |
+| `source_loc_reason` | string, nullable | why `source_loc` is `null` |
+
+How names are matched:
+
+- A type matches when its display name is `NAME`. Every type object with
+  that name is listed (a class defined twice gives two entries).
+- A function matches when `<module>.<__qualname__>` is `NAME`, where
+  `<module>` is the name of the module whose `__dict__` is the function's
+  `__globals__`. Functions with the same location (a closure created many
+  times) are listed once. If some of them also have `NAME`'s qualname as
+  their code object's `co_qualname`, the others (decorator wrappers that
+  copied `__qualname__`) are left out.
+- A module matches by its `__name__`.
 
 ## `diff`
 

@@ -122,3 +122,17 @@ def test_mcp_tools_against_real_heapspy(heapspy_bin, start_victim, tmp_path, pyt
     source = (VICTIMS / "unbounded_cache.py").read_text().splitlines()
     line = next(n for n, text in enumerate(source, 1) if text.startswith("CACHE = "))
     assert f"unbounded_cache.py:{line}" in locations, mapped
+
+    # With the snapshot, the class resolves from the location heapspy recorded
+    # (heapspy-mcp versions with that argument only).
+    if "map_exact" in results:
+        exact = ok(results, "map_exact")
+        assert exact["heuristic"] is False and exact["via"] == "snapshot", exact
+        line = next(
+            n for n, text in enumerate(source, 1) if text.startswith("class CachedResponse")
+        )
+        assert [c["location"] for c in exact["candidates"]] == [f"unbounded_cache.py:{line}"], exact
+        assert exact["candidates"][0]["matched_by"] == "exact_path", exact
+        # type_detail and heap_summary carry the type's recorded location.
+        locs = detail.get("type_locations")
+        assert locs and locs[0]["type_location"]["file"].endswith("unbounded_cache.py"), detail

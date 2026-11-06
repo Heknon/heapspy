@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use heapspy_analyzer::report::{AnalyzeReport, DiffReport, RetainingPathReport, TypeQueryReport};
+use heapspy_analyzer::report::{
+    AnalyzeReport, DiffReport, LocateReport, RetainingPathReport, TypeQueryReport,
+};
 use heapspy_snapshot::{RootKind, SnapshotBuilder};
 
 fn heapspy(args: &[&str]) -> Output {
@@ -117,6 +119,39 @@ fn query_modes() {
 }
 
 #[test]
+fn query_locate() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.hpy");
+    let mut b = SnapshotBuilder::new();
+    let m = b.ty("builtins", "module");
+    let d = b.ty("builtins", "dict");
+    let f = b.ty("builtins", "function");
+    let c = b.ty("builtins", "code");
+    b.object(0x1000, m, 72)
+        .attr(0x2000, "__dict__")
+        .qualname("app");
+    b.object(0x2000, d, 1000).dict_value(0x3000, "'run'");
+    b.object(0x3000, f, 160)
+        .attr(0x4000, "__code__")
+        .attr(0x2000, "__globals__")
+        .qualname("run");
+    b.object(0x4000, c, 200)
+        .qualname("run")
+        .source_loc("app/__init__.py:7");
+    b.root(0x1000, RootKind::ModuleDict, "sys.modules['app']");
+    b.write_to(&p).unwrap();
+    let ps = p.to_str().unwrap();
+
+    let json = ok_stdout(&["query", ps, "--locate=app.run", "--json"]);
+    let r: LocateReport = serde_json::from_str(&json).unwrap();
+    assert_eq!(r.query, "app.run");
+    let l = r.matches[0].source_loc.as_ref().unwrap();
+    assert_eq!((l.file.as_str(), l.line), ("app/__init__.py", Some(7)));
+    let text = ok_stdout(&["query", ps, "--locate", "app.run"]);
+    assert!(text.contains("app/__init__.py:7"), "{text}");
+}
+
+#[test]
 fn diff_text_and_json() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.hpy");
@@ -148,6 +183,7 @@ fn json_errors_are_error_reports() {
         vec!["query", ps, "--type", "no.such.Type", "--json"],
         vec!["query", ps, "--retaining-path", "0x1", "--json"],
         vec!["query", ps, "--retaining-path-type", "Nope", "--json"],
+        vec!["query", ps, "--locate", "app.nothing", "--json"],
     ] {
         let out = heapspy(&args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");

@@ -77,6 +77,19 @@ async def main(args: dict[str, Any]) -> dict[str, Any]:
                 await call(
                     f"map_{i}", "map_to_source", {"qualname": hint, "repo_path": args["repo"]}
                 )
+            # A heapspy-mcp whose map_to_source takes a snapshot resolves exactly.
+            tools = {t.name: t for t in (await client.list_tools()).tools}
+            props = (tools["map_to_source"].input_schema or {}).get("properties") or {}
+            if "snapshot" in props:
+                await call(
+                    "map_exact",
+                    "map_to_source",
+                    {
+                        "qualname": "__main__.CachedResponse",
+                        "repo_path": args["repo"],
+                        "snapshot": handle,
+                    },
+                )
     return out
 
 

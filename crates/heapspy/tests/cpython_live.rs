@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use heapspy_analyzer::report::AnalyzeReport;
+use heapspy_analyzer::report::{AnalyzeReport, LocateReport, TypeQueryReport};
 use heapspy_snapshot::{EdgeLabel, KeyLabel, RootKind, Snapshot};
 
 const VICTIM: &str = r#"
@@ -47,6 +47,52 @@ main()
 
 const SESSIONS: usize = 1000;
 const PAYLOAD: u64 = 1024;
+
+/// A victim for source locations. `Session` is defined at line
+/// [`SESSION_LINE`] and `Registry` at [`REGISTRY_LINE`] (the text starts with
+/// a newline, so line 1 is empty). The leak is one `Registry` holding two
+/// lists of `Session`s; neither list holds 90% of it, so the `Registry`
+/// instance itself is the top retainer.
+const LOC_VICTIM: &str = r#"
+import os, sys, time
+
+
+class Session:
+    kind = "web"
+
+    def __init__(self, i):
+        self.id = i
+        self.payload = os.urandom(1024)
+
+    @staticmethod
+    def make(i):
+        return Session(i)
+
+
+class Registry:
+    def __init__(self):
+        self.a = [Session.make(i) for i in range(500)]
+        self.b = [Session(i) for i in range(500)]
+
+
+def handler():
+    return 1
+
+
+REG = Registry()
+H = handler
+
+tmp = sys.argv[1] + ".tmp"
+with open(tmp, "w") as f:
+    f.write(str(os.getpid()))
+os.rename(tmp, sys.argv[1])
+while True:
+    time.sleep(1)
+"#;
+const SESSION_LINE: u32 = 5;
+const SESSION_INIT_LINE: u32 = 8;
+const REGISTRY_LINE: u32 = 17;
+const HANDLER_LINE: u32 = 23;
 
 fn python(minor: u8) -> PathBuf {
     if let Ok(p) = std::env::var(format!("HEAPSPY_PY3{minor}")) {
@@ -81,8 +127,12 @@ impl Drop for Victim {
 }
 
 fn start_victim(py: &Path, dir: &Path) -> Victim {
+    start_script(py, dir, VICTIM)
+}
+
+fn start_script(py: &Path, dir: &Path, text: &str) -> Victim {
     let script = dir.join("victim.py");
-    std::fs::write(&script, VICTIM).unwrap();
+    std::fs::write(&script, text).unwrap();
     let ready = dir.join("ready");
     let child = Command::new(py)
         .arg(&script)
@@ -222,6 +272,74 @@ fn run_core(minor: u8) {
     check_analyze(&out);
 }
 
+fn json_of<T: serde::de::DeserializeOwned>(args: &[&str]) -> T {
+    let o = heapspy(args);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+
+/// `type_location` of `__main__.Session` and of the top retainer, the
+/// location of a function, and a module's `__file__` with contents capture.
+fn run_locations(minor: u8) {
+    let dir = tempfile::tempdir().unwrap();
+    let v = start_script(&python(minor), dir.path(), LOC_VICTIM);
+    let script = dir.path().join("victim.py");
+    let script = script.to_str().unwrap();
+    let out = dir.path().join("loc.hpy");
+    let contents = dir.path().join("contents.hpy");
+    dump(&["--pid", &v.pid.to_string()], &out);
+    dump(
+        &["--pid", &v.pid.to_string(), "--capture-contents"],
+        &contents,
+    );
+    drop(v);
+    let snap = out.to_str().unwrap();
+
+    let q: TypeQueryReport = json_of(&["query", snap, "--type", "__main__.Session", "--json"]);
+    assert_eq!(q.instances, SESSIONS as u64);
+    let t = q.matched_type_locations[0].type_location.as_ref().unwrap();
+    // Started with an absolute path, so co_filename is that path.
+    assert_eq!(t.file, script);
+    let line = t.line.unwrap();
+    assert!(line >= SESSION_LINE, "{t:?}");
+    assert_eq!(line, SESSION_INIT_LINE, "{t:?}");
+    assert!(!t.exact);
+    assert_eq!(t.via, "methods");
+
+    let r: AnalyzeReport = json_of(&["analyze", snap, "--json", "--top", "100"]);
+    let top = &r.top_retainers[0];
+    assert_eq!(top.type_name, "__main__.Registry", "{top:#?}");
+    let t = top.type_location.as_ref().expect("Registry location");
+    assert_eq!(t.file, script);
+    assert!(t.line.unwrap() >= REGISTRY_LINE, "{t:?}");
+    assert_eq!(t.line, Some(REGISTRY_LINE + 1), "{t:?}");
+    let row = r
+        .type_histogram
+        .iter()
+        .find(|x| x.type_name == "__main__.Session")
+        .expect("Session row");
+    assert_eq!(row.type_location.as_ref().unwrap().file, script);
+
+    let l: LocateReport = json_of(&["query", snap, "--locate", "__main__.handler", "--json"]);
+    let f = l.matches[0].source_loc.as_ref().unwrap();
+    assert_eq!((f.file.as_str(), f.line), (script, Some(HANDLER_LINE)));
+    assert!(f.exact);
+    let l: LocateReport = json_of(&["query", snap, "--locate", "__main__", "--json"]);
+    assert_eq!(
+        l.matches[0].source_loc_reason.as_deref(),
+        Some("contents_not_captured")
+    );
+    let l: LocateReport = json_of(&[
+        "query",
+        contents.to_str().unwrap(),
+        "--locate",
+        "__main__",
+        "--json",
+    ]);
+    let m = l.matches[0].source_loc.as_ref().expect("__file__");
+    assert_eq!((m.file.as_str(), m.line), (script, None));
+}
+
 /// gcore names the file `<prefix>.<pid>`; find it.
 fn g_pid(_g: &std::process::Output, prefix: &Path) -> String {
     let dir = prefix.parent().unwrap();
@@ -271,35 +389,20 @@ fn python314_core() {
     run_core(14);
 }
 
-/// `record --json` on a live CPython process: the recorders are stubs, so
-/// it fails with `unimplemented` (from the eBPF stub on Linux), exits 1
-/// and writes neither the profile nor the `--then-dump` snapshot.
 #[test]
-#[ignore = "needs /usr/bin/python3.12"]
-fn python312_record_json_is_unimplemented() {
-    let dir = tempfile::tempdir().unwrap();
-    let v = start_victim(&python(12), dir.path());
-    let prof = dir.path().join("a.hpya");
-    let snap = dir.path().join("a.hpy");
-    let o = heapspy(&[
-        "record",
-        "--json",
-        "--pid",
-        &v.pid.to_string(),
-        "--duration",
-        "1s",
-        "-o",
-        prof.to_str().unwrap(),
-        "--then-dump",
-        snap.to_str().unwrap(),
-    ]);
-    assert_eq!(o.status.code(), Some(1));
-    let doc: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(doc["kind"], "error");
-    assert_eq!(doc["error"]["code"], "unimplemented");
-    if cfg!(target_os = "linux") {
-        let msg = doc["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("eBPF"), "{msg}");
-    }
-    assert!(!prof.exists() && !snap.exists());
+#[ignore = "needs ptrace and /usr/bin/python3.12"]
+fn python312_locations() {
+    run_locations(12);
+}
+
+#[test]
+#[ignore = "needs ptrace and /usr/local/bin/python3.13"]
+fn python313_locations() {
+    run_locations(13);
+}
+
+#[test]
+#[ignore = "needs ptrace and uv's Python 3.14"]
+fn python314_locations() {
+    run_locations(14);
 }

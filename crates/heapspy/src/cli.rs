@@ -89,7 +89,7 @@ pub struct AnalyzeArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("what").required(true).args(["type_name", "retaining_path", "retaining_path_type"])))]
+#[command(group(clap::ArgGroup::new("what").required(true).args(["type_name", "retaining_path", "retaining_path_type", "locate"])))]
 pub struct QueryArgs {
     /// Snapshot file.
     #[arg(value_name = "SNAP")]
@@ -103,6 +103,10 @@ pub struct QueryArgs {
     /// Retaining paths of the largest instances of a type (up to --top).
     #[arg(long, value_name = "T")]
     pub retaining_path_type: Option<String>,
+    /// Where the type, function or module with this full name is defined
+    /// (e.g. app.session.Session, app.cache.Store.get).
+    #[arg(long, value_name = "NAME")]
+    pub locate: Option<String>,
     /// Number of instances, holders, or path targets.
     #[arg(long, value_name = "N", default_value_t = heapspy_analyzer::DEFAULT_TOP)]
     pub top: usize,

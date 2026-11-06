@@ -18,10 +18,12 @@ mod diff;
 mod dominators;
 pub mod flame;
 mod graph;
+mod locate;
 mod notes;
 mod query;
 pub mod render;
 pub mod report;
+pub mod source;
 
 use heapspy_snapshot::Snapshot;
 
@@ -221,6 +223,7 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
     for (i, v) in a.top_retainers(opts.top)?.into_iter().enumerate() {
         let o = snap.object(v);
         let bytes = a.retained[v as usize];
+        let (type_location, type_location_reason) = a.type_location(v)?;
         top_retainers.push(Retainer {
             rank: i as u32 + 1,
             address: Address(o.addr),
@@ -231,6 +234,8 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
             retained_pct: pct(bytes, reachable_bytes),
             path: a.path(v)?.unwrap_or_default(),
             allocated_at: None,
+            type_location,
+            type_location_reason,
         });
     }
 
@@ -241,6 +246,13 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
             .then_with(|| x.type_name.cmp(&y.type_name))
     });
     type_histogram.truncate(opts.top);
+    for row in &mut type_histogram {
+        let g = a
+            .types
+            .find(&row.type_name)
+            .expect("row from the type table");
+        (row.type_location, row.type_location_reason) = a.group_location(g)?;
+    }
 
     let mut notes = vec![notes::untracked_objects()];
     if let (Some(rss), Some(out)) = (memory.rss_bytes, memory.outside_graph_bytes) {
@@ -278,6 +290,17 @@ pub fn query_type(
     opts: &QueryOptions,
 ) -> Result<TypeQueryReport> {
     query::query_type(snap, path, type_name, opts)
+}
+
+/// Where the type, function or module named `module.qualname` is defined.
+/// Fails with [`Error::NotFound`] if nothing has that name.
+pub fn locate(
+    snap: &Snapshot,
+    path: &str,
+    name: &str,
+    opts: &QueryOptions,
+) -> Result<report::LocateReport> {
+    locate::locate(snap, path, name, opts)
 }
 
 /// Shortest retaining paths for an address or a type's instances. Fails

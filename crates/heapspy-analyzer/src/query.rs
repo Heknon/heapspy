@@ -8,7 +8,7 @@ use crate::analysis::Analysis;
 use crate::dominators::NONE;
 use crate::report::{
     self, Address, Holder, Instance, PathQuery, PathQueryBy, RetainingPath, RetainingPathKind,
-    RetainingPathReport, SchemaVersion, TypeQueryKind, TypeQueryReport,
+    RetainingPathReport, SchemaVersion, TypeLocation, TypeQueryKind, TypeQueryReport,
 };
 use crate::{format_address, notes, snapshot_summary, Error, PathTarget, QueryOptions, Result};
 
@@ -107,6 +107,7 @@ pub fn query_type(
     let mut top_instances = Vec::new();
     for &v in inst.iter().take(opts.top) {
         let o = snap.object(v);
+        let (source_loc, source_loc_reason) = a.source_loc(v)?;
         top_instances.push(Instance {
             address: Address(o.addr),
             type_name: a.type_name(v).to_string(),
@@ -115,22 +116,35 @@ pub fn query_type(
             length: snap.extras(v).and_then(|x| x.length),
             path: a.path(v)?,
             allocated_at: None,
+            source_loc,
+            source_loc_reason,
         });
     }
 
     let mut notes = Vec::new();
     notes::header_notes(snap, &mut notes);
-    let mut matched_types: Vec<String> = groups
+    let mut sorted = groups.clone();
+    sorted.sort_by(|&x, &y| a.types.names[x as usize].cmp(&a.types.names[y as usize]));
+    let matched_types: Vec<String> = sorted
         .iter()
         .map(|&g| a.types.names[g as usize].clone())
         .collect();
-    matched_types.sort();
+    let mut matched_type_locations = Vec::with_capacity(sorted.len());
+    for &g in &sorted {
+        let (type_location, type_location_reason) = a.group_location(g)?;
+        matched_type_locations.push(TypeLocation {
+            type_name: a.types.names[g as usize].clone(),
+            type_location,
+            type_location_reason,
+        });
+    }
     Ok(TypeQueryReport {
         schema_version: SchemaVersion,
         kind: TypeQueryKind::Kind,
         snapshot: snapshot_summary(snap, path),
         query: type_name.to_string(),
         matched_types,
+        matched_type_locations,
         instances: total,
         shallow_bytes,
         retained_bytes,
@@ -232,6 +246,7 @@ pub fn retaining_path(
         if !reachable {
             notes.push(notes::unreachable_target(&format_address(o.addr)));
         }
+        let (type_location, type_location_reason) = a.type_location(v)?;
         targets.push(report::PathTarget {
             address: Address(o.addr),
             type_name: a.type_name(v).to_string(),
@@ -239,6 +254,8 @@ pub fn retaining_path(
             retained_bytes: a.retained[v as usize],
             reachable,
             paths,
+            type_location,
+            type_location_reason,
         });
     }
     notes::header_notes(snap, &mut notes);
