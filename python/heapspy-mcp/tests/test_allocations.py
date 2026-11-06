@@ -205,6 +205,29 @@ async def test_binary_without_allocations(call, snap_file, profile, monkeypatch)
     assert err and out["error"]["code"] == "allocations_unsupported"
 
 
+async def test_binary_with_allocations_flag_but_no_join(
+    call, snap_file, profile, monkeypatch
+) -> None:
+    """heapspy from feature/alloc-format alone: --allocations is accepted and the
+    profile checked, but allocations and allocated_at are null."""
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", "alloc_not_joined")
+    for tool, args in [
+        ("heap_summary", {"snapshot": str(snap_file), "allocations": str(profile)}),
+        (
+            "type_detail",
+            {"snapshot": str(snap_file), "type": "Session", "allocations": str(profile)},
+        ),
+        ("allocation_sites", {"profile": str(profile), "snapshot": str(snap_file)}),
+        ("allocation_sites", {"profile": str(profile)}),
+    ]:
+        err, out = await call(tool, args)
+        assert err and out["error"]["code"] == "allocations_unsupported", (tool, out)
+        assert "Upgrade heapspy" in out["error"]["hint"]
+    # Without a profile the same binary works as before.
+    err, out = await call("heap_summary", {"snapshot": str(snap_file)})
+    assert not err, out
+
+
 async def test_allocation_output_is_bounded(call, snap_file, profile, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_HEAPSPY_MODE", "big")
     err, out = await call(

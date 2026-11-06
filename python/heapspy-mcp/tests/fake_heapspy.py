@@ -17,7 +17,10 @@ Environment:
                            --allocations, flamegraph, query --locate or the source
                            location fields in its reports);
                            with --allocations also alloc_not_linked (a profile from
-                           another pid); a profile path containing "corrupt" fails with
+                           another pid) and alloc_not_joined (a heapspy that checks
+                           the profile but has no join: null allocations, note
+                           allocations_not_joined, no flamegraph --allocations);
+                           a profile path containing "corrupt" fails with
                            invalid_allocations, a missing one with io
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
     FAKE_HEAPSPY_LOCATE    JSON object mapping a name to the ``matches`` that
@@ -258,6 +261,8 @@ def flamegraph(args: list[str]) -> None:
         )
         sys.exit(2)
     profile = opt(args, "allocations")
+    if profile is not None and MODE == "alloc_not_joined":
+        usage_error("--allocations", "heapspy flamegraph [OPTIONS] [SNAP]")
     if profile is None or "--folded" not in args:
         sys.exit(2)
     if "corrupt" in profile:
@@ -275,6 +280,24 @@ def flamegraph(args: list[str]) -> None:
     lines.append(lines[0].rsplit(" ", 1)[0] + " 1024")
     print("\n".join(sorted(lines)))
     sys.exit(0)
+
+
+def not_joined(cmd: str, args: list[str]) -> None:
+    """analyze or query --type with --allocations from a heapspy without the join."""
+    doc = load("analyze" if cmd == "analyze" else "type_query")
+    doc["snapshot"]["path"] = args[1]
+    if cmd == "analyze":
+        doc["allocations"] = None
+    for item in doc.get("top_retainers", []) + doc.get("top_instances", []):
+        item["allocated_at"] = None
+    doc["notes"] = [
+        *doc["notes"],
+        {
+            "code": "allocations_not_joined",
+            "message": "The allocation profile was checked, but the join is not implemented.",
+        },
+    ]
+    emit(doc)
 
 
 def main() -> None:
@@ -311,6 +334,8 @@ def main() -> None:
         sys.exit(2)
 
     profile = check_profile(args)
+    if profile is not None and MODE == "alloc_not_joined" and cmd in ("analyze", "query"):
+        not_joined(cmd, args)
     if cmd == "analyze" and profile is not None:
         doc = analyze_with_allocations(args, profile, int(opt(args, "top") or 20))
     elif cmd == "analyze":
