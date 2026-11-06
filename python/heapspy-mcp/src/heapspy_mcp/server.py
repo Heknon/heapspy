@@ -116,7 +116,9 @@ def build_server(config: Config) -> MCPServer:
         annotations=read_only,
         description=(
             "List Python processes on this machine: pid, name, truncated command line, RSS, "
-            "detected CPython version, and whether the server's allowlist permits capturing it. "
+            "detected CPython version, thread count and threads_by_state, optional "
+            "cpu_percent_on_cpu (measure_s), and whether the server's allowlist permits "
+            "capturing it. "
             "Read-only; does not touch the processes. Use this to find the PID for "
             "capture_snapshot. Sorted by RSS, largest first."
         ),
@@ -127,9 +129,16 @@ def build_server(config: Config) -> MCPServer:
             Field(description="Case-insensitive substring to match in the name or command line."),
         ] = None,
         limit: Annotated[int, Field(description="Maximum processes to return (1 to 200).")] = 50,
+        measure_s: Annotated[
+            float,
+            Field(description="Window for cpu_percent_on_cpu, 0 to 2 s; 0 (default) skips it."),
+        ] = 0.0,
     ) -> dict[str, Any]:
         return processes.list_python_processes(
-            name_filter, limit=S.clamp(limit, 1, processes.MAX_PROCESSES), allow=config.allow
+            name_filter,
+            limit=S.clamp(limit, 1, processes.MAX_PROCESSES),
+            allow=config.allow,
+            measure_s=measure_s,
         )
 
     @server.tool(

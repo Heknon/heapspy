@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -87,3 +89,42 @@ async def test_name_filter_and_limit(call, child_python) -> None:
     assert out["processes"][0]["capture_allowed"] is True
     err, out = await call("list_python_processes", {"limit": 0})
     assert len(out["processes"]) <= 1
+
+
+# Two threads hashing large buffers release the GIL: about two cores busy.
+BURNER = """
+import hashlib, threading
+buf = b"x" * (1 << 20)
+def burn():
+    while True:
+        hashlib.sha256(buf).digest()
+for _ in range(2):
+    threading.Thread(target=burn, daemon=True).start()
+threading.Event().wait()
+"""
+
+
+@pytest.fixture
+def burner_proc():
+    proc = subprocess.Popen([sys.executable, "-c", BURNER], stdin=subprocess.DEVNULL)
+    time.sleep(0.5)
+    try:
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc")
+async def test_list_python_processes_cpu_and_threads(call, burner_proc) -> None:
+    err, out = await call("list_python_processes", {"measure_s": 0.5, "limit": 200})
+    assert not err, out
+    assert out["cpu_percent_window_s"] >= 0.45
+    rows = {r["pid"]: r for r in out["processes"]}
+    burner = rows[burner_proc.pid]
+    assert burner["cpu_percent_on_cpu"] > 100, burner
+    assert burner["threads"] == 3
+    assert burner["threads_by_state"]["running_or_runnable"] >= 1
+    err, out = await call("list_python_processes", {"limit": 200})
+    assert out["cpu_percent_window_s"] is None
+    assert all(r["cpu_percent_on_cpu"] is None for r in out["processes"])

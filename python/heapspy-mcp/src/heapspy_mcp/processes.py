@@ -95,7 +95,7 @@ def matches_allowlist(
 
 
 def list_python_processes(
-    name_filter: str | None, *, limit: int, allow: list[str]
+    name_filter: str | None, *, limit: int, allow: list[str], measure_s: float = 0.0
 ) -> dict[str, Any]:
     me = os.getpid()
     found: list[dict[str, Any]] = []
@@ -138,7 +138,11 @@ def list_python_processes(
             }
         )
     found.sort(key=lambda p: p["rss_bytes"] or 0, reverse=True)
+    from .system.listing import annotate  # threads, threads_by_state, cpu_percent_on_cpu
+
+    measured = annotate(found[:limit], measure_s)
     return {
+        **measured,
         "processes": found[:limit],
         "total_found": len(found),
         "partially_inaccessible": inaccessible,
