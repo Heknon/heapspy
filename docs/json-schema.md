@@ -242,8 +242,11 @@ Holder:
 
 ## `retaining_path`
 
-`heapspy query SNAP --retaining-path ADDR --json`. Example:
-`docs/examples/retaining_path.json`.
+`heapspy query SNAP --retaining-path ADDR --json`, or
+`heapspy query SNAP --retaining-path-type T --json` for the largest
+instances of a type (`query.by` is then `"type"`). `--top N` bounds the
+number of targets and `--max-paths N` the paths per target (default 3).
+Example: `docs/examples/retaining_path.json`.
 
 | field | type | meaning |
 |---|---|---|
@@ -333,9 +336,11 @@ labels so that it can be found again in another dump:
   type of the largest contributor.
 
 Which sites are listed: sites whose retained bytes and objects did not
-change are left out, and so is a site whose change is at least 90% in one of
-its child sites (with the same sign). Growth in `CACHE` also shows as growth
-in the module and the module's `__dict__`; only `CACHE` is listed.
+change are left out, and so is a site whose change is at least 90% in one
+child site that is a single object in both snapshots (with the same sign).
+Growth in `CACHE` also shows as growth in the module and the module's
+`__dict__`; only `CACHE` is listed. A child site that sums many objects does
+not hide its parent.
 
 ## `error`
 

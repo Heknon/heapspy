@@ -13,28 +13,30 @@ pub fn run(args: QueryArgs) -> anyhow::Result<()> {
     };
     let snap = open_snapshot(&args.snapshot)?;
     let path = display_path(&args.snapshot);
-    let opts = QueryOptions::default();
+    let opts = QueryOptions {
+        top: args.top,
+        max_paths: args.max_paths,
+    };
 
-    match (args.type_name, addr) {
-        (Some(t), None) => {
+    let target = match (args.type_name, addr, args.retaining_path_type) {
+        (Some(t), None, None) => {
             let report = heapspy_analyzer::query_type(&snap, &path, &t, &opts)?;
-            if args.json {
+            return if args.json {
                 print_json(&report)
             } else {
                 print!("{}", render::type_query(&report)?);
                 Ok(())
-            }
+            };
         }
-        (None, Some(a)) => {
-            let report =
-                heapspy_analyzer::retaining_path(&snap, &path, &PathTarget::Address(a.0), &opts)?;
-            if args.json {
-                print_json(&report)
-            } else {
-                print!("{}", render::retaining_path(&report)?);
-                Ok(())
-            }
-        }
-        _ => unreachable!("clap enforces exactly one of --type / --retaining-path"),
+        (None, Some(a), None) => PathTarget::Address(a.0),
+        (None, None, Some(t)) => PathTarget::Type(t),
+        _ => unreachable!("clap enforces exactly one query mode"),
+    };
+    let report = heapspy_analyzer::retaining_path(&snap, &path, &target, &opts)?;
+    if args.json {
+        print_json(&report)
+    } else {
+        print!("{}", render::retaining_path(&report)?);
+        Ok(())
     }
 }
