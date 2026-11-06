@@ -5,6 +5,7 @@ mod common;
 use common::*;
 use heapspy_analyzer::report::DiffReport;
 use heapspy_analyzer::{diff, DiffOptions};
+use heapspy_snapshot::RootKind;
 
 fn run(before: &Heap, after: &Heap) -> DiffReport {
     let r = diff(
@@ -230,8 +231,49 @@ fn object_shared_by_two_roots_gets_a_site_instead_of_panicking() {
     let s = r
         .by_site
         .iter()
-        .find(|s| s.site == "...['SHARED']")
+        .find(|s| s.site == "sys.modules['app.a'].__dict__['SHARED']")
         .unwrap_or_else(|| panic!("{:?}", r.by_site));
     assert_eq!(s.type_name, "builtins.list");
     assert_eq!(s.delta_retained_bytes, 8 * 1000);
+}
+
+#[test]
+fn module_dicts_shared_through_globals_keep_their_module_in_the_site() {
+    // Two modules each have a CACHE global, and a running frame holds a
+    // function from each, so both module dicts are dominated only by the
+    // super-root. Their globals must stay apart: only app.b's CACHE grows.
+    let build = |n: u32| {
+        let mut h = Heap::new();
+        for (name, items) in [("app.a", 3), ("app.b", n)] {
+            let (_, d) = h.module(name);
+            let f = h.obj("builtins.function", 160);
+            h.key(d, f, "handler");
+            h.attr(f, d, "__globals__");
+            h.root(
+                f,
+                RootKind::FrameLocal,
+                &format!("frame {name}:run local 'cb'"),
+            );
+            let cache = h.obj("builtins.dict", 232);
+            h.key(d, cache, "CACHE");
+            for i in 0..items {
+                let x = h.obj("builtins.bytes", 1000);
+                h.edge(cache, x, L::Redacted(i as u64));
+            }
+        }
+        h
+    };
+    let r = run(&build(3), &build(10));
+    let grown: Vec<_> = r
+        .by_site
+        .iter()
+        .filter(|s| s.site.ends_with("['CACHE']"))
+        .map(|s| (s.site.as_str(), s.delta_retained_bytes))
+        .collect();
+    assert_eq!(
+        grown,
+        [("sys.modules['app.b'].__dict__['CACHE']", 7 * 1000)],
+        "{:?}",
+        r.by_site
+    );
 }
