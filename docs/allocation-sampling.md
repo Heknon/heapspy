@@ -1,6 +1,6 @@
 # Allocation sampling (M7): design
 
-Status: in progress. The shared contracts are in place: the `.hpya` format ([docs/alloc-format.md](alloc-format.md), `crates/heapspy-alloc`), the recorder interface (`crates/heapspy-record`), the frame offsets recorders read stacks with (`heapspy_reader::cpython::frames`), the `record` command and `--allocations` flags, and the report fields ([docs/json-schema.md](json-schema.md#allocations)). The recorders (M7a, M7b) and the join (M7c) are stubs. [Decisions](#decisions) records what was settled while building the contracts. The spike checklist at the end is still open.
+Status: in progress. The shared contracts are in place: the `.hpya` format ([docs/alloc-format.md](alloc-format.md), `crates/heapspy-alloc`), the recorder interface (`crates/heapspy-record`), the frame offsets recorders read stacks with (`heapspy_reader::cpython::frames`), the `record` command and `--allocations` flags, and the report fields ([docs/json-schema.md](json-schema.md#allocations)). The join (M7c) is implemented; the recorders (M7a, M7b) are stubs. [Decisions](#decisions) records what was settled while building the contracts. The spike checklist at the end is still open.
 
 ## Why
 
@@ -93,9 +93,37 @@ Specified byte for byte in [docs/alloc-format.md](alloc-format.md). This uses th
 
 ## Joining with a snapshot
 
-- **By address.** If an object's address falls inside a sampled pool or large allocation, and no later sample covers that range, the object is linked to that sample. This gives a per-object `allocated_at` for some objects. Only some get one, because only a sample of allocations is recorded.
-- **By site.** Sampled growth bytes are aggregated by Python stack, and the stacks that produced the most growth are shown next to the top retainers. For each retainer, the stacks of the linked objects in its dominator subtree are summed.
-- **Report additions** (schema v1, additive): `allocations` on `AnalyzeReport` (top growth stacks, sampling parameters, the approximate flag, coverage) and `allocated_at` on retainer entries and on `query --type` instances. Older consumers ignore both. Defined in [docs/json-schema.md](json-schema.md#allocations).
+Implemented in `heapspy_analyzer::allocations`. `analyze --allocations`, `query --type --allocations` and `flamegraph --allocations` use it.
+
+**Preconditions.** The profile is checked against the snapshot first: same pid (for a snapshot of a live process), same CPython version, and recording started no later than the snapshot. If any check fails, the report carries the mismatch note and `allocations_not_linked`, no object is linked, and only the sampled stacks are reported. Samples whose timestamp is past the snapshot's capture second are not used for linking, because they describe memory the snapshot has not seen.
+
+**By address.** A sample covers `[address, address + size)`: a pool sample one 16 KiB pool, an arena sample one 1 MiB arena, a large-object sample one allocation. An object is linked to the latest sample (highest index, since samples are sorted by time) whose range contains the object's address. A later sample over the same memory supersedes an earlier one, because the memory was freed and reused in between. The objects are already sorted by address. The join sorts the sample ranges by start once, then walks the objects in address order. Each sample whose range starts at or before the current address is pushed onto a max-heap keyed by sample index. Samples whose range has ended are popped from the top. The top is then the answer. An ended sample below the top is popped later, when it reaches the top. It never hides a live sample, because the top has the largest index of all entries. Each sample is pushed and popped once, so the sweep is `O(n + m log m)` for `n` objects and `m` samples. It needs `O(m)` extra memory (ranges, order, heap) plus one `u32` per object for the result.
+
+**Exact and approximate links.** A large-object sample covers one allocation, so a link through it is exact (the allocator's block may start before the object, for example at the GC header, which the range covers). An arena or pool sample covers memory that many objects are later allocated from, so a link through it only says "the most recent growth event that created this memory". It is not necessarily the call that allocated the object. Reports keep the two apart with `exact_linked_objects` and `exact_linked_bytes`. The `approximate` flags keep their meaning: Python frames matched to the event by time (ETW).
+
+**By site.** Samples are grouped by resolved stack, the sequence of `(function, file:line)` innermost first. Raw frames are resolved once per distinct `(code entry, instruction offset)` and interned, so a stack is a short list of ids and grouping costs one hash lookup per frame. Per stack, `estimated_bytes` sums the sample weights and `linked_bytes` sums the shallow bytes of the reachable objects linked to its samples. The largest stacks by estimated bytes are `top_stacks`. `coverage` counts the linked reachable objects, their bytes, and their share of the reachable bytes.
+
+**Per retainer and instance (`allocated_at`).** The dominator subtree of `v` is the nodes whose dominator-tree preorder number lies in `tin[v] .. tin[v] + retained_count[v]` (the interval check in `analysis.rs`). The reachable linked objects are scattered into preorder once (`O(n)`). Each listed object's subtree is then one slice, found by two binary searches, and only the linked objects in that slice are visited. Top retainers are disjoint, so together they visit each linked object at most once. Type-query instances can nest, so the cost there is at most `--top` times the linked objects. Per stack, the linked objects and their shallow bytes are summed, and the five largest by bytes are listed. `top_stack_rank` points at the same stack in `top_stacks`.
+
+**Cost.** On the ignored scale test (10 million objects, 1 million samples of 24 frames each, release build), the address sweep takes 0.19 s and stack grouping 0.36 s. Peak RSS of `analyze --allocations` is the same as plain `analyze` (2.0 GiB, mostly the dominator analysis and the mapped snapshot).
+
+**What it cannot see.**
+- Blocks reused from freed memory are not sampled, and objects allocated before recording started have no sample.
+- A large allocation that is not an object, such as a list's item array, a dict's key table, or a bytearray's buffer, has a different address from the object that owns it. Its sample links to nothing, and its owner is not linked through it.
+- A large block freed and then reused by an allocation that was not sampled still links to the old sample. Byte-interval sampling makes this likely for small large objects.
+
+**What the join needs from recorders.**
+- Samples in time order. The writer sorts them (stably), so for two samples over the same address, the later event must have the later timestamp, or the same timestamp and a later position in recorder order.
+- Timestamps in Unix-epoch nanoseconds on the same clock as the snapshot's `captured_at`, or samples after the snapshot are not recognised.
+- `address` and `size` per kind: an arena is the base the `mmap` or `VirtualAlloc` call returned and the full mapped length. A pool is its base and the pool size (16 KiB). A large object is the pointer the allocator returned and the requested size, not the size class. A `realloc` that returns a new pointer is a new large-object sample at that pointer, with the new size.
+- `event_kind` set to `large_object` only for single allocations, since those links are reported as exact. Anything else that covers many objects is `arena`, `pool` or `other`.
+
+**Report additions** (schema v1, additive): `allocations` on `AnalyzeReport` and `allocated_at` on retainer entries and on `query --type` instances. Older consumers ignore both. Defined in [docs/json-schema.md](json-schema.md#allocations).
+
+**Flame graph.** `heapspy flamegraph --allocations app.hpya` draws the stacks as a classic flame graph: frames are `function (file:line)`, outermost at the root, width is estimated bytes. `--retained app.hpy` uses linked bytes as the width instead, which shows where the memory still alive was allocated.
+
+**Not built yet.**
+- `diff --allocations` only checks the profile against AFTER. Adding allocating stacks to growth sites needs the diff to keep each site's member objects, so it is left for later.
 - **MCP:** a new `allocation_sites` tool, and `heap_summary` passes `allocated_at` through when a sidecar is given.
 
 ## Decisions
@@ -136,10 +164,10 @@ Settled while building the shared contracts, before the recorders.
 
 **Failure handling.** A recording that fails writes no file; the writer only renames its temporary file into place on success.
 
-**Joining, until M7c.**
+**Joining.**
 - `--allocations` opens and validates the profile. It then checks the profile against the snapshot (`AFTER` for diff): the pid (for live-process snapshots), the CPython version, and that the snapshot was not taken before recording started.
-- A mismatch is a warning on stderr and a note in the report (`allocations_pid_mismatch`, `allocations_python_mismatch`, `allocations_after_snapshot`).
-- While the join is a stub, `analyze` and `query --type` print the plain report with an `allocations_not_joined` note. `diff` and `--retaining-path` have no allocation fields and only check the profile.
+- A mismatch is a warning on stderr and a note in the report (`allocations_pid_mismatch`, `allocations_python_mismatch`, `allocations_after_snapshot`). A joined report with a mismatch links nothing and adds `allocations_not_linked`.
+- `analyze` and `query --type` join the profile with the snapshot (M7c, see [Joining with a snapshot](#joining-with-a-snapshot)) and add the `allocations_sampled` note. `allocations_not_joined`, the note the stub printed, is no longer emitted. `diff` and `--retaining-path` have no allocation fields and only check the profile.
 - A missing profile is error code `io`. A corrupt one is `invalid_allocations`.
 
 **Report fields.** The new fields are always present in new documents (`null` without `--allocations`), as the schema rules require. They deserialize to `null` when missing, so documents from older versions still parse.
