@@ -76,6 +76,10 @@ kind_marker!(
     DiffKind = "diff"
 );
 kind_marker!(
+    /// `"kind": "dump"`
+    DumpKind = "dump"
+);
+kind_marker!(
     /// `"kind": "error"`
     ErrorKind = "error"
 );
@@ -426,6 +430,46 @@ pub struct SiteGrowth {
     pub delta_retained_objects: i64,
 }
 
+// ---------------------------------------------------------------- dump
+
+/// `heapspy dump --json`, printed after the snapshot is written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DumpReport {
+    pub schema_version: SchemaVersion,
+    pub kind: DumpKind,
+    /// The snapshot file written, as given with `-o`.
+    pub path: String,
+    pub source: SourceRef,
+    /// CPython version found in the target, `sys.version` style.
+    pub python_version: String,
+    /// `--capture-contents` was given.
+    pub contents_captured: bool,
+    pub objects: u64,
+    pub edges: u64,
+    pub types: u64,
+    pub roots: u64,
+    /// Size of the snapshot file.
+    pub bytes_written: u64,
+    /// Reads of target memory that failed; the objects involved are partial.
+    pub read_errors: u64,
+    /// The snapshot is marked truncated (same as `snapshot.truncated` in the
+    /// other reports).
+    pub truncated: bool,
+    pub image: DumpImage,
+    /// How long a live target was stopped, in milliseconds. `null` for core
+    /// files and minidumps, and where the backend does not measure it.
+    pub pause_ms: Option<f64>,
+    pub notes: Vec<Note>,
+}
+
+/// Facts about the memory image a dump read (`image`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpImage {
+    /// Bytes of memory the image's own headers describe but the file does
+    /// not contain (a core cut short). 0 when complete or unknown.
+    pub missing_bytes: u64,
+}
+
 // ---------------------------------------------------------------- error
 
 /// Printed to stdout by any `--json` command that fails, before exiting non-zero.
@@ -438,8 +482,8 @@ pub struct ErrorReport {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
-    /// One of `"unimplemented"`, `"invalid_argument"`, `"not_found"`,
-    /// `"invalid_snapshot"`, `"io"`, `"permission_denied"`, `"internal"`.
+    /// A stable code from the table in `docs/json-schema.md`, e.g.
+    /// `"not_found"`, `"not_python"`, `"permission_denied"`, `"internal"`.
     pub code: String,
     pub message: String,
 }

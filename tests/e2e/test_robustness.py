@@ -2,13 +2,15 @@
 target that is busy allocating while it is dumped, and a PID that is gone.
 
 "Survive" means: exit status 0 or 1 within the timeout, never a panic or a
-signal. A failure must say why on stderr; a snapshot that was written from
-an incomplete image must be marked ``truncated``.
+signal. A failure must say why on stderr and, with ``--json``, carry the
+specific error code from docs/json-schema.md; a snapshot that was written
+from an incomplete image must be marked ``truncated``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
@@ -32,19 +34,27 @@ IMAGE_METHOD = "core" if IS_LINUX else "minidump"
 
 
 def check_truncated_dump(heapspy, image, tmp_path, flag: str, what: str) -> str:
-    """Dump a cut image; return "error" or "truncated". Anything else fails."""
+    """Dump a cut image with ``--json``; return the error code, or "truncated"
+    if a snapshot was written. Anything else fails."""
     out = tmp_path / "cut.hpy"
     out.unlink(missing_ok=True)
-    r = heapspy.run("dump", flag, str(image), "-o", str(out), step=f"dump {what}")
+    r = heapspy.run("dump", flag, str(image), "-o", str(out), "--json", step=f"dump {what}")
     assert not is_crash(r), r.describe()
     if r.returncode == 1:
         assert "heapspy: error:" in r.stderr, r.describe()
         assert not out.exists(), "a failed dump left a snapshot behind"
-        return "error"
+        doc = json.loads(r.stdout)
+        assert doc["kind"] == "error", doc
+        code = doc["error"]["code"]
+        assert code in ("truncated_image", "invalid_image"), f"{what}: {doc}"
+        return code
     assert r.returncode == 0, r.describe()
     assert r.stderr.strip().endswith("(truncated)"), (
         f"{what}: dump succeeded on a cut image without marking it truncated\n" + r.describe()
     )
+    report = json.loads(r.stdout)
+    assert report["kind"] == "dump" and report["truncated"] is True, report
+    assert "truncated_snapshot" in [n["code"] for n in report["notes"]], report
     doc = heapspy.analyze(out)
     assert doc["snapshot"]["truncated"] is True, doc["snapshot"]
     assert "truncated_snapshot" in [n["code"] for n in doc["notes"]]
@@ -71,7 +81,14 @@ def test_cut_image(heapspy, cache_image, tmp_path, keep) -> None:
     data = image.read_bytes()
     n = keep if isinstance(keep, int) else int(size * keep)
     cut.write_bytes(data[:n])
-    check_truncated_dump(heapspy, cut, tmp_path, flag, f"cut to {n} of {size} bytes")
+    result = check_truncated_dump(heapspy, cut, tmp_path, flag, f"cut to {n} of {size} bytes")
+    if n < 32:
+        # Shorter than an ELF or minidump header: not recognisable at all.
+        assert result == "invalid_image", result
+    elif flag == "--core":
+        # gcore writes the notes last, so any cut loses them or the
+        # program headers.
+        assert result == "truncated_image", result
 
 
 @pytest.mark.skipif(not IS_LINUX, reason="ELF cores only")
@@ -99,7 +116,12 @@ def test_cut_kernel_layout_core(heapspy, cache_image, tmp_path, keep) -> None:
     assert any(off <= n < off + size for _, off, size in loads), "cut is inside a segment"
     cut = tmp_path / "cut.core"
     cut.write_bytes(data[:n])
-    check_truncated_dump(heapspy, cut, tmp_path, "--core", f"kernel-layout core cut at {keep}")
+    result = check_truncated_dump(
+        heapspy, cut, tmp_path, "--core", f"kernel-layout core cut at {keep}"
+    )
+    # Metadata is intact: either a truncated snapshot or a refusal that
+    # blames the cut, never "not a CPython process".
+    assert result in ("truncated", "truncated_image"), result
 
 
 # -- not a Python process -----------------------------------------------------
@@ -119,11 +141,13 @@ def check_not_python(r) -> None:
     assert not is_crash(r), r.describe()
     assert r.returncode == 1, r.describe()
     assert "not a CPython process" in r.stderr, r.describe()
+    doc = json.loads(r.stdout)
+    assert doc["kind"] == "error" and doc["error"]["code"] == "not_python", doc
 
 
 def test_not_python_pid(heapspy, sleeper, tmp_path) -> None:
     out = tmp_path / "x.hpy"
-    r = heapspy.run("dump", "--pid", str(sleeper.pid), "-o", str(out), step="dump --pid")
+    r = heapspy.run("dump", "--pid", str(sleeper.pid), "-o", str(out), "--json", step="dump --pid")
     check_not_python(r)
     assert not out.exists()
 
@@ -131,17 +155,61 @@ def test_not_python_pid(heapspy, sleeper, tmp_path) -> None:
 @pytest.mark.skipif(not IS_LINUX, reason="gcore is Linux only")
 def test_not_python_core(heapspy, sleeper, tmp_path) -> None:
     args, _ = image_file("core", sleeper.pid, tmp_path)
-    r = heapspy.run("dump", *args, "-o", str(tmp_path / "x.hpy"), step="dump --core")
+    r = heapspy.run("dump", *args, "-o", str(tmp_path / "x.hpy"), "--json", step="dump --core")
     check_not_python(r)
 
 
 def test_pid_that_has_exited(heapspy, tmp_path) -> None:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait(timeout=60)
-    r = heapspy.run("dump", "--pid", str(proc.pid), "-o", str(tmp_path / "x.hpy"))
-    assert not is_crash(r), r.describe()
-    assert r.returncode == 1, r.describe()
-    assert "heapspy: error:" in r.stderr
+    pid = proc.pid
+    del proc  # on Windows, release the process handle
+    code = heapspy.error_code("dump", "--pid", str(pid), "-o", str(tmp_path / "x.hpy"))
+    if IS_LINUX:
+        assert code == "no_such_process", code
+    else:
+        # A process object can outlive the process while a handle to it is
+        # open somewhere; dumping it then fails some other way.
+        assert code in ("no_such_process", "io", "not_python"), code
+
+
+def test_pid_that_never_existed(heapspy, tmp_path) -> None:
+    # Above Linux's largest pid_max (2^22); Windows process ids are multiples of 4.
+    code = heapspy.error_code("dump", "--pid", "1073741823", "-o", str(tmp_path / "x.hpy"))
+    assert code == "no_such_process", code
+
+
+@pytest.mark.skipif(
+    not IS_LINUX or os.geteuid() != 0, reason="needs root on Linux to run heapspy as nobody"
+)
+def test_permission_denied(heapspy, sleeper, tmp_path) -> None:
+    """heapspy as ``nobody`` cannot ptrace a root process."""
+    args = [str(heapspy.binary), "dump", f"--pid={sleeper.pid}", "-o", "/nonexistent/x.hpy"]
+    try:
+        r = subprocess.run(
+            [*args, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            user=65534,
+            group=65534,
+            check=False,
+        )
+    except PermissionError as e:
+        # nobody cannot reach the binary (a build under a 0700 parent directory).
+        pytest.skip(f"user nobody cannot execute {heapspy.binary}: {e}")
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    doc = json.loads(r.stdout)
+    assert doc["error"]["code"] == "permission_denied", doc
+    assert "CAP_SYS_PTRACE" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("flag", ["--core", "--minidump"])
+def test_junk_image(heapspy, tmp_path, flag) -> None:
+    junk = tmp_path / "junk.img"
+    junk.write_bytes(b"neither an ELF core nor a minidump\n" * 100)
+    code = heapspy.error_code("dump", flag, str(junk), "-o", str(tmp_path / "x.hpy"))
+    assert code == "invalid_image", code
 
 
 def test_analyze_non_snapshot_file(heapspy, tmp_path) -> None:

@@ -71,7 +71,7 @@ The Windows path has not been run yet; see "Status" below.
 |---|---|
 | `test_fixtures.py` | each leak fixture: top retainer type and root path, retained bytes in band, retaining-path hops, type queries |
 | `test_diff.py` | dump the growing list, grow it, dump again: `diff` puts the growth at `EVENTS` |
-| `test_robustness.py` | cut cores and minidumps, non-Python processes, an exited PID, a non-snapshot file, a busy multi-threaded target |
+| `test_robustness.py` | cut cores and minidumps, non-Python processes, exited and nonexistent PIDs, junk images, ptrace refused (as root, Linux), a non-snapshot file, a busy multi-threaded target; failures are checked for their `dump --json` error code |
 | `test_perf.py` | about 2.1M objects dumped and analyzed within the budget |
 | `test_mcp.py` | heapspy-mcp's tools against the real binary (only with `HEAPSPY_MCP_DIR`) |
 
