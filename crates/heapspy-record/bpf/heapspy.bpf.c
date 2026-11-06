@@ -10,6 +10,8 @@
 //   raw_tracepoint/sys_enter, sys_exit  arenas: anonymous mmap of arena_size
 //   uprobe/{malloc,calloc,realloc}[_ctx] large objects: entry, size, sampler
 //   uretprobe/alloc_ret                  large objects: returned pointer
+// Events are assembled in a per-CPU scratch map and only the frames in
+// use are copied into the ring buffer.
 // Every event carries the allocating thread's Python stack, walked here
 // at event time exactly like heapspy_reader::cpython::frames::read_stack.
 
@@ -31,8 +33,7 @@ static u32 (*prandom_u32)(void) = (void *)7;
 static u64 (*get_current_pid_tgid)(void) = (void *)14;
 static long (*probe_read_user)(void *dst, u32 size, const void *src) = (void *)112;
 static long (*probe_read_kernel)(void *dst, u32 size, const void *src) = (void *)113;
-static void *(*ringbuf_reserve)(void *ringbuf, u64 size, u64 flags) = (void *)131;
-static void (*ringbuf_submit)(void *data, u64 flags) = (void *)132;
+static long (*ringbuf_output)(void *ringbuf, void *data, u64 size, u64 flags) = (void *)130;
 
 struct map_def {
     u32 type, key_size, value_size, max_entries, map_flags;
@@ -117,7 +118,9 @@ SEC("maps") struct map_def counters = {MAP_PERCPU_ARRAY, 4, 8, N_COUNTERS, 0};
 SEC("maps") struct map_def pending = {MAP_LRU_HASH, sizeof(struct pkey), sizeof(struct pending), 65536, 0};
 SEC("maps") struct map_def mmaps = {MAP_LRU_HASH, 8, 8, 16384, 0};
 SEC("maps") struct map_def tstates = {MAP_LRU_HASH, 8, 8, 16384, 0};
-SEC("maps") struct map_def events = {MAP_RINGBUF, 0, 0, 8 << 20, 0};
+SEC("maps") struct map_def events = {MAP_RINGBUF, 0, 0, 16 << 20, 0};
+// Events are built here, then only the used part is copied to the ring.
+SEC("maps") struct map_def scratch = {MAP_PERCPU_ARRAY, 4, sizeof(struct event), 1, 0};
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -183,7 +186,7 @@ INLINE void walk(struct config *c, struct event *e, u64 tid) {
     u64 f = rd(ts + c->ts_current_frame);
     if (c->ts_frame_via_cframe && f)
         f = rd(f);
-    // The frame count lives in the event (ring buffer memory), not in a
+    // The frame count lives in the event (map memory), not in a
     // register: the verifier does not track its value, so loop states
     // with different counts are pruned as equivalent.
     e->nframes = 0;
@@ -228,12 +231,13 @@ INLINE struct config *config(void) {
     return map_lookup(&cfg, &z);
 }
 
+#define HEADER_SIZE 40
+
 INLINE void emit(struct config *c, u64 tid, u8 kind, u64 addr, u64 size, u64 ret, u8 flags) {
-    struct event *e = ringbuf_reserve(&events, sizeof(struct event), 0);
-    if (!e) {
-        count(C_DROPPED);
+    u32 z = 0;
+    struct event *e = map_lookup(&scratch, &z);
+    if (!e)
         return;
-    }
     e->ts = ktime_get_ns();
     e->tid = (u32)tid;
     e->kind = kind;
@@ -243,8 +247,17 @@ INLINE void emit(struct config *c, u64 tid, u8 kind, u64 addr, u64 size, u64 ret
     e->ret_addr = ret;
     e->nframes = 0;
     walk(c, e, tid);
+    u64 n = e->nframes;
+    if (n > KMAX_FRAMES)
+        n = KMAX_FRAMES;
+    u64 len = HEADER_SIZE + n * sizeof(struct frame);
+    if (len > sizeof(struct event))
+        len = sizeof(struct event);
+    if (ringbuf_output(&events, e, len, 0) != 0) {
+        count(C_DROPPED);
+        return;
+    }
     count(C_SAMPLED);
-    ringbuf_submit(e, 0);
 }
 
 // ---- arenas ---------------------------------------------------------------

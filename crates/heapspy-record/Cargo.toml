@@ -13,9 +13,14 @@ heapspy-reader.workspace = true
 heapspy-snapshot.workspace = true
 thiserror.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 object.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Diagnostics_Etw", "Win32_System_ProcessStatus", "Win32_System_Time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

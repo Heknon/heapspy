@@ -63,6 +63,7 @@ pub mod live;
 pub mod options;
 pub mod recorder;
 pub mod session;
+pub mod signals;
 pub mod sink;
 pub mod windows;
 
@@ -72,4 +73,5 @@ pub use options::{
 };
 pub use recorder::{RecordContext, Recorder, RunOutcome, Target};
 pub use session::{host_os, now_ns, record, record_with, select, RecordStats};
+pub use signals::stop_on_signals;
 pub use sink::{SampleSink, SinkStats};

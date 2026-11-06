@@ -20,10 +20,10 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
     opts.then_dump = args.then_dump;
     opts.mechanism = args.mechanism;
 
-    let stop = AtomicBool::new(false);
+    let stop: &AtomicBool = heapspy_record::stop_on_signals();
     // The source context lets error_code() treat I/O errors on the target
     // as being about the process, as for `dump --pid`.
-    let stats = heapspy_record::record(&opts, &stop).map_err(|e| {
+    let stats = heapspy_record::record(&opts, stop).map_err(|e| {
         anyhow::Error::from(e).context(DumpSource {
             kind: SourceKind::Pid,
             text: format!("cannot record pid {}", args.pid),

@@ -58,7 +58,7 @@
 //!
 //! # User space
 //!
-//! A BPF ring buffer (8 MiB), drained every 10 ms; reservation failures
+//! A BPF ring buffer (16 MiB, events sized to their frames), drained every 10 ms; reservation failures
 //! are counted in the kernel and reported as `samples_dropped`. Event times
 //! are `bpf_ktime_get_ns` (`CLOCK_MONOTONIC`), converted with
 //! `CLOCK_REALTIME − CLOCK_MONOTONIC` measured at start; the writer sorts

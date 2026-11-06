@@ -176,7 +176,8 @@ pub fn record_with(
         i.end_ns = now_ns();
         i.mechanisms = mechanisms;
         i.overhead = overhead;
-        i.truncated = outcome.truncated;
+        // Stopped early (Ctrl-C): the window is shorter than asked.
+        i.truncated = outcome.truncated || stop.load(std::sync::atomic::Ordering::Relaxed);
     }
     w.add_meta("heapspy.version", env!("CARGO_PKG_VERSION"))?;
     w.add_meta("heapspy.recorder", rec.name())?;
@@ -192,7 +193,7 @@ pub fn record_with(
         code_read_errors: st.code_read_errors,
         bytes_written: ws.bytes_written,
         overhead,
-        truncated: outcome.truncated,
+        truncated: outcome.truncated || stop.load(std::sync::atomic::Ordering::Relaxed),
         elapsed,
         snapshot: None,
     })
