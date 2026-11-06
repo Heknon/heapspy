@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use heapspy_alloc::{EventKind, EventKinds};
 #[cfg(target_os = "linux")]
-use heapspy_reader::cpython::frames::{RawFrame, MAX_INSTR_OFFSET};
+use heapspy_reader::cpython::frames::{self, RawFrame, MAX_INSTR_OFFSET};
 #[cfg(target_os = "linux")]
 use heapspy_reader::cpython::FrameOffsets;
 #[cfg(target_os = "linux")]
@@ -37,15 +37,31 @@ pub fn note_events(
 }
 
 #[cfg(target_os = "linux")]
-/// Remembers which type addresses are `code` (`tp_name == "code"`), the
-/// same test `read_stack` applies.
+/// Remembers which type addresses are `code` (`tp_name == "code"`) and
+/// which code objects are CPython shim code: the same tests `read_stack`
+/// applies to decide which frames to keep.
 #[derive(Default)]
 pub struct CodeTypes {
     types: HashMap<u64, bool>,
+    shims: HashMap<u64, bool>,
 }
 
 #[cfg(target_os = "linux")]
 impl CodeTypes {
+    /// Whether a frame whose executable is `code`, of type `ty`, is a
+    /// Python frame `read_stack` would keep: a code object, and not
+    /// CPython's shim code ([`frames::is_shim_code`]).
+    pub fn keep(&mut self, src: &dyn MemorySource, fo: &FrameOffsets, ty: u64, code: u64) -> bool {
+        if code == 0 || !self.is_code(src, fo, ty) {
+            return false;
+        }
+        // Shim code objects are static, so an address is never both.
+        !*self
+            .shims
+            .entry(code)
+            .or_insert_with(|| frames::is_shim_code(src, fo, code))
+    }
+
     pub fn is_code(&mut self, src: &dyn MemorySource, fo: &FrameOffsets, ty: u64) -> bool {
         if ty == 0 {
             return false;

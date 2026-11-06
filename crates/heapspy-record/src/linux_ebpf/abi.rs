@@ -96,6 +96,8 @@ const ZERO_OFFSETS: FrameOffsets = FrameOffsets {
     co_qualname: 0,
     co_filename: 0,
     co_firstlineno: 0,
+    co_flags: 0,
+    shim_code_flag: 0,
     co_linetable: 0,
     co_code_adaptive: 0,
     ob_type: 8,

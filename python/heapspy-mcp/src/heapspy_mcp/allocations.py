@@ -33,7 +33,9 @@ CAVEATS = (
     "started, have no stack.",
     "Arena and pool links are approximate: they name the most recent growth event that "
     "created the memory, not necessarily the call that allocated the object. "
-    "exact_linked_bytes counts links through large-object samples, which are exact.",
+    "exact_linked_bytes counts links through large-object samples, which are exact: the "
+    "object is the sampled allocation itself. Objects on memory a sampled large block "
+    "left behind, which they do not match, are not linked (coverage.unlinked_reused_*).",
     "estimated_bytes is the sum of sample weights over the recording window: an estimate "
     "of bytes allocated through sampled events, not of bytes still alive. linked_bytes is "
     "what is still alive in the snapshot.",
@@ -210,7 +212,7 @@ def summarize_allocations(
     sampling = block.get("sampling") if isinstance(block.get("sampling"), dict) else {}
     overhead = block.get("overhead") if isinstance(block.get("overhead"), dict) else {}
     coverage = dict(block.get("coverage") or {})
-    with_human(coverage, "linked_bytes", "exact_linked_bytes")
+    with_human(coverage, "linked_bytes", "exact_linked_bytes", "unlinked_reused_bytes")
     recording = {
         "path": clip_left(block.get("path"), 400),
         "pid": block.get("pid"),

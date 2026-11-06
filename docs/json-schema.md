@@ -212,6 +212,7 @@ Codes defined so far:
 | `allocations_after_snapshot` | `--allocations`: the snapshot was taken before recording started, so no sampled allocation can be in it |
 | `allocations_not_linked` | `--allocations` on analyze and `query --type`: one of the three notes above applies, so no object was linked to a sample; `top_stacks` is still reported, with `linked_bytes` 0 |
 | `allocations_sampled` | always on analyze and `query --type` with `--allocations`: what the samples cover (allocations made while recording, sampled events only) and that arena and pool links are approximate |
+| `allocations_unlinked_reused` | `--allocations` on analyze and `query --type`, when `coverage.unlinked_reused_objects` (see Allocations) is not 0: how many reachable objects sit on memory of a sampled large allocation they do not match, and are therefore not linked |
 | `allocations_not_joined` | no longer emitted. heapspy versions before the join printed it when `--allocations` was given to analyze or `query --type` |
 
 `truncated_snapshot` is also used by dump, when `truncated` is true.
@@ -451,15 +452,22 @@ window, not a full allocation history: only arena, pool and large-object
 events are sampled, blocks reused from freed memory are not, and objects
 allocated before recording started have no sample. An object is *linked*
 to a sample when its address lies inside the sampled range and no later
-sample covers that address. Samples taken after the snapshot's capture
+sample covers that address. For a `large_object` sample the object must
+also be that allocation: it starts at the sample's address plus 0, 16 or
+32 bytes (no GC header, the GC header, or the GC header and the managed
+dict and weakref words), and the sample's requested size is within 16
+bytes of the object's `shallow_size` (for a type object, at most 16 bytes
+above it). When the latest covering sample is a `large_object` sample the
+object does not match, the object is not linked at all and is counted in
+`coverage.unlinked_reused_*`. Samples taken after the snapshot's capture
 second are not used for linking. When the profile does not match the
 snapshot (the `allocations_*_mismatch` and `allocations_after_snapshot`
 notes), nothing is linked and the report carries `allocations_not_linked`.
 The algorithm is described in `docs/allocation-sampling.md`, "Joining with
 a snapshot".
 
-Links through `large_object` samples are *exact*: the sample's range is
-one allocation. Links through `arena` and `pool` samples (and `other`) are
+Links through `large_object` samples are *exact*: the sample is the
+object's own allocation. Links through `arena` and `pool` samples (and `other`) are
 *approximate*: the sample is the most recent growth event that created
 the memory, not necessarily the call that allocated the object. The
 `exact_linked_*` fields give the exact part of each linked count. The
@@ -492,6 +500,8 @@ event by time (ETW).
 | `coverage.linked_pct` | float | `coverage.linked_bytes / totals.reachable_bytes * 100` |
 | `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` samples (exact links) |
 | `coverage.exact_linked_bytes` | integer | their shallow bytes |
+| `coverage.unlinked_reused_objects` | integer | reachable objects not linked because the latest sample over their address is a `large_object` sample they do not match: the sampled block was freed and the memory reused by an allocation that was not sampled. Added after the first M7 release; reads as 0 when missing |
+| `coverage.unlinked_reused_bytes` | integer | their shallow bytes; reads as 0 when missing |
 | `top_stacks` | array of AllocationStack | stacks by `estimated_bytes`, at most `--top` |
 
 AllocationStack (`top_stacks[]`):

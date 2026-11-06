@@ -2,7 +2,11 @@
 //! profiles, checked against brute force.
 //!
 //! - Each object is linked to the latest sample whose range contains its
-//!   address.
+//!   address, unless that sample is a large-object sample the object does
+//!   not match (start at a pre-header offset of 0, 16 or 32 bytes, not 0
+//!   for a GC-tracked object; requested size within 16 bytes of the
+//!   shallow size, or at most 16 above it for a type object). Then it is
+//!   not linked at all, and counted as reused if reachable.
 //! - Linked bytes are reachable bytes, so never more than the reachable
 //!   total, and the stacks' linked bytes add up to the coverage.
 //! - `allocated_at` of a retainer or instance sums the linked objects of
@@ -17,7 +21,7 @@ use heapspy_analyzer::allocations::{
 };
 use heapspy_analyzer::report::AllocatedAt;
 use heapspy_analyzer::{AnalyzeOptions, QueryOptions};
-use heapspy_snapshot::{RootKind, SnapshotBuilder};
+use heapspy_snapshot::{ObjectFlags, RootKind, SnapshotBuilder};
 use proptest::prelude::*;
 
 const TYPES: [&str; 2] = ["A", "B"];
@@ -29,34 +33,94 @@ const KINDS: [EventKind; 4] = [
     EventKind::Other,
 ];
 
+/// Object flags: GC-tracked, untracked, or a (tracked) type object.
+const FLAGS: [ObjectFlags; 3] = [
+    ObjectFlags::GC_TRACKED,
+    ObjectFlags::NONE,
+    ObjectFlags(ObjectFlags::GC_TRACKED.0 | ObjectFlags::IS_TYPE.0),
+];
+
 #[derive(Debug, Clone)]
 struct Case {
     types: Vec<usize>,
     sizes: Vec<u64>,
+    flags: Vec<usize>,
     edges: Vec<(usize, usize)>,
     roots: Vec<usize>,
-    /// (kind, start offset from the first object, size, stack)
+    /// (kind, start address, size, stack)
     samples: Vec<(usize, u64, u64, usize)>,
 }
+
+/// A sample: a random range, or a large-object sample aimed at object
+/// `j` (start `addr(j) - pre`, size `sizes[j] + delta`) so that matches and
+/// near misses are common.
+type RawSample = (usize, u64, u64, usize, Option<(usize, u64, i64)>);
 
 fn strategy() -> impl Strategy<Value = Case> {
     (1usize..14).prop_flat_map(|n| {
         let span = 0x10 * n as u64 + 0x40;
+        let aimed = (
+            0..n,
+            prop::sample::select(vec![0u64, 8, 16, 32, 48]),
+            -24i64..24,
+        );
         (
             prop::collection::vec(0..TYPES.len(), n),
             prop::collection::vec(1u64..500, n),
+            prop::collection::vec(0..FLAGS.len(), n),
             prop::collection::vec((0..n, 0..n), 0..n * 3),
             prop::collection::vec(0..n, 1..4),
-            prop::collection::vec((0..KINDS.len(), 0..span, 0u64..0x60, 0..STACKS), 0..12),
+            prop::collection::vec(
+                (
+                    0..KINDS.len(),
+                    0..span,
+                    0u64..0x60,
+                    0..STACKS,
+                    prop::option::of(aimed),
+                ),
+                0..12,
+            ),
         )
-            .prop_map(|(types, sizes, edges, roots, samples)| Case {
-                types,
-                sizes,
-                edges,
-                roots,
-                samples,
+            .prop_map(|(types, sizes, flags, edges, roots, raw)| {
+                let samples = raw
+                    .into_iter()
+                    .map(|(kind, off, size, stack, aim): RawSample| match aim {
+                        Some((j, pre, delta)) => (
+                            2, // LargeObject
+                            addr(j) - pre,
+                            (sizes[j] as i64 + delta).max(0) as u64,
+                            stack,
+                        ),
+                        None => (kind, sample_start(off), size, stack),
+                    })
+                    .collect();
+                Case {
+                    types,
+                    sizes,
+                    flags,
+                    edges,
+                    roots,
+                    samples,
+                }
             })
     })
+}
+
+/// The large-object rule, written out on its own.
+fn matches(c: &Case, i: usize, start: u64, size: u64) -> bool {
+    let a = addr(i);
+    if a < start {
+        return false;
+    }
+    let pre = a - start;
+    let f = FLAGS[c.flags[i]];
+    let tracked = f.contains(ObjectFlags::GC_TRACKED);
+    let is_type = f.contains(ObjectFlags::IS_TYPE);
+    let start_ok = pre == 16 || pre == 32 || (pre == 0 && !tracked);
+    let shallow = c.sizes[i] as i64;
+    let d = size as i64 - shallow;
+    let size_ok = d <= 16 && (is_type || d >= -16);
+    start_ok && size_ok
 }
 
 const BASE: u64 = 0x1000;
@@ -149,6 +213,7 @@ proptest! {
         let tids: Vec<_> = TYPES.iter().map(|t| b.ty("m", t)).collect();
         for i in 0..n {
             let o = b.object(addr(i), tids[c.types[i]], c.sizes[i]);
+            o.flags(FLAGS[c.flags[i]]);
             for (k, &(_, t)) in c.edges.iter().filter(|e| e.0 == i).enumerate() {
                 o.list_item(addr(t), k as u32);
             }
@@ -162,25 +227,34 @@ proptest! {
         let code: Vec<_> = (0..STACKS)
             .map(|k| pb.code_with_lines(0x9000 + k as u64 * 0x100, &format!("f{k}"), "m.py", 1, &[(8, 1)]))
             .collect();
-        for &(kind, off, size, stack) in &c.samples {
-            pb.sample(KINDS[kind], sample_start(off), size).frame(code[stack], 0);
+        for &(kind, start, size, stack) in &c.samples {
+            pb.sample(KINDS[kind], start, size).frame(code[stack], 0);
         }
         let prof = pb.build().unwrap();
 
-        // Latest covering sample per object.
-        let link: Vec<Option<usize>> = (0..n)
+        // Latest covering sample per object, and whether it is a
+        // large-object sample the object does not match.
+        let covering: Vec<Option<usize>> = (0..n)
             .map(|i| {
                 let a = addr(i);
                 c.samples
                     .iter()
                     .enumerate()
                     .rev()
-                    .find(|(_, &(_, off, size, _))| {
-                        let s = sample_start(off);
-                        s <= a && a < s + size
-                    })
+                    .find(|(_, &(_, s, size, _))| s <= a && a < s + size)
                     .map(|(j, _)| j)
             })
+            .collect();
+        let reused: Vec<bool> = (0..n)
+            .map(|i| {
+                covering[i].is_some_and(|j| {
+                    let (kind, start, size, _) = c.samples[j];
+                    KINDS[kind] == EventKind::LargeObject && !matches(&c, i, start, size)
+                })
+            })
+            .collect();
+        let link: Vec<Option<usize>> = (0..n)
+            .map(|i| covering[i].filter(|_| !reused[i]))
             .collect();
         let got = object_links(&snap, &prof).unwrap();
         let got: Vec<Option<usize>> = got
@@ -205,6 +279,15 @@ proptest! {
             .map(|i| c.sizes[i])
             .sum();
         prop_assert_eq!(a.coverage.linked_bytes, linked);
+        let reused_bytes: u64 = (0..n)
+            .filter(|&i| base[i] && reused[i])
+            .map(|i| c.sizes[i])
+            .sum();
+        let reused_objects = (0..n).filter(|&i| base[i] && reused[i]).count() as u64;
+        prop_assert_eq!(a.coverage.unlinked_reused_objects, reused_objects);
+        prop_assert_eq!(a.coverage.unlinked_reused_bytes, reused_bytes);
+        let noted = rep.notes.iter().any(|n| n.code == "allocations_unlinked_reused");
+        prop_assert_eq!(noted, reused_objects > 0);
         prop_assert!(a.coverage.linked_bytes <= rep.totals.reachable_bytes);
         prop_assert!(a.coverage.exact_linked_bytes <= a.coverage.linked_bytes);
         prop_assert!(a.coverage.linked_pct <= 100.0);

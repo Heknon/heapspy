@@ -28,6 +28,7 @@
 //!       frame + if_owner (u8)        >= owner_first_shim: C-stack shim, skip
 //!       frame + if_executable        -> code object (3.14: _PyStackRef, clear low 2 bits;
 //!                                       low bits 0b11 is a tagged int, skip)
+//!       code + co_flags (u32)        & shim_code_flag: CPython's shim code, skip
 //!       frame + if_instr_ptr         -> _Py_CODEUNIT * (3.12: prev_instr)
 //!       instr_offset = instr_ptr - (code + co_code_adaptive), in bytes
 //!       frame + if_previous          -> next outer frame, or 0
@@ -38,6 +39,32 @@
 //! object's `co_linetable`. On 3.12 a frame that has not started has
 //! `prev_instr` one code unit before the code; that is recorded as "no
 //! offset" and resolves to `co_firstlineno`, as CPython does.
+//!
+//! # Shim frames
+//!
+//! Two kinds of frames on the chain run no Python code of the program, and
+//! CPython's tracebacks do not show them:
+//!
+//! - The entry frame `_PyEval_EvalFrameDefault` pushes for each C-level
+//!   call into the interpreter: owner `FRAME_OWNED_BY_CSTACK` (3.12, 3.13)
+//!   or `FRAME_OWNED_BY_INTERPRETER` (3.14), so `owner >= owner_first_shim`.
+//!   Its executable is the interpreter's trampoline code object on 3.12 and
+//!   `None` on 3.13 and 3.14.
+//! - On 3.13 and 3.14, the frame of `_Py_InitCleanup`, which the
+//!   `CALL_ALLOC_AND_ENTER_INIT` instruction (a call to a Python class
+//!   with a Python `__init__`) pushes under `__init__`'s frame to check
+//!   that `__init__` returned `None`. It is an ordinary frame
+//!   (`FRAME_OWNED_BY_THREAD`) whose code object is a static one named
+//!   `__init__` in file `__init__`. CPython hides it because its
+//!   instruction pointer is before the code's `_co_firsttraceable`
+//!   (`_PyFrame_IsIncomplete`). This module recognises the code object
+//!   instead, by `CO_NO_MONITORING_EVENTS` (0x2000000) in `co_flags`: the
+//!   compiler never sets it, and CPython sets it on its internal shim code
+//!   so that monitoring does not see it either. 3.12 has no such frame (and
+//!   no such flag).
+//!
+//! [`read_stack`] skips both, and the eBPF recorder applies the same two
+//! tests to the frames its kernel program copies ([`is_shim_code`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -58,6 +85,12 @@ pub const MAX_NAME_LEN: usize = 4096;
 pub const MAX_LINETABLE_LEN: usize = 1 << 20;
 /// Instruction offsets at or above this are treated as misreads.
 pub const MAX_INSTR_OFFSET: u64 = 1 << 26;
+/// `offsetof(PyCodeObject, co_flags)` on 3.12, 3.13 and 3.14: after
+/// `PyObject_VAR_HEAD` and `co_consts`, `co_names`, `co_exceptiontable`.
+pub const CO_FLAGS: u64 = 48;
+/// `CO_NO_MONITORING_EVENTS` (3.13+): set on CPython's shim code
+/// (`_Py_InitCleanup`), never by the compiler.
+pub const CO_NO_MONITORING_EVENTS: u32 = 0x0200_0000;
 
 /// Byte offsets a recorder needs to read Python stacks and code objects.
 /// See the module docs for how they chain.
@@ -104,6 +137,11 @@ pub struct FrameOffsets {
     pub co_filename: u64,
     /// `PyCodeObject.co_firstlineno` (`int`).
     pub co_firstlineno: u64,
+    /// `PyCodeObject.co_flags` (`int`).
+    pub co_flags: u64,
+    /// The `co_flags` bit that marks CPython's shim code objects
+    /// (`CO_NO_MONITORING_EVENTS` on 3.13+), or 0 if the version has none.
+    pub shim_code_flag: u32,
     /// `PyCodeObject.co_linetable` (pointer to `bytes`).
     pub co_linetable: u64,
     /// Start of the bytecode inside the code object (`_PyCode_CODE`).
@@ -150,6 +188,12 @@ impl FrameOffsets {
             co_qualname: o.co_qualname,
             co_filename: o.co_filename,
             co_firstlineno: o.co_firstlineno,
+            co_flags: CO_FLAGS,
+            shim_code_flag: if o.minor >= 13 {
+                CO_NO_MONITORING_EVENTS
+            } else {
+                0
+            },
             co_linetable: o.co_linetable,
             co_code_adaptive: o.co_code_adaptive,
             ob_type: 8,
@@ -277,9 +321,19 @@ fn is_code(
     v
 }
 
+/// Whether the code object at `code` is one of CPython's shim code objects
+/// (see "Shim frames" in the module docs). A failed read says no: the frame
+/// is kept.
+pub fn is_shim_code(src: &dyn MemorySource, fo: &FrameOffsets, code: u64) -> bool {
+    fo.shim_code_flag != 0
+        && src
+            .read_u32(code + fo.co_flags)
+            .is_ok_and(|f| f & fo.shim_code_flag != 0)
+}
+
 /// Read a thread's Python stack, innermost first, at most `max_frames`
-/// frames. Shim frames and frames whose executable is not a code object
-/// are skipped.
+/// frames. Shim frames (see the module docs) and frames whose executable is
+/// not a code object are skipped.
 pub fn read_stack(
     src: &dyn MemorySource,
     fo: &FrameOffsets,
@@ -290,6 +344,7 @@ pub fn read_stack(
     let mut f = current_frame(src, fo, tstate)?;
     let mut seen = HashSet::new();
     let mut types = HashMap::new();
+    let mut shims: HashMap<u64, bool> = HashMap::new();
     // Bound the walk even when every frame is a shim.
     let limit = max_frames.saturating_mul(4).max(64);
     while f != 0 {
@@ -316,7 +371,12 @@ pub fn read_stack(
             } else {
                 raw
             };
-            if code != 0 && is_code(src, fo, code, &mut types) {
+            if code != 0
+                && is_code(src, fo, code, &mut types)
+                && !*shims
+                    .entry(code)
+                    .or_insert_with(|| is_shim_code(src, fo, code))
+            {
                 if out.frames.len() == max_frames {
                     out.truncated = true;
                     break;

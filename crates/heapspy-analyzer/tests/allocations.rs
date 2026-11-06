@@ -4,11 +4,11 @@
 use heapspy_alloc::{CodeId, EventKind, Profile, ProfileBuilder, SampleFlags};
 use heapspy_analyzer::allocations::{
     analyze_with_allocations, folded_allocations, folded_allocations_linked, object_links,
-    query_type_with_allocations, FlameWeight, NO_LINK, NO_STACK_FRAME,
+    query_type_with_allocations, FlameWeight, NO_LINK, NO_STACK_FRAME, SIZE_SLACK,
 };
 use heapspy_analyzer::report::{AnalyzeReport, Note, TypeQueryReport};
 use heapspy_analyzer::{AnalyzeOptions, MinWidth, QueryOptions};
-use heapspy_snapshot::{RootKind, Snapshot, SnapshotBuilder, TypeId};
+use heapspy_snapshot::{ObjectFlags, RootKind, Snapshot, SnapshotBuilder, TypeId};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1 << 20;
@@ -18,13 +18,26 @@ fn codes(n: &[Note]) -> Vec<&str> {
     n.iter().map(|n| n.code.as_str()).collect()
 }
 
+/// How a CACHE entry is recorded in the snapshot.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// `bytes`: no GC header, so its allocation starts at the object.
+    Bytes,
+    /// A GC-tracked `tuple`: its allocation starts 16 bytes before it.
+    Tuple,
+    /// A type object (GC-tracked, flag `IS_TYPE`).
+    Type,
+}
+
 /// A snapshot builder for pid 4242 (matching [`profile`]) with a module
 /// `app` whose `CACHE` dict is at 0x3000.
 struct Snap {
     b: SnapshotBuilder,
     bytes: TypeId,
-    entries: Vec<(u64, u64)>,
-    extra: Vec<(u64, u64)>,
+    tuple: TypeId,
+    ty: TypeId,
+    entries: Vec<(u64, u64, Kind)>,
+    extra: Vec<(u64, u64, Kind)>,
 }
 
 impl Snap {
@@ -33,9 +46,13 @@ impl Snap {
         b.info_mut().source.reference = "4242".into();
         b.info_mut().captured_at = 2000;
         let bytes = b.ty("builtins", "bytes");
+        let tuple = b.ty("builtins", "tuple");
+        let ty = b.ty("builtins", "type");
         Snap {
             b,
             bytes,
+            tuple,
+            ty,
             entries: Vec::new(),
             extra: Vec::new(),
         }
@@ -43,13 +60,20 @@ impl Snap {
 
     /// A `bytes` object of `size` at `addr` held by CACHE.
     fn entry(&mut self, addr: u64, size: u64) -> &mut Self {
-        self.entries.push((addr, size));
+        self.entries.push((addr, size, Kind::Bytes));
+        self
+    }
+
+    /// An object of another kind held by CACHE; `size` includes the GC
+    /// header, as the walker's shallow sizes do.
+    fn entry_of(&mut self, kind: Kind, addr: u64, size: u64) -> &mut Self {
+        self.entries.push((addr, size, kind));
         self
     }
 
     /// An unreachable `bytes` object.
     fn garbage(&mut self, addr: u64, size: u64) -> &mut Self {
-        self.extra.push((addr, size));
+        self.extra.push((addr, size, Kind::Bytes));
         self
     }
 
@@ -60,11 +84,22 @@ impl Snap {
         b.object(0x1000, m, 72).attr(0x2000, "__dict__");
         b.object(0x2000, d, 1000).dict_value(0x3000, "'CACHE'");
         let c = b.object(0x3000, d, 200);
-        for (i, &(a, _)) in self.entries.iter().enumerate() {
+        for (i, &(a, _, _)) in self.entries.iter().enumerate() {
             c.dict_value(a, &format!("'k{i}'"));
         }
-        for &(a, s) in self.entries.iter().chain(&self.extra) {
-            b.object(a, self.bytes, s).untracked();
+        for &(a, s, k) in self.entries.iter().chain(&self.extra) {
+            match k {
+                Kind::Bytes => {
+                    b.object(a, self.bytes, s).untracked();
+                }
+                Kind::Tuple => {
+                    b.object(a, self.tuple, s);
+                }
+                Kind::Type => {
+                    b.object(a, self.ty, s)
+                        .flags(ObjectFlags::GC_TRACKED | ObjectFlags::IS_TYPE);
+                }
+            }
         }
         b.root(0x1000, RootKind::ModuleDict, "sys.modules['app']");
         b.build().unwrap()
@@ -139,12 +174,12 @@ fn link_of(s: &Snapshot, p: &Profile, addr: u64) -> u32 {
 
 #[test]
 fn large_object_link_is_exact() {
-    // The allocator's block starts 16 bytes before the object (GC header).
-    let s = Snap::new().entry(0x10_0010, 4096).build();
+    // A bytes object has no GC header: its allocation starts at the object.
+    let s = Snap::new().entry(0x10_0000, 4096).build();
     let mut p = profile();
-    p.by_fill(EventKind::LargeObject, 0x10_0000, 4096 + 16);
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 4096);
     let p = p.build();
-    assert_eq!(link_of(&s, &p, 0x10_0010), 0);
+    assert_eq!(link_of(&s, &p, 0x10_0000), 0);
     assert_eq!(link_of(&s, &p, 0x3000), NO_LINK);
 
     let r = analyze(&s, &p);
@@ -161,8 +196,196 @@ fn large_object_link_is_exact() {
     assert_eq!(t.frames[0].location, "app.py:4");
     assert_eq!(t.frames[1].location, "main.py:2");
     assert!(!t.approximate && !a.approximate);
-    assert!(codes(&r.notes).contains(&"allocations_sampled"));
+    assert_eq!(a.coverage.unlinked_reused_objects, 0);
+    assert_eq!(a.coverage.unlinked_reused_bytes, 0);
+    assert_eq!(codes(&r.notes).last(), Some(&"allocations_sampled"));
     assert!(!codes(&r.notes).contains(&"allocations_not_linked"));
+    assert!(!codes(&r.notes).contains(&"allocations_unlinked_reused"));
+}
+
+#[test]
+fn gc_header_is_part_of_the_allocation() {
+    // A GC object's allocation starts at its GC header, 16 bytes before the
+    // object (32 with the managed dict and weakref words); the shallow size
+    // counts the header, as the requested size does.
+    let s = Snap::new()
+        .entry_of(Kind::Tuple, 0x10_0010, 4112)
+        .entry_of(Kind::Tuple, 0x20_0020, 4128)
+        .build();
+    let mut p = profile();
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 4112);
+    p.by_fill(EventKind::LargeObject, 0x20_0000, 4128);
+    let p = p.build();
+    assert_eq!(link_of(&s, &p, 0x10_0010), 0);
+    assert_eq!(link_of(&s, &p, 0x20_0020), 1);
+    let a = analyze(&s, &p).allocations.unwrap();
+    assert_eq!(a.coverage.exact_linked_objects, 2);
+    assert_eq!(a.coverage.exact_linked_bytes, 4112 + 4128);
+    assert_eq!(a.coverage.unlinked_reused_objects, 0);
+}
+
+#[test]
+fn size_tolerance() {
+    // `PyType_GenericAlloc` asks for one item more than the object holds,
+    // rounded to 8: an int subclass 4 to 8 bytes more, a tuple subclass 8.
+    let base = 0x100_0000u64;
+    let slack = SIZE_SLACK as i64;
+    let deltas: [i64; 6] = [0, 8, slack, -slack, slack + 1, -slack - 1];
+    let mut s = Snap::new();
+    let mut p = profile();
+    for (i, d) in deltas.iter().enumerate() {
+        let a = base + i as u64 * 0x1_0000;
+        s.entry(a, 5000);
+        p.by_fill(EventKind::LargeObject, a, (5000 + d) as u64);
+    }
+    let (s, p) = (s.build(), p.build());
+    let got: Vec<bool> = (0..deltas.len() as u64)
+        .map(|i| link_of(&s, &p, base + i * 0x1_0000) != NO_LINK)
+        .collect();
+    assert_eq!(got, [true, true, true, true, false, false]);
+    let a = analyze(&s, &p).allocations.unwrap();
+    assert_eq!(a.coverage.unlinked_reused_objects, 2);
+    assert_eq!(a.coverage.unlinked_reused_bytes, 10_000);
+}
+
+#[test]
+fn type_objects_may_count_more_than_their_allocation() {
+    // A heap type's shallow size also counts its shared-keys table, which
+    // is a separate allocation: only the upper bound applies.
+    let s = Snap::new()
+        .entry_of(Kind::Type, 0x10_0010, 1700)
+        .entry_of(Kind::Type, 0x20_0010, 1000)
+        .build();
+    let mut p = profile();
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 1000);
+    p.by_fill(EventKind::LargeObject, 0x20_0000, 1700);
+    let p = p.build();
+    assert_eq!(link_of(&s, &p, 0x10_0010), 0);
+    assert_eq!(link_of(&s, &p, 0x20_0010), NO_LINK);
+}
+
+/// The reproduction: a large block sampled and freed (`render_page`), and
+/// its memory reused by an unsampled allocation of another size (a
+/// `Session` blob) that the snapshot then sees.
+#[test]
+fn reused_address_of_another_size_is_not_linked() {
+    let s = Snap::new()
+        .entry(0x10_0000, 8225)
+        .entry(0x20_0000, 8225)
+        .build();
+    let mut p = profile();
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 20_033);
+    // Older samples describe even earlier allocations: an older sample of
+    // the right size does not take over.
+    p.by_load(EventKind::LargeObject, 0x20_0000, 8225);
+    p.by_fill(EventKind::LargeObject, 0x20_0000, 20_033);
+    let p = p.build();
+    assert_eq!(link_of(&s, &p, 0x10_0000), NO_LINK);
+    assert_eq!(link_of(&s, &p, 0x20_0000), NO_LINK);
+
+    let r = analyze(&s, &p);
+    let a = r.allocations.as_ref().unwrap();
+    assert_eq!(a.coverage.linked_objects, 0);
+    assert_eq!(a.coverage.exact_linked_bytes, 0);
+    assert_eq!(a.coverage.unlinked_reused_objects, 2);
+    assert_eq!(a.coverage.unlinked_reused_bytes, 2 * 8225);
+    for t in &a.top_stacks {
+        assert_eq!(t.linked_bytes, 0, "{t:?}");
+    }
+    let at = r.top_retainers[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.linked_objects, 0);
+    assert!(at.stacks.is_empty());
+    let n = r
+        .notes
+        .iter()
+        .find(|n| n.code == "allocations_unlinked_reused")
+        .expect("allocations_unlinked_reused note");
+    assert!(
+        n.message.starts_with("2 reachable objects (16450 bytes)"),
+        "{}",
+        n.message
+    );
+    // Unreachable objects are not counted.
+    let s = Snap::new().garbage(0x10_0000, 8225).build();
+    let r = analyze(&s, &p);
+    assert_eq!(
+        r.allocations
+            .as_ref()
+            .unwrap()
+            .coverage
+            .unlinked_reused_objects,
+        0
+    );
+    assert!(!codes(&r.notes).contains(&"allocations_unlinked_reused"));
+}
+
+#[test]
+fn start_offset_mismatch_is_not_linked() {
+    let s = Snap::new()
+        // Inside the block, not at a pre-header offset.
+        .entry(0x10_0008, 4096)
+        .entry(0x20_0030, 4096)
+        .entry(0x30_0040, 4096)
+        // A GC-tracked object has a GC header, so it cannot start at the
+        // block's start.
+        .entry_of(Kind::Tuple, 0x40_0000, 4096)
+        .build();
+    let mut p = profile();
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 4096);
+    p.by_fill(EventKind::LargeObject, 0x20_0000, 4096);
+    p.by_fill(EventKind::LargeObject, 0x30_0000, 4096);
+    p.by_fill(EventKind::LargeObject, 0x40_0000, 4096);
+    let p = p.build();
+    for a in [0x10_0008, 0x20_0030, 0x30_0040, 0x40_0000] {
+        assert_eq!(link_of(&s, &p, a), NO_LINK, "{a:#x}");
+    }
+    let a = analyze(&s, &p).allocations.unwrap();
+    assert_eq!(a.coverage.unlinked_reused_objects, 4);
+}
+
+#[test]
+fn reuse_sampled_again_links_to_the_later_sample() {
+    // render_page's block, freed; then the blob's own allocation at the
+    // same address, sampled.
+    let s = Snap::new().entry(0x10_0000, 8225).build();
+    let mut p = profile();
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 20_033);
+    p.by_load(EventKind::LargeObject, 0x10_0000, 8225);
+    let p = p.build();
+    assert_eq!(link_of(&s, &p, 0x10_0000), 1);
+    let a = analyze(&s, &p).allocations.unwrap();
+    assert_eq!(a.coverage.exact_linked_bytes, 8225);
+    assert_eq!(a.coverage.unlinked_reused_objects, 0);
+    let by = |f: &str| {
+        a.top_stacks
+            .iter()
+            .find(|t| t.frames[0].function == f)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by("fill").linked_bytes, 0);
+    assert_eq!(by("load").exact_linked_bytes, 8225);
+}
+
+#[test]
+fn arena_links_ignore_object_sizes() {
+    // Objects carved from an arena link to it whatever their size and
+    // offset; no large-object rule applies.
+    let s = Snap::new()
+        .entry(ARENA + 0x30, 48)
+        .entry_of(Kind::Tuple, ARENA + 0x4040, 2440)
+        .build();
+    let mut p = profile();
+    // A large block whose memory was unmapped, then the arena mapped there.
+    p.by_load(EventKind::LargeObject, ARENA, 300_000);
+    p.by_fill(EventKind::Arena, ARENA, MIB);
+    let p = p.build();
+    assert_eq!(link_of(&s, &p, ARENA + 0x30), 1);
+    assert_eq!(link_of(&s, &p, ARENA + 0x4040), 1);
+    let a = analyze(&s, &p).allocations.unwrap();
+    assert_eq!(a.coverage.linked_objects, 2);
+    assert_eq!(a.coverage.exact_linked_objects, 0);
+    assert_eq!(a.coverage.unlinked_reused_objects, 0);
 }
 
 #[test]
@@ -198,22 +421,24 @@ fn pool_and_arena_links_are_approximate() {
 #[test]
 fn later_sample_supersedes_earlier() {
     let s = Snap::new()
-        .entry(0x20_0010, 1000)
-        .entry(ARENA + 0x80, 64)
+        .entry(0x20_0000, 1000)
+        .entry(ARENA + 0x80, 600)
         .entry(ARENA + 2 * MIB + 0x80, 64)
         .build();
     let mut p = profile();
     // The same block allocated twice: the second one is the live one.
-    p.by_fill(EventKind::LargeObject, 0x20_0000, 2000);
-    p.by_load(EventKind::LargeObject, 0x20_0000, 2000);
-    // An arena mapped, a large block inside it later: the block wins.
+    p.by_fill(EventKind::LargeObject, 0x20_0000, 1000);
+    p.by_load(EventKind::LargeObject, 0x20_0000, 1000);
+    // An arena mapped (then unmapped), a large block there later: the
+    // block wins.
     p.by_fill(EventKind::Arena, ARENA, MIB);
-    p.by_load(EventKind::LargeObject, ARENA + 0x70, 200);
-    // A large block, then an arena mapped over the same memory: the arena wins.
+    p.by_load(EventKind::LargeObject, ARENA + 0x80, 600);
+    // A large block, then an arena mapped over the same memory: the arena
+    // wins, whatever the block's size.
     p.by_load(EventKind::LargeObject, ARENA + 2 * MIB + 0x70, 200);
     p.by_fill(EventKind::Arena, ARENA + 2 * MIB, MIB);
     let p = p.build();
-    assert_eq!(link_of(&s, &p, 0x20_0010), 1);
+    assert_eq!(link_of(&s, &p, 0x20_0000), 1);
     assert_eq!(link_of(&s, &p, ARENA + 0x80), 3);
     assert_eq!(link_of(&s, &p, ARENA + 2 * MIB + 0x80), 5);
 
@@ -223,8 +448,8 @@ fn later_sample_supersedes_earlier() {
         .iter()
         .find(|t| t.frames[0].function == "load")
         .unwrap();
-    assert_eq!(load.linked_bytes, 1000 + 64);
-    assert_eq!(load.exact_linked_bytes, 1000 + 64);
+    assert_eq!(load.linked_bytes, 1000 + 600);
+    assert_eq!(load.exact_linked_bytes, 1000 + 600);
     let fill = a
         .top_stacks
         .iter()
@@ -264,11 +489,11 @@ fn two_stack_cache() -> (Snapshot, Profile) {
     let mut p = profile();
     for i in 0..6u64 {
         let addr = 0x100_0000 + i * 0x1_0000;
-        s.entry(addr + 16, 5000);
+        s.entry(addr, 5000);
         if i < 4 {
-            p.by_fill(EventKind::LargeObject, addr, 5016);
+            p.by_fill(EventKind::LargeObject, addr, 5000);
         } else {
-            p.by_load(EventKind::LargeObject, addr, 5016);
+            p.by_load(EventKind::LargeObject, addr, 5000);
         }
     }
     (s.build(), p.build())
@@ -414,7 +639,7 @@ fn header_fields_are_reported() {
 
 #[test]
 fn mismatched_profiles_are_not_linked() {
-    let s = Snap::new().entry(0x10_0010, 4096).build();
+    let s = Snap::new().entry(0x10_0000, 8192).build();
     for (what, code) in [
         ("pid", "allocations_pid_mismatch"),
         ("after", "allocations_after_snapshot"),
@@ -442,17 +667,18 @@ fn mismatched_profiles_are_not_linked() {
 
 #[test]
 fn samples_after_the_snapshot_are_not_linked() {
-    let s = Snap::new().entry(0x10_0010, 4096).build();
+    let s = Snap::new().entry(0x10_0000, 4096).build();
     let mut p = profile();
-    p.by_fill(EventKind::LargeObject, 0x10_0000, 8192);
-    // Taken after the snapshot (captured at second 2000): would supersede.
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 4096);
+    // Taken after the snapshot (captured at second 2000): would supersede,
+    // and would not match.
     let (l, m) = (p.load, p.main);
     p.b.sample(EventKind::LargeObject, 0x10_0000, 8192)
         .at(2001 * 1_000_000_000)
         .frame(l, 0)
         .frame(m, 0);
     let p = p.build();
-    assert_eq!(link_of(&s, &p, 0x10_0010), 0);
+    assert_eq!(link_of(&s, &p, 0x10_0000), 0);
 }
 
 #[test]

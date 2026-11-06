@@ -41,6 +41,33 @@ def outer(ready):
 outer(sys.argv[1])
 "#;
 
+/// The same stack through a class instantiation. The call site runs often
+/// enough to be specialized (`CALL_ALLOC_AND_ENTER_INIT` on 3.13 and
+/// 3.14), so `__init__` runs above CPython's `_Py_InitCleanup` shim frame,
+/// which `read_stack` must skip. Line numbers: inner:9, Box.__init__:14,
+/// outer:18, <module>:20.
+const CLASS_VICTIM: &str = r#"import os, sys, time
+
+def inner(ready):
+    tmp = ready + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(os.getpid()))
+    os.rename(tmp, ready)
+    while True:
+        time.sleep(1)
+
+class Box:
+    def __init__(self, ready, n):
+        if n == 0:
+            inner(ready)
+
+def outer(ready):
+    for n in range(50, -1, -1):
+        Box(ready, n)
+
+outer(sys.argv[1])
+"#;
+
 fn python(minor: u8) -> PathBuf {
     if let Ok(p) = std::env::var(format!("HEAPSPY_PY3{minor}")) {
         return p.into();
@@ -69,9 +96,9 @@ impl Drop for Victim {
     }
 }
 
-fn start(py: &Path, dir: &Path) -> Victim {
+fn start(py: &Path, dir: &Path, victim: &str) -> Victim {
     let script = dir.join("victim.py");
-    std::fs::write(&script, VICTIM).unwrap();
+    std::fs::write(&script, victim).unwrap();
     let ready = dir.join("ready");
     let child = Command::new(py)
         .arg(&script)
@@ -92,9 +119,61 @@ fn start(py: &Path, dir: &Path) -> Victim {
     Victim(child)
 }
 
+/// Shim code objects on the raw frame chain of `tstate`, walked without
+/// any filtering: the frames `read_stack` has to skip.
+fn raw_shims(
+    src: &dyn heapspy_reader::MemorySource,
+    fo: &frames::FrameOffsets,
+    tstate: u64,
+) -> usize {
+    use heapspy_reader::MemorySourceExt;
+    let mut f = frames::current_frame(src, fo, tstate).unwrap();
+    let mut n = 0;
+    for _ in 0..256 {
+        if f == 0 {
+            break;
+        }
+        let owner = src.read_u8(f + fo.if_owner).unwrap();
+        if owner < fo.owner_first_shim {
+            let raw = src.read_ptr(f + fo.if_executable).unwrap();
+            let code = if fo.executable_is_stackref {
+                raw & !3
+            } else {
+                raw
+            };
+            if code != 0 && frames::is_shim_code(src, fo, code) {
+                n += 1;
+            }
+        }
+        f = src.read_ptr(f + fo.if_previous).unwrap();
+    }
+    n
+}
+
 fn check(minor: u8) {
+    check_victim(
+        minor,
+        VICTIM,
+        &[("inner", 9), ("outer", 12), ("<module>", 14)],
+    );
+}
+
+fn check_class(minor: u8) {
+    check_victim(
+        minor,
+        CLASS_VICTIM,
+        &[
+            ("inner", 9),
+            ("Box.__init__", 14),
+            ("outer", 18),
+            ("<module>", 20),
+        ],
+    );
+}
+
+fn check_victim(minor: u8, victim: &str, want: &[(&str, u32)]) {
     let dir = tempfile::tempdir().unwrap();
-    let v = start(&python(minor), dir.path());
+    let v = start(&python(minor), dir.path(), victim);
     let pid = v.0.id();
     let src = LiveProcess::attach(pid).expect("attach (needs ptrace permission)");
     let target = Target::locate(&src, pid).unwrap();
@@ -108,6 +187,15 @@ fn check(minor: u8) {
         .unwrap_or_else(|| panic!("3.{minor}: no thread state for tid {pid}: {threads:?}"));
     let stack = frames::read_stack(&src, &fo, main.addr, 64).unwrap();
     assert!(!stack.broken && !stack.truncated, "3.{minor}: {stack:?}");
+    // The class victim runs under the init shim on 3.13+ (3.12 has none);
+    // a stack without it is then the filter's doing.
+    let shims = raw_shims(&src, &fo, main.addr);
+    let class = victim == CLASS_VICTIM;
+    assert_eq!(
+        shims,
+        usize::from(class && minor >= 13),
+        "3.{minor}: shim frames on the raw chain"
+    );
 
     let format = LineTableFormat::for_python(target.runtime.version).unwrap();
     let got: Vec<(String, String, Option<u32>)> = stack
@@ -126,9 +214,8 @@ fn check(minor: u8) {
             (c.qualname.unwrap_or_default(), file, line)
         })
         .collect();
-    let want = [("inner", 9), ("outer", 12), ("<module>", 14)];
     assert_eq!(got.len(), want.len(), "3.{minor}: {got:?}");
-    for ((q, file, line), (wq, wl)) in got.iter().zip(want) {
+    for ((q, file, line), &(wq, wl)) in got.iter().zip(want) {
         assert_eq!(q, wq, "3.{minor}: {got:?}");
         assert_eq!(file, "victim.py");
         assert_eq!(*line, Some(wl), "3.{minor} {q}: {got:?}");
@@ -151,4 +238,22 @@ fn live_stack_313() {
 #[ignore = "needs ptrace and CPython 3.14"]
 fn live_stack_314() {
     check(14);
+}
+
+#[test]
+#[ignore = "needs ptrace and CPython 3.12"]
+fn live_stack_class_312() {
+    check_class(12);
+}
+
+#[test]
+#[ignore = "needs ptrace and CPython 3.13"]
+fn live_stack_class_313() {
+    check_class(13);
+}
+
+#[test]
+#[ignore = "needs ptrace and CPython 3.14"]
+fn live_stack_class_314() {
+    check_class(14);
 }
