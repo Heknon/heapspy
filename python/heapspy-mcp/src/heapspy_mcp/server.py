@@ -357,8 +357,11 @@ def build_server(config: Config) -> MCPServer:
             "Resolve a module.qualname from heapspy output (a type such as "
             "app.session.Session, a module global such as app.cache.CACHE, a method such as "
             "app.cache.Store.get, or an attribute set as self.x in a method) to file:line "
-            "inside repo_path, with a short source excerpt. Handles src/ layouts, packages, "
-            "and __main__. Read-only and confined to repo_path. Next step: read the file "
+            "inside repo_path, with a short source excerpt. Handles src/ layouts and packages. "
+            "__main__.X is resolved heuristically (heuristic=true): every script in the repo "
+            "that binds X at top level is a candidate, ranked by main_evidence (__main__.py, "
+            "a main guard, a #! line); confirm against the process's command line. "
+            "Read-only and confined to repo_path. Next step: read the file "
             "around that line and find where the holder grows without being cleared."
         ),
     )

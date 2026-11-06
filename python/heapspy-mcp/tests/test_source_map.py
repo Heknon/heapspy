@@ -151,10 +151,98 @@ def test_monorepo_subproject(repo: Path) -> None:
 
 
 def test_main_module(repo: Path) -> None:
-    c = only(resolve("__main__.Job.pending", repo))
+    result = resolve("__main__.Job.pending", repo)
+    c = only(result)
     assert c["location"] == "tool.py:2"
+    assert c["main_evidence"] == [
+        "has an if __name__ == '__main__' guard",
+        "defines Job at top level",
+    ]
+    assert result["heuristic"] is True
+    assert "whichever script was started" in result["main_resolution"]["note"]
     c = only(resolve("__main__.RUNNING", repo))
     assert c["file"] == "app/__main__.py"
+    assert c["main_evidence"][0] == "named __main__.py"
+
+
+def test_main_script_without_guard(repo: Path) -> None:
+    write(
+        repo,
+        "scripts/leaky.py",
+        """
+        import time
+
+        class Holder:
+            items = []
+
+
+        while True:
+            Holder.items.append(bytearray(1024))
+            time.sleep(0.01)
+        """,
+    )
+    result = resolve("__main__.Holder.items", repo)
+    c = only(result)
+    assert c["location"] == "scripts/leaky.py:4"
+    assert c["kind"] == "assignment"
+    assert c["main_evidence"] == ["defines Holder at top level"]
+    assert result["main_resolution"]["files_matched"] == 1
+
+
+def test_main_name_defined_in_two_scripts(repo: Path) -> None:
+    write(repo, "jobs/a_plain.py", "BUFFER = []\n")
+    write(
+        repo,
+        "jobs/b_runner.py",
+        """
+        #!/usr/bin/env python3
+        BUFFER = []
+
+
+        if __name__ == "__main__":
+            BUFFER.append(1)
+        """,
+    )
+    write(repo, "jobs/c_import.py", "from jobs.a_plain import BUFFER\n")
+    write(repo, "jobs/d_mention.py", "def f():\n    BUFFER = 1\n    return BUFFER\n")
+    result = resolve("__main__.BUFFER", repo)
+    files = [c["file"] for c in result["candidates"]]
+    # Main guard and #! first; a plain definition next; an import last; a local is no match.
+    assert files == ["jobs/b_runner.py", "jobs/a_plain.py", "jobs/c_import.py"]
+    assert result["candidates"][0]["main_evidence"] == [
+        "has an if __name__ == '__main__' guard",
+        "starts with a #! line",
+        "defines BUFFER at top level",
+    ]
+    assert result["candidates"][2]["kind"] == "import"
+    assert result["heuristic"] is True
+
+
+def test_main_scan_stays_in_repo(repo: Path, tmp_path: Path) -> None:
+    outside = write(tmp_path, "outside/evil.py", "SECRET_HOLDER = []\n")
+    write(tmp_path, "outside/deep/more.py", "SECRET_HOLDER = []\n")
+    (repo / "linked.py").symlink_to(outside)
+    (repo / "linkdir").symlink_to(outside.parent, target_is_directory=True)
+    write(repo, ".hidden/x.py", "SECRET_HOLDER = []\n")
+    write(repo, ".venv/lib/x.py", "SECRET_HOLDER = []\n")
+    result = resolve("__main__.SECRET_HOLDER", repo)
+    assert result["candidates"] == []
+    assert result["searched_files"] == []
+    assert result["main_resolution"]["files_matched"] == 0
+
+
+def test_main_scan_is_bounded(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import heapspy_mcp.source_map as source_map
+
+    monkeypatch.setattr(source_map, "MAX_MAIN_SCAN", 3)
+    result = resolve("__main__.Job", repo)
+    assert result["main_resolution"]["files_scanned"] == 3
+    assert result["main_resolution"]["scan_limit_reached"] is True
+
+
+def test_non_main_names_are_not_heuristic(repo: Path) -> None:
+    result = resolve("app.cache.CACHE", repo)
+    assert "heuristic" not in result and "main_resolution" not in result
 
 
 def test_excerpt_is_bounded(repo: Path) -> None:
