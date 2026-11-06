@@ -20,7 +20,9 @@ from .config import (
     ENV_TIMEOUT,
     Config,
     ConfigError,
+    add_diagnostics_arguments,
     default_snapshot_dir,
+    diagnostics_from_args,
 )
 
 
@@ -82,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"timeout for heapspy dump (also ${ENV_CAPTURE_TIMEOUT}; "
         f"default {DEFAULT_CAPTURE_TIMEOUT:g})",
     )
+    add_diagnostics_arguments(p)
     # --- CPU profiling (py-spy) ---
     p.add_argument(
         "--py-spy-bin",
@@ -119,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             capture_timeout=args.capture_timeout,
         )
+        config.diagnostics = diagnostics_from_args(args)
         cpu_config.load_cpu_settings(
             config, py_spy_bin=args.py_spy_bin, cpu_max_duration=args.cpu_max_duration
         )

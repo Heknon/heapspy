@@ -69,7 +69,9 @@ def _looks_like_python(name: str | None, exe: str | None) -> bool:
 
 
 def describe_cmdline(cmdline: list[str] | None) -> str:
-    text = " ".join(cmdline or [])
+    from .system.redact import redact_args  # secret-looking values become <redacted>
+
+    text = " ".join(redact_args(cmdline or []))
     return text if len(text) <= MAX_CMDLINE else text[: MAX_CMDLINE - 3] + "..."
 
 
@@ -95,7 +97,7 @@ def matches_allowlist(
 
 
 def list_python_processes(
-    name_filter: str | None, *, limit: int, allow: list[str]
+    name_filter: str | None, *, limit: int, allow: list[str], measure_s: float = 0.0
 ) -> dict[str, Any]:
     me = os.getpid()
     found: list[dict[str, Any]] = []
@@ -138,7 +140,11 @@ def list_python_processes(
             }
         )
     found.sort(key=lambda p: p["rss_bytes"] or 0, reverse=True)
+    from .system.listing import annotate  # threads, threads_by_state, cpu_percent_on_cpu
+
+    measured = annotate(found[:limit], measure_s)
     return {
+        **measured,
         "processes": found[:limit],
         "total_found": len(found),
         "partially_inaccessible": inaccessible,

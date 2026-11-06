@@ -1,0 +1,23 @@
+Name:	gunicorn
+Umask:	0022
+State:	S (sleeping)
+Tgid:	4242
+Ngid:	0
+Pid:	4242
+PPid:	1
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Groups:	1000
+NStgid:	4242	7
+NSpid:	4242	7
+VmPeak:	  312040 kB
+VmRSS:	   61224 kB
+Threads:	9
+SigQ:	0/63374
+Cpus_allowed:	f
+Cpus_allowed_list:	0-3
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	15321
+nonvoluntary_ctxt_switches:	877

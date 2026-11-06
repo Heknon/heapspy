@@ -14,6 +14,14 @@ EXPECTED_TOOLS = {
     "type_detail",
     "diff_snapshots",
     "map_to_source",
+    # process diagnostics (heapspy_mcp.system)
+    "find_processes",
+    "scan_processes",
+    "process_cpu",
+    "hw_counters",
+    "snapshot_process_metrics",
+    "compare_process_snapshots",
+    "diagnose_process_cpu",
     # CPU tools (py-spy)
     "cpu_stacks",
     "cpu_profile",
@@ -39,3 +47,12 @@ async def test_workflow_resource_and_prompt(make_config) -> None:
         assert "Native memory" in text
         prompt = await client.get_prompt("investigate_memory", {"target": "pid 1234"})
         assert "pid 1234" in prompt.messages[0].content.text
+
+
+async def test_process_workflow_resource_prompt_and_instructions(make_config) -> None:
+    async with Client(build_server(make_config())) as client:
+        assert "scan_processes" in (client.instructions or "")
+        resource = await client.read_resource("heapspy://process-workflow")
+        assert "find_processes" in resource.contents[0].text
+        prompt = await client.get_prompt("investigate_process_cpu", {"target": "pid 7"})
+        assert "pid 7" in prompt.messages[0].content.text

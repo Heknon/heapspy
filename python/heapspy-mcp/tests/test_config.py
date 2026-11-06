@@ -7,8 +7,10 @@ import pytest
 from heapspy_mcp.__main__ import main
 from heapspy_mcp.config import (
     DEFAULT_MAX_RSS,
+    DEFAULT_MAX_WINDOW,
     Config,
     ConfigError,
+    DiagnosticsConfig,
     parse_size,
     resolve_binary,
 )
@@ -99,3 +101,31 @@ def test_snapshot_refs(tmp_path: Path, snap_file: Path) -> None:
     for bad in ["", "hs-00000000", str(tmp_path / "missing.hpy"), "/etc/passwd"]:
         with pytest.raises(SnapshotRefError):
             store.resolve(bad)
+
+
+def test_diagnostics_config(tmp_path: Path) -> None:
+    d = DiagnosticsConfig.from_sources(env={})
+    assert d.max_window_s == DEFAULT_MAX_WINDOW
+    assert d.host_context is True
+    assert d.proc_root == Path("/proc") and d.cgroup_root is None
+    env = {
+        "HEAPSPY_MCP_MAX_WINDOW": "4",
+        "HEAPSPY_MCP_NO_HOST_CONTEXT": "1",
+        "HEAPSPY_MCP_CGROUP_ROOT": str(tmp_path),
+    }
+    d = DiagnosticsConfig.from_sources(env=env)
+    assert (d.max_window_s, d.host_context, d.cgroup_root) == (4.0, False, tmp_path)
+    assert DiagnosticsConfig.from_sources(max_window=2.5, env=env).max_window_s == 2.5
+    with pytest.raises(ConfigError, match="--cgroup-root"):
+        DiagnosticsConfig.from_sources(cgroup_root=str(tmp_path / "missing"), env={})
+    with pytest.raises(ConfigError):
+        DiagnosticsConfig.from_sources(env={"HEAPSPY_MCP_MAX_WINDOW": "-1"})
+
+
+def test_main_parses_diagnostics_flags(fake_bin: Path) -> None:
+    from heapspy_mcp.__main__ import build_parser
+    from heapspy_mcp.config import diagnostics_from_args
+
+    args = build_parser().parse_args(["--max-window", "3", "--no-host-context"])
+    d = diagnostics_from_args(args)
+    assert d.max_window_s == 3.0 and d.host_context is False
