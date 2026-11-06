@@ -1,0 +1,6 @@
+/target
+*.hpy
+*.hpy.tmp
+!docs/examples/*.hpy
+core.*
+*.dmp

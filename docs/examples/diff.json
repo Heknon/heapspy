@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "kind": "diff",
+  "identity_approximate": true,
+  "before": {
+    "path": "before.hpy",
+    "format_version": 1,
+    "python_version": "3.12.4",
+    "os": "linux",
+    "arch": "x86_64",
+    "pointer_size": 8,
+    "captured_at": 1762430400,
+    "source": { "kind": "pid", "ref": "1234" },
+    "contents_captured": false,
+    "truncated": false
+  },
+  "after": {
+    "path": "after.hpy",
+    "format_version": 1,
+    "python_version": "3.12.4",
+    "os": "linux",
+    "arch": "x86_64",
+    "pointer_size": 8,
+    "captured_at": 1762434000,
+    "source": { "kind": "pid", "ref": "1234" },
+    "contents_captured": false,
+    "truncated": false
+  },
+  "totals": {
+    "before": { "objects": 1441907, "shallow_bytes": 120586240, "reachable_bytes": 120400000 },
+    "after": { "objects": 2841907, "shallow_bytes": 469762048, "reachable_bytes": 469460992 },
+    "delta_objects": 1400000,
+    "delta_shallow_bytes": 349175808,
+    "delta_reachable_bytes": 349060992
+  },
+  "by_type": [
+    {
+      "type": "builtins.bytes",
+      "before_count": 100021,
+      "after_count": 400021,
+      "delta_count": 300000,
+      "before_bytes": 103022592,
+      "after_bytes": 412090368,
+      "delta_bytes": 309067776
+    },
+    {
+      "type": "builtins.list",
+      "before_count": 5400,
+      "after_count": 5100,
+      "delta_count": -300,
+      "before_bytes": 691200,
+      "after_bytes": 652800,
+      "delta_bytes": -38400
+    }
+  ],
+  "by_site": [
+    {
+      "site": "sys.modules['app.cache'].__dict__['CACHE']",
+      "type": "builtins.dict",
+      "before_retained_bytes": 108003328,
+      "after_retained_bytes": 432643686,
+      "delta_retained_bytes": 324640358,
+      "before_retained_objects": 600113,
+      "after_retained_objects": 2400113,
+      "delta_retained_objects": 1800000
+    }
+  ],
+  "notes": [
+    {
+      "code": "identity_approximate",
+      "message": "Objects are matched by type and retaining site, not by address. Per-object growth is approximate."
+    }
+  ]
+}

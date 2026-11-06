@@ -4,7 +4,7 @@ Read the object graph of a running Python process from the outside, and find out
 
 py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
 
-> **Status: design stage.** No code exists yet. This README describes what heapspy is meant to do and how it will be used. Commands below are the planned interface and will not work until the first milestones land.
+> **Status: early development.** The workspace, the snapshot file format and the command-line interface exist; dumping and analysis do not work yet and report "not implemented". This README describes what heapspy is meant to do and how it will be used. Commands below are the planned interface.
 
 ## What it answers, and what it doesn't
 
@@ -176,6 +176,19 @@ pip install heapspy-mcp   # optional, for agent integration
 | M6 | `heapspy-mcp` |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `crates/heapspy-snapshot` | snapshot file format: types, streaming writer, mmap reader, test builder |
+| `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
+| `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
+| `crates/heapspy` | the `heapspy` command-line tool |
+| `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
+| `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and how CI is run.
 
 ## License
 

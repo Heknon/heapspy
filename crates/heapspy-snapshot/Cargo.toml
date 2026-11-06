@@ -1,0 +1,16 @@
+[package]
+name = "heapspy-snapshot"
+description = "The heapspy snapshot file format: types, streaming writer, mmap reader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "heapspy-reader"
+description = "Read a CPython heap from a memory image and write a heapspy snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+heapspy-snapshot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

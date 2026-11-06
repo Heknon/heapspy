@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "kind": "analyze",
+  "snapshot": {
+    "path": "app.hpy",
+    "format_version": 1,
+    "python_version": "3.12.4",
+    "os": "linux",
+    "arch": "x86_64",
+    "pointer_size": 8,
+    "captured_at": 1762430400,
+    "source": { "kind": "pid", "ref": "1234" },
+    "contents_captured": false,
+    "truncated": false
+  },
+  "totals": {
+    "objects": 2841907,
+    "edges": 9120443,
+    "types": 2213,
+    "roots": 412,
+    "shallow_bytes": 469762048,
+    "reachable_objects": 2839001,
+    "reachable_bytes": 469460992,
+    "unreachable_objects": 2906,
+    "unreachable_bytes": 301056,
+    "dangling_edges": 0
+  },
+  "memory": {
+    "rss_bytes": 2040109465,
+    "graph_bytes": 469762048,
+    "outside_graph_bytes": 1570347417,
+    "outside_graph_pct": 76.97
+  },
+  "top_retainers": [
+    {
+      "rank": 1,
+      "address": "0x7f3a2c41b0d0",
+      "type": "builtins.dict",
+      "shallow_bytes": 38692864,
+      "retained_bytes": 432643686,
+      "retained_objects": 2400113,
+      "retained_pct": 92.16,
+      "path": [
+        {
+          "address": "0x7f3a2d000040",
+          "type": "builtins.module",
+          "shallow_bytes": 72,
+          "edge": null,
+          "root_label": "sys.modules['app.cache']",
+          "root_kind": "module_dict"
+        },
+        {
+          "address": "0x7f3a2d0001a0",
+          "type": "builtins.dict",
+          "shallow_bytes": 4696,
+          "edge": ".__dict__",
+          "root_label": null,
+          "root_kind": null
+        },
+        {
+          "address": "0x7f3a2c41b0d0",
+          "type": "builtins.dict",
+          "shallow_bytes": 38692864,
+          "edge": "['CACHE']",
+          "root_label": null,
+          "root_kind": null
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "address": "0x7f3a2b9e4410",
+      "type": "builtins.list",
+      "shallow_bytes": 12288,
+      "retained_bytes": 4194304,
+      "retained_objects": 1501,
+      "retained_pct": 0.89,
+      "path": [
+        {
+          "address": "0x7f3a2b9e4410",
+          "type": "builtins.list",
+          "shallow_bytes": 12288,
+          "edge": null,
+          "root_label": "frame worker:run local 'pending'",
+          "root_kind": "frame_local"
+        }
+      ]
+    }
+  ],
+  "type_histogram": [
+    {
+      "type": "builtins.bytes",
+      "count": 400021,
+      "shallow_bytes": 412090368,
+      "retained_bytes": 412090368
+    },
+    {
+      "type": "app.session.Session",
+      "count": 400000,
+      "shallow_bytes": 22400000,
+      "retained_bytes": 434490368
+    }
+  ],
+  "notes": [
+    {
+      "code": "untracked_objects",
+      "message": "Untracked objects (bare ints, short strings, raw buffers) are included only when a recorded container references them."
+    },
+    {
+      "code": "outside_graph",
+      "message": "Python graph accounts for 448.0 MiB of 1.9 GiB RSS. The rest is outside the object graph (native allocations, C extensions, untracked objects)."
+    }
+  ]
+}

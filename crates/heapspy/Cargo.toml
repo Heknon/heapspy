@@ -1,0 +1,24 @@
+[package]
+name = "heapspy"
+description = "Find what keeps memory alive in a CPython process, from the outside"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "heapspy"
+path = "src/main.rs"
+
+[dependencies]
+heapspy-snapshot.workspace = true
+heapspy-reader.workspace = true
+heapspy-analyzer.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
