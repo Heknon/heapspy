@@ -19,7 +19,9 @@ from .config import (
     ENV_TIMEOUT,
     Config,
     ConfigError,
+    add_diagnostics_arguments,
     default_snapshot_dir,
+    diagnostics_from_args,
 )
 
 
@@ -81,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"timeout for heapspy dump (also ${ENV_CAPTURE_TIMEOUT}; "
         f"default {DEFAULT_CAPTURE_TIMEOUT:g})",
     )
+    add_diagnostics_arguments(p)
     return p
 
 
@@ -103,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             capture_timeout=args.capture_timeout,
         )
+        config.diagnostics = diagnostics_from_args(args)
     except ConfigError as e:
         print(f"heapspy-mcp: error: {e}", file=sys.stderr)
         return 2

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shutil
@@ -101,6 +102,8 @@ class Config:
     max_rss_bytes: int = DEFAULT_MAX_RSS
     timeout: float = DEFAULT_TIMEOUT
     capture_timeout: float = DEFAULT_CAPTURE_TIMEOUT
+    # process diagnostics (heapspy_mcp.system)
+    diagnostics: DiagnosticsConfig = field(default_factory=lambda: DiagnosticsConfig())
 
     @classmethod
     def from_sources(
@@ -145,3 +148,85 @@ def _float_env(env: dict[str, str], name: str, default: float) -> float:
     if result <= 0:
         raise ConfigError(f"{name} must be positive")
     return result
+
+
+# --- process diagnostics (heapspy_mcp.system) ---------------------------------
+# Settings for the process CPU and scheduler tools, kept in one block so it
+# merges cleanly with other tool families.
+
+ENV_MAX_WINDOW = "HEAPSPY_MCP_MAX_WINDOW"
+ENV_NO_HOST_CONTEXT = "HEAPSPY_MCP_NO_HOST_CONTEXT"
+ENV_PROC_ROOT = "HEAPSPY_MCP_PROC_ROOT"
+ENV_CGROUP_ROOT = "HEAPSPY_MCP_CGROUP_ROOT"
+DEFAULT_WINDOW = 2.0
+DEFAULT_MAX_WINDOW = 10.0
+
+
+@dataclass
+class DiagnosticsConfig:
+    """``max_window_s`` caps every measurement window. ``host_context=False`` leaves
+    host-wide figures (load, steal, host PSI) out of the process tools. ``proc_root``
+    and ``cgroup_root`` point at a host ``/proc`` or cgroup v2 mount when the server
+    sees them somewhere other than the usual place."""
+
+    max_window_s: float = DEFAULT_MAX_WINDOW
+    host_context: bool = True
+    proc_root: Path = Path("/proc")
+    cgroup_root: Path | None = None
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        max_window: float | None = None,
+        no_host_context: bool = False,
+        proc_root: str | None = None,
+        cgroup_root: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> DiagnosticsConfig:
+        env = dict(os.environ) if env is None else env
+        proc = proc_root or env.get(ENV_PROC_ROOT)
+        cgroup = cgroup_root or env.get(ENV_CGROUP_ROOT)
+        for name, value in (("--proc-root", proc), ("--cgroup-root", cgroup)):
+            if value and not Path(value).is_dir():
+                raise ConfigError(f"{name}={value!r} is not a directory")
+        if max_window is not None and max_window <= 0:
+            raise ConfigError("--max-window must be positive")
+        return cls(
+            max_window_s=max_window or _float_env(env, ENV_MAX_WINDOW, DEFAULT_MAX_WINDOW),
+            host_context=not (no_host_context or parse_bool(env.get(ENV_NO_HOST_CONTEXT))),
+            proc_root=Path(proc) if proc else Path("/proc"),
+            cgroup_root=Path(cgroup) if cgroup else None,
+        )
+
+
+def add_diagnostics_arguments(parser: argparse.ArgumentParser) -> None:
+    g = parser.add_argument_group("process diagnostics")
+    g.add_argument(
+        "--max-window",
+        type=float,
+        metavar="SECONDS",
+        help=f"cap on measurement windows (also ${ENV_MAX_WINDOW}; default {DEFAULT_MAX_WINDOW:g})",
+    )
+    g.add_argument(
+        "--no-host-context",
+        action="store_true",
+        help=f"leave host-wide load, steal and PSI out of the process tools "
+        f"(also ${ENV_NO_HOST_CONTEXT}=1)",
+    )
+    g.add_argument("--proc-root", metavar="DIR", help=f"procfs to read (also ${ENV_PROC_ROOT})")
+    g.add_argument(
+        "--cgroup-root",
+        metavar="DIR",
+        help=f"cgroup v2 mount to read instead of the one in /proc/self/mountinfo "
+        f"(also ${ENV_CGROUP_ROOT})",
+    )
+
+
+def diagnostics_from_args(args: argparse.Namespace) -> DiagnosticsConfig:
+    return DiagnosticsConfig.from_sources(
+        max_window=args.max_window,
+        no_host_context=args.no_host_context,
+        proc_root=args.proc_root,
+        cgroup_root=args.cgroup_root,
+    )

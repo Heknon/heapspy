@@ -18,6 +18,7 @@ from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
 from .config import Config
 from .snapshots import SnapshotRefError, SnapshotStore
+from .system import register as register_process_diagnostics
 
 log = logging.getLogger("heapspy_mcp")
 
@@ -384,4 +385,5 @@ def build_server(config: Config) -> MCPServer:
         )
         return lead + WORKFLOW
 
+    register_process_diagnostics(server, config)
     return server
