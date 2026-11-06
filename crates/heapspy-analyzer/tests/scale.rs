@@ -205,3 +205,59 @@ fn ten_million_objects() {
     // Random references into the cache make a few entries shared.
     assert!(top.retained_bytes as f64 >= 0.8 * (40 * entries + entries * 1056) as f64);
 }
+
+/// Folded stacks on the same generated heap, 5 million objects by default
+/// (`HEAPSPY_FLAME_OBJECTS`). Run with
+///
+/// ```sh
+/// cargo test --release -p heapspy-analyzer --test scale flame -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn flame_five_million_objects() {
+    use heapspy_analyzer::{folded_stacks, FlameOptions};
+
+    let n: u64 = std::env::var("HEAPSPY_FLAME_OBJECTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scale.hpy");
+    let edges = write(n, &path, dir.path());
+    let file_mib = std::fs::metadata(&path).unwrap().len() >> 20;
+    eprintln!("wrote {n} objects, {edges} edges, {file_mib} MiB");
+
+    reset_peak();
+    let base = rss_kib();
+    let t = Instant::now();
+    let snap = Snapshot::open(&path).unwrap();
+    let f = folded_stacks(&snap, &FlameOptions::default()).unwrap();
+    let elapsed = t.elapsed();
+    let peak = rss_kib();
+    let mut out = Vec::new();
+    f.write_to(&mut out).unwrap();
+    eprintln!(
+        "open+fold {:.2}s, {} lines, {} bytes of folded text, cutoff {} bytes",
+        elapsed.as_secs_f64(),
+        f.lines.len(),
+        out.len(),
+        f.min_bytes
+    );
+    if let (Some((_, base_rss)), Some((hwm, _))) = (base, peak) {
+        eprintln!(
+            "RSS before {} MiB, peak during fold {} MiB (includes mapped snapshot pages, {} MiB file)",
+            base_rss >> 10,
+            hwm >> 10,
+            file_mib
+        );
+    }
+    for l in f.lines.iter().take(5) {
+        eprintln!("  {} {}", l.stack, l.bytes);
+    }
+    assert_eq!(
+        f.lines.iter().map(|l| l.bytes).sum::<u64>(),
+        f.reachable_bytes
+    );
+    assert!(f.lines.iter().all(|l| l.stack.split(';').count() <= 33));
+    assert!(out.len() < 1 << 20, "folded output should stay small");
+}

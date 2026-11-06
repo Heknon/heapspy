@@ -17,6 +17,7 @@ heapspy-reader.workspace = true
 heapspy-analyzer.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+inferno.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
