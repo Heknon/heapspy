@@ -1,0 +1,64 @@
+# CI runs on request only. See CONTRIBUTING.md.
+#
+#   - Label a PR `ci` to run fmt, clippy and tests on Linux.
+#   - Label a PR `ci:windows` to run the tests on Windows.
+#   - Tag pushes (v*) and manual dispatch run both jobs.
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test (ubuntu)
+    # On a `labeled` event, only react to the label this job cares about,
+    # so adding unrelated labels does not start a run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (contains(github.event.pull_request.labels.*.name, 'ci') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  windows:
+    name: test (windows)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (contains(github.event.pull_request.labels.*.name, 'ci:windows') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci:windows'))
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
