@@ -207,3 +207,31 @@ fn list_items_are_generalised_and_indirect_hops_marked() {
         "{sites:?}"
     );
 }
+
+#[test]
+fn object_shared_by_two_roots_gets_a_site_instead_of_panicking() {
+    // A list referenced from two modules is dominated only by the super-root,
+    // but BFS reaches it through an ordinary edge, not a root entry. Real
+    // heaps have many of these (objects imported into several modules).
+    let build = |n: u32| {
+        let mut h = Heap::new();
+        let (_, a) = h.module("app.a");
+        let (_, b) = h.module("app.b");
+        let shared = h.obj("builtins.list", 64);
+        h.key(a, shared, "SHARED");
+        h.key(b, shared, "SHARED");
+        for i in 0..n {
+            let x = h.obj("builtins.bytes", 1000);
+            h.item(shared, x, i);
+        }
+        h
+    };
+    let r = run(&build(2), &build(10));
+    let s = r
+        .by_site
+        .iter()
+        .find(|s| s.site == "...['SHARED']")
+        .unwrap_or_else(|| panic!("{:?}", r.by_site));
+    assert_eq!(s.type_name, "builtins.list");
+    assert_eq!(s.delta_retained_bytes, 8 * 1000);
+}
