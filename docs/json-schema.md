@@ -62,6 +62,12 @@ Also used for `before` and `after` in a diff.
 A retaining path is an array of hops, **root first**: `path[0]` is the root
 object and the last hop is the object the path is about.
 
+Paths are shortest paths. When an object is equally close to several roots,
+the path starts at the best-ranked root: `module_dict` first, then
+`frame_local`, `thread_locals`, `interp`, `other`, ties broken by root label.
+So a module global is reported under `sys.modules[...]` even when a running
+frame also reaches it through a function's `__globals__`.
+
 | field | type | meaning |
 |---|---|---|
 | `address` | string | object address |
