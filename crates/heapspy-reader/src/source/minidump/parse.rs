@@ -195,6 +195,14 @@ pub(super) fn directory(file: Bytes, h: &Header) -> Result<Vec<DirEntry>> {
         };
         // Every stream must lie inside the file, even ones heapspy ignores:
         // a directory that points past the end means the file is truncated.
+        if e.loc.rva.saturating_add(e.loc.size) > file.len() {
+            return Err(Error::Truncated(format!(
+                "minidump: stream {i} at {:#x}+{:#x} is past the end of the file ({:#x} bytes)",
+                e.loc.rva,
+                e.loc.size,
+                file.len()
+            )));
+        }
         e.loc.data(file, "stream")?;
         out.push(e);
     }
@@ -221,6 +229,14 @@ fn checked_range(
     start
         .checked_add(size)
         .ok_or_else(|| bad(format_args!("{what}: range {start:#x}+{size:#x} overflows")))?;
+    // `file` is the whole file: memory past its end was cut off.
+    if file_off.saturating_add(size) > file.len() {
+        return Err(Error::Truncated(format!(
+            "minidump: {what} at {file_off:#x}+{size:#x} is past the end of the file \
+             ({:#x} bytes)",
+            file.len()
+        )));
+    }
     file.sub(file_off, size, what)?;
     Ok(RawRange {
         start,

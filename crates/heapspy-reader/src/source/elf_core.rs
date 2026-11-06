@@ -269,6 +269,17 @@ impl ElfCore {
         if phentsize < 56 {
             return Err(fmt_err(format!("program header size {phentsize}")));
         }
+        let ph_end = phnum
+            .checked_mul(phentsize)
+            .and_then(|n| n.checked_add(phoff))
+            .ok_or_else(|| fmt_err("program header table overflows"))?;
+        if ph_end > b.len() {
+            return Err(Error::Truncated(format!(
+                "{}: program headers end at {ph_end:#x}, past the end of the file ({:#x} bytes)",
+                path.display(),
+                b.len()
+            )));
+        }
 
         let mut segments = Vec::new();
         let mut files = Vec::new();
@@ -310,9 +321,14 @@ impl ElfCore {
                     let end = start
                         .checked_add(usize::try_from(p_filesz).map_err(|_| fmt_err("note"))?)
                         .ok_or_else(|| fmt_err("note size overflow"))?;
-                    let seg = b
-                        .get(start..end)
-                        .ok_or_else(|| fmt_err("PT_NOTE outside the file"))?;
+                    let seg = b.get(start..end).ok_or_else(|| {
+                        Error::Truncated(format!(
+                            "{}: PT_NOTE at {start:#x}..{end:#x} is past the end of the file \
+                             ({:#x} bytes)",
+                            path.display(),
+                            b.len()
+                        ))
+                    })?;
                     for n in parse_notes(seg) {
                         if n.name != b"CORE\0" && n.name != b"CORE" {
                             continue;
@@ -825,6 +841,23 @@ mod tests {
         // Cut before the second segment starts: all of it is gone.
         let core = open_bytes(&full[..full.len() - 0x100]).unwrap();
         assert_eq!(core.missing_bytes(), 0x100);
+    }
+
+    #[test]
+    fn a_core_cut_in_its_headers_or_notes_is_truncated() {
+        let mut b = CoreBuilder::new();
+        b.notes.push((NT_PRSTATUS, prstatus(1, 0, 0)));
+        b.loads.push((0x1000, 0x100, vec![1; 0x100]));
+        let full = b.build();
+        // ELF header, then 2 program headers of 56 bytes, then the notes.
+        for cut in [70, 64 + 56, 64 + 2 * 56 + 4] {
+            let r = open_bytes(&full[..cut]);
+            assert!(matches!(r, Err(Error::Truncated(_))), "cut at {cut}: {r:?}");
+        }
+        // Not a cut: an ELF header that is not a core.
+        let mut not_core = full.clone();
+        not_core[0x10] = 2;
+        assert!(matches!(open_bytes(&not_core), Err(Error::Format(_))));
     }
 
     #[test]

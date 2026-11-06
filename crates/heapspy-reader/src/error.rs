@@ -26,6 +26,11 @@ pub enum Error {
     #[error("malformed image: {0}")]
     Format(String),
 
+    /// An image file ends before data its own headers describe (a core or
+    /// minidump cut short, e.g. by a size limit or a full disk).
+    #[error("image cut short: {0}")]
+    Truncated(String),
+
     /// No CPython runtime was found in the target.
     #[error("not a CPython process: {0}")]
     NotPython(String),

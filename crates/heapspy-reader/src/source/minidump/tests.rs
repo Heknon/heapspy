@@ -445,6 +445,19 @@ fn every_truncation_errors() {
 }
 
 #[test]
+fn a_cut_minidump_is_truncated() {
+    // Directory first, stream data after it: cutting the tail leaves a
+    // directory entry that points past the end of the file.
+    let full = DumpBuilder {
+        data_first: false,
+        ..sample()
+    }
+    .build();
+    let r = Minidump::from_bytes(full[..full.len() - 1].to_vec(), MinidumpOptions::default());
+    assert!(matches!(r, Err(Error::Truncated(_))), "{:?}", r.err());
+}
+
+#[test]
 fn shrunk_streams_error_or_parse_but_never_panic() {
     let (full, layout) = sample().build_with_layout();
     for s in &layout {
