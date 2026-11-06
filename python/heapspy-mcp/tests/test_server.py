@@ -19,6 +19,7 @@ EXPECTED_TOOLS = {
     "hw_counters",
     "snapshot_process_metrics",
     "compare_process_snapshots",
+    "diagnose_process_cpu",
 }
 
 

@@ -8,7 +8,9 @@ the tools to an :class:`MCPServer`.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 import anyio
@@ -18,8 +20,10 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..config import DEFAULT_WINDOW, Config
-from ..processes import matches_allowlist
+from ..processes import matches_allowlist, version_from_exe, version_from_maps_text
+from . import diagnose as dg
 from . import perf, views, windows
+from . import procfs as pf
 from .sampling import ProcessGone, identify
 
 T = TypeVar("T")
@@ -119,6 +123,22 @@ def check_pid(config: Config, pid: int) -> dict[str, Any]:
             name=ident["name"],
         )
     return {"allowlist_entry": entry, **ident}
+
+
+def python_info(proc_root: Path, pid: int, exe: str | None, name: str | None) -> dict[str, Any]:
+    version = version_from_exe(exe) or version_from_exe(name)
+    free = bool(exe and re.search(r"python3\.\d+t$", Path(exe).name))
+    maps = None
+    if not version:
+        maps = pf.read_text(proc_root / str(pid) / "maps") or ""
+        version = version_from_maps_text(maps)
+        free = free or bool(re.search(r"libpython3\.\d+t\.so", maps))
+    by_name = bool(re.match(r"^python", Path(exe).name if exe else (name or "")))
+    return {
+        "is_python": bool(version) or by_name,
+        "python_version": version,
+        "free_threaded": free,
+    }
 
 
 def _window(config: Config, window_s: float) -> float:
@@ -258,6 +278,51 @@ def register(server: MCPServer, config: Config) -> None:
     ) -> dict[str, Any]:
         async def body() -> dict[str, Any]:
             return windows.compare(store.get(before), store.get(after))
+
+        return await _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Measure one process and its environment over a window (process_cpu plus hardware "
+            "counters) and score competing explanations for its CPU use, CPU wait or slowness: "
+            "run-queue contention, cache or memory-bound contention, CFS throttling, lock "
+            "contention, spin-waiting or compute, GIL convoy, steal, memory pressure, I/O "
+            "pressure. Each has evidence for, evidence against (raw value, threshold, weight) "
+            "and unknown signals, and next measurements to tell them apart. The ranking says "
+            "how well each fits these numbers; it does not establish a cause, and several can "
+            "apply at once."
+        ),
+    )
+    async def diagnose_process_cpu(
+        pid: PidArg, window_s: WindowArg = DEFAULT_WINDOW
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            ident = check_pid(config, pid)
+            m = await measure(pid, window_s, hw=True)
+            view = views.full_view(m)
+            hw = hw_block(m)
+            py = python_info(d.proc_root, pid, ident.get("exe"), ident.get("name"))
+            signals, reasons = dg.extract_signals(view, hw, py)
+            return {
+                "pid": pid,
+                "comm": view["comm"],
+                "measurement": view["measurement"],
+                "python": py,
+                "hypotheses": dg.evaluate(signals, reasons),
+                "signals": signals,
+                "signal_unavailable_reasons": reasons,
+                "thresholds": dg.threshold_table(),
+                "caveats": [
+                    "Scores compare these numbers with fixed thresholds from one window; they "
+                    "rank how well each explanation fits, they do not prove one.",
+                    "Several explanations can hold at once, and an unmeasured signal "
+                    "(listed under unknown) can change the ranking.",
+                ],
+                "process": {k: view[k] for k in ("cpu", "context_switches", "scheduler")},
+                "environment": view["environment"],
+                "hw": hw,
+            }
 
         return await _guard(body)
 
