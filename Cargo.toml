@@ -4,6 +4,7 @@ members = [
     "crates/heapspy-snapshot",
     "crates/heapspy-reader",
     "crates/heapspy-analyzer",
+    "crates/heapspy",
 ]
 
 [workspace.package]
