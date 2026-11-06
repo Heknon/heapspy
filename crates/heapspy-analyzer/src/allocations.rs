@@ -67,7 +67,7 @@ use heapspy_alloc::{EventKind, Profile, SampleFlags};
 use heapspy_snapshot::{Snapshot, SourceKind};
 
 use crate::analysis::Analysis;
-use crate::flame::FxMap;
+use crate::flame::{sanitise, FoldedLine, FxMap, MinWidth, TextTree};
 use crate::report::{
     AllocatedAt, AllocatedAtStack, AllocationStack, Allocations, AnalyzeReport, Coverage, Note,
     OverheadInfo, SamplingInfo, StackFrame, TypeQueryReport,
@@ -79,6 +79,10 @@ pub const NO_LINK: u32 = u32::MAX;
 
 /// Most stacks listed in one `allocated_at`.
 pub const ALLOCATED_AT_STACKS: usize = 5;
+
+/// Frame text for a sample without Python frames in an allocation flame
+/// graph.
+pub const NO_STACK_FRAME: &str = "[no Python stack]";
 
 const NS_PER_S: u64 = 1_000_000_000;
 
@@ -388,6 +392,24 @@ impl Stacks {
             .collect()
     }
 
+    /// Flame graph frames of group `g`, outermost first.
+    fn flame_frames(&self, g: u32) -> Vec<String> {
+        let grp = &self.groups[g as usize];
+        if grp.frames.is_empty() {
+            return vec![NO_STACK_FRAME.to_string()];
+        }
+        grp.frames
+            .iter()
+            .rev()
+            .map(|&f| {
+                let t = &self.frames[f as usize];
+                let mut s = format!("{} ({})", t.function, t.location);
+                sanitise(&mut s);
+                s
+            })
+            .collect()
+    }
+
     /// Groups by estimated bytes, then linked bytes, then first appearance.
     fn ranked(&self) -> Vec<u32> {
         let mut v: Vec<u32> = (0..self.groups.len() as u32).collect();
@@ -667,6 +689,132 @@ pub fn object_links(snap: &Snapshot, profile: &Profile) -> Result<Vec<u32>> {
     } else {
         j.link
     })
+}
+
+// ---------------------------------------------------------------- flame graph
+
+/// What an allocation flame graph's widths are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlameWeight {
+    /// Estimated bytes allocated (sample weights).
+    Estimated,
+    /// Shallow bytes of reachable snapshot objects linked to the samples:
+    /// where the memory still alive was allocated.
+    Linked,
+}
+
+/// Folded stacks of an allocation profile, sorted by stack. Frames are
+/// Python functions, `qualname (file:line)`, outermost first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AllocationFolded {
+    pub lines: Vec<FoldedLine>,
+    pub weight: FlameWeight,
+    /// Sum of all widths: estimated bytes, or linked bytes.
+    pub total_bytes: u64,
+    pub samples: u64,
+    /// Some frames were matched to events by time.
+    pub approximate: bool,
+    /// The cutoff that was applied, in bytes.
+    pub min_bytes: u64,
+    /// Compatibility notes ([`FlameWeight::Linked`] only).
+    pub notes: Vec<Note>,
+}
+
+impl AllocationFolded {
+    /// Write `stack bytes` lines.
+    pub fn write_to(&self, mut w: impl std::io::Write) -> std::io::Result<()> {
+        for l in &self.lines {
+            writeln!(w, "{} {}", l.stack, l.bytes)?;
+        }
+        Ok(())
+    }
+}
+
+fn min_bytes(min_width: MinWidth, total: u64) -> Result<u64> {
+    Ok(match min_width {
+        MinWidth::Bytes(b) => b,
+        MinWidth::Pct(p) if (0.0..=100.0).contains(&p) => (total as f64 * p / 100.0).ceil() as u64,
+        MinWidth::Pct(p) => {
+            return Err(Error::InvalidArgument(format!(
+                "min percentage must be between 0 and 100, got {p}"
+            )))
+        }
+    })
+}
+
+fn fold(
+    stacks: &Stacks,
+    width: impl Fn(&Group) -> u64,
+    min_width: MinWidth,
+    samples: u64,
+    weight: FlameWeight,
+    notes: Vec<Note>,
+) -> Result<AllocationFolded> {
+    let total: u64 = stacks.groups.iter().map(&width).sum();
+    let min = min_bytes(min_width, total)?;
+    let mut tt = TextTree::default();
+    for (g, grp) in stacks.groups.iter().enumerate() {
+        let w = width(grp);
+        if w > 0 {
+            let frames = stacks.flame_frames(g as u32);
+            tt.add_path(frames.iter().map(String::as_str), w);
+        }
+    }
+    let tt = if min > 0 { tt.pruned(min) } else { tt };
+    let lines = tt
+        .lines()
+        .into_iter()
+        .map(|(stack, b)| FoldedLine { stack, bytes: b[0] })
+        .collect();
+    Ok(AllocationFolded {
+        lines,
+        weight,
+        total_bytes: total,
+        samples,
+        approximate: stacks.approximate,
+        min_bytes: min,
+        notes,
+    })
+}
+
+/// Folded stacks of a profile, weighted by estimated bytes allocated.
+/// Frames narrower than `min_width` (a percentage is of the total
+/// estimated bytes) are folded into an `[other]` sibling.
+pub fn folded_allocations(profile: &Profile, min_width: MinWidth) -> Result<AllocationFolded> {
+    let stacks = Stacks::new(profile)?;
+    fold(
+        &stacks,
+        |g| g.estimated,
+        min_width,
+        profile.sample_count(),
+        FlameWeight::Estimated,
+        Vec::new(),
+    )
+}
+
+/// Folded stacks of a profile, weighted by the shallow bytes of the
+/// reachable objects of `snap` linked to each stack's samples.
+pub fn folded_allocations_linked(
+    snap: &Snapshot,
+    profile: &Profile,
+    min_width: MinWidth,
+) -> Result<AllocationFolded> {
+    let a = Analysis::new(snap)?;
+    let j = Join::new(&a, profile)?;
+    let notes: Vec<Note> = j
+        .notes
+        .iter()
+        .filter(|n| n.code != "allocations_sampled")
+        .cloned()
+        .collect();
+    fold(
+        &j.stacks,
+        |g| g.linked_bytes,
+        min_width,
+        profile.sample_count(),
+        FlameWeight::Linked,
+        notes,
+    )
 }
 
 #[cfg(test)]

@@ -165,14 +165,28 @@ pub struct FlamegraphArgs {
     /// Snapshot file.
     #[arg(
         value_name = "SNAP",
-        required_unless_present = "diff",
-        conflicts_with = "diff"
+        required_unless_present_any = ["diff", "allocations"],
+        conflicts_with_all = ["diff", "allocations"]
     )]
     pub snapshot: Option<PathBuf>,
     /// Differential flame graph: frames that grew from BEFORE to AFTER are
     /// red, frames that shrank are blue.
     #[arg(long, num_args = 2, value_names = ["BEFORE", "AFTER"])]
     pub diff: Option<Vec<PathBuf>>,
+    /// Allocation flame graph of a profile from `heapspy record`: frames are
+    /// Python functions, width is estimated bytes allocated.
+    #[arg(long, value_name = "FILE.hpya", conflicts_with = "diff")]
+    pub allocations: Option<PathBuf>,
+    /// With --allocations: weigh each stack by the bytes of the objects in
+    /// SNAP linked to its samples (where the memory still alive was
+    /// allocated).
+    #[arg(
+        long,
+        value_name = "SNAP",
+        requires = "allocations",
+        conflicts_with_all = ["snapshot", "diff"]
+    )]
+    pub retained: Option<PathBuf>,
     /// Output path. Without it the output goes to stdout.
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: Option<PathBuf>,
@@ -183,11 +197,12 @@ pub struct FlamegraphArgs {
     /// Fold frames narrower than N bytes into `[other]`.
     #[arg(long, value_name = "N", conflicts_with = "min_pct")]
     pub min_bytes: Option<u64>,
-    /// Fold frames narrower than P percent of the reachable bytes into
-    /// `[other]` [default: 0.01].
+    /// Fold frames narrower than P percent of the reachable bytes (with
+    /// --allocations: of the total width) into `[other]` [default: 0.01].
     #[arg(long, value_name = "P", value_parser = parse_pct)]
     pub min_pct: Option<f64>,
-    /// Fold objects more than N levels below a root into `[other]`.
+    /// Fold objects more than N levels below a root into `[other]`. Not
+    /// used with --allocations: allocation stacks are never cut.
     #[arg(long, value_name = "N", default_value_t = heapspy_analyzer::flame::DEFAULT_MAX_DEPTH,
           value_parser = clap::value_parser!(u32).range(1..))]
     pub max_depth: u32,

@@ -310,7 +310,7 @@ fn compact_type(name: &str) -> &str {
 
 /// Make a frame safe for the folded format: `;` separates frames and a line
 /// break ends the line, so neither may appear inside one.
-fn sanitise(s: &mut String) {
+pub(crate) fn sanitise(s: &mut String) {
     if s.contains([';', '\n', '\r']) {
         *s = s
             .chars()
@@ -356,7 +356,7 @@ struct Node {
 /// Frames keyed by `(parent, text)`, with self bytes for up to two
 /// snapshots (slot 0 is "before", or the only snapshot).
 #[derive(Default)]
-struct TextTree {
+pub(crate) struct TextTree {
     texts: Vec<Box<str>>,
     text_ids: HashMap<Box<str>, u32>,
     nodes: Vec<Node>,
@@ -383,6 +383,18 @@ impl TextTree {
             });
             nodes.len() as u32 - 1
         })
+    }
+
+    /// Add `bytes` of self bytes in slot 0 to the frame at `path` (root
+    /// first), creating the frames on the way.
+    pub(crate) fn add_path<'t>(&mut self, path: impl IntoIterator<Item = &'t str>, bytes: u64) {
+        let mut node = NONE;
+        for text in path {
+            node = self.child(node, text);
+        }
+        if node != NONE {
+            self.nodes[node as usize].self_bytes[0] += bytes;
+        }
     }
 
     /// Add one snapshot's label tree in `slot`. Frames narrower than
@@ -432,7 +444,7 @@ impl TextTree {
 
     /// A copy with every node narrower than `min_bytes` in both slots folded
     /// into an `[other]` sibling.
-    fn pruned(&self, min_bytes: u64) -> TextTree {
+    pub(crate) fn pruned(&self, min_bytes: u64) -> TextTree {
         let totals = self.totals();
         let mut out = TextTree::default();
         let mut map = vec![NONE; self.nodes.len()];
@@ -463,7 +475,7 @@ impl TextTree {
 
     /// `(stack, self bytes)` for every node with self bytes in either slot,
     /// sorted by stack.
-    fn lines(&self) -> Vec<(String, [u64; 2])> {
+    pub(crate) fn lines(&self) -> Vec<(String, [u64; 2])> {
         let mut out = Vec::new();
         let mut path: Vec<u32> = Vec::new();
         for n in &self.nodes {

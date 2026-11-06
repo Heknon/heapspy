@@ -275,6 +275,109 @@ fn matching_allocations_are_accepted() {
 }
 
 #[test]
+fn allocation_flame_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("a.hpy");
+    let prof = dir.path().join("a.hpya");
+    write_snapshot(&snap);
+    write_profile(&prof, 4242, 0);
+    let (s, p) = (snap.to_str().unwrap(), prof.to_str().unwrap());
+
+    let out = heapspy(&["flamegraph", "--allocations", p, "--folded"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fill (app.py:4) 4096\n"
+    );
+
+    let svg_path = dir.path().join("alloc.svg");
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "-o",
+        svg_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let svg = std::fs::read_to_string(&svg_path).unwrap();
+    assert!(svg.starts_with("<?xml"));
+    assert!(svg.contains("heapspy allocation flame graph"));
+    assert!(
+        svg.contains("60.0 s, 1 samples (ebpf), 4.0 KiB estimated, approximate: no"),
+        "{}",
+        &svg[..2000.min(svg.len())]
+    );
+    assert!(svg.contains("fill (app.py:4)"));
+    // Deterministic.
+    let again = dir.path().join("again.svg");
+    heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "-o",
+        again.to_str().unwrap(),
+    ]);
+    assert_eq!(svg, std::fs::read_to_string(&again).unwrap());
+
+    // Weighted by what is still alive in the snapshot.
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "--retained",
+        s,
+        "--folded",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fill (app.py:4) 4096\n"
+    );
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "--retained",
+        s,
+        "-o",
+        svg_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let svg = std::fs::read_to_string(&svg_path).unwrap();
+    assert!(svg.contains(&format!("4.0 KiB live in {s}")));
+
+    // A profile from another process links nothing.
+    let other = dir.path().join("other.hpya");
+    write_profile(&other, 77, 0);
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        other.to_str().unwrap(),
+        "--retained",
+        s,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let e = stderr(&out);
+    assert!(
+        e.contains("warning: The allocation profile was recorded from pid 77"),
+        "{e}"
+    );
+    assert!(e.contains("no sampled allocation is linked"), "{e}");
+
+    // Usage errors.
+    for args in [
+        &["flamegraph", s, "--allocations", p][..],
+        &["flamegraph", "--allocations", p, "--diff", s, s],
+        &["flamegraph", s, "--retained", s],
+    ] {
+        assert_eq!(heapspy(args).status.code(), Some(2), "{args:?}");
+    }
+    let out = heapspy(&["flamegraph", "--allocations", s]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("cannot open allocation profile"));
+}
+
+#[test]
 fn mismatched_allocations_warn() {
     let dir = tempfile::tempdir().unwrap();
     let snap = dir.path().join("a.hpy");

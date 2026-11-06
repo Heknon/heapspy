@@ -3,10 +3,11 @@
 
 use heapspy_alloc::{CodeId, EventKind, Profile, ProfileBuilder, SampleFlags};
 use heapspy_analyzer::allocations::{
-    analyze_with_allocations, object_links, query_type_with_allocations, NO_LINK,
+    analyze_with_allocations, folded_allocations, folded_allocations_linked, object_links,
+    query_type_with_allocations, FlameWeight, NO_LINK, NO_STACK_FRAME,
 };
 use heapspy_analyzer::report::{AnalyzeReport, Note, TypeQueryReport};
-use heapspy_analyzer::{AnalyzeOptions, QueryOptions};
+use heapspy_analyzer::{AnalyzeOptions, MinWidth, QueryOptions};
 use heapspy_snapshot::{RootKind, Snapshot, SnapshotBuilder, TypeId};
 
 const KIB: u64 = 1024;
@@ -471,4 +472,71 @@ fn reports_round_trip_through_json() {
     let q = query(&s, &p);
     let back: TypeQueryReport = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
     assert_eq!(back, q);
+}
+
+// ---------------------------------------------------------------- flame graph
+
+#[test]
+fn allocation_folded_stacks() {
+    let mut p = profile();
+    p.by_fill(EventKind::LargeObject, 0x10_0000, 3000);
+    p.by_fill(EventKind::LargeObject, 0x20_0000, 2000);
+    p.by_load(EventKind::Arena, ARENA, MIB);
+    p.b.sample(EventKind::LargeObject, 0x30_0000, 700);
+    let p = p.build();
+    let f = folded_allocations(&p, MinWidth::Bytes(0)).unwrap();
+    assert_eq!(f.weight, FlameWeight::Estimated);
+    assert_eq!(f.total_bytes, 5000 + MIB + 700);
+    assert_eq!(f.lines.iter().map(|l| l.bytes).sum::<u64>(), f.total_bytes);
+    let lines: Vec<(&str, u64)> = f
+        .lines
+        .iter()
+        .map(|l| (l.stack.as_str(), l.bytes))
+        .collect();
+    // Outermost frame first; sorted by stack.
+    assert_eq!(
+        lines,
+        [
+            (NO_STACK_FRAME, 700),
+            ("main (main.py:2);fill (app.py:4)", 5000),
+            ("main (main.py:2);load (app.py:11)", MIB),
+        ]
+    );
+    // Deterministic.
+    assert_eq!(folded_allocations(&p, MinWidth::Bytes(0)).unwrap(), f);
+
+    // Cutoffs fold narrow frames into [other] and keep the total.
+    let c = folded_allocations(&p, MinWidth::Bytes(1000)).unwrap();
+    assert_eq!(c.lines.iter().map(|l| l.bytes).sum::<u64>(), c.total_bytes);
+    assert!(c
+        .lines
+        .iter()
+        .any(|l| l.stack == "[other]" && l.bytes == 700));
+    let c = folded_allocations(&p, MinWidth::Pct(1.0)).unwrap();
+    assert_eq!(
+        c.min_bytes,
+        ((5000 + MIB + 700) as f64 / 100.0).ceil() as u64
+    );
+    assert!(folded_allocations(&p, MinWidth::Pct(200.0)).is_err());
+}
+
+#[test]
+fn allocation_folded_stacks_weighted_by_linked_bytes() {
+    let (s, p) = two_stack_cache();
+    let f = folded_allocations_linked(&s, &p, MinWidth::Bytes(0)).unwrap();
+    assert_eq!(f.weight, FlameWeight::Linked);
+    assert_eq!(f.total_bytes, 30_000);
+    let lines: Vec<(&str, u64)> = f
+        .lines
+        .iter()
+        .map(|l| (l.stack.as_str(), l.bytes))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("main (main.py:2);fill (app.py:4)", 20_000),
+            ("main (main.py:2);load (app.py:11)", 10_000),
+        ]
+    );
+    assert!(f.notes.is_empty());
 }

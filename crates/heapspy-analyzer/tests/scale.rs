@@ -375,7 +375,18 @@ fn join_ten_million_objects_one_million_samples() {
     let sweep_s = t.elapsed().as_secs_f64();
     let sweep_peak = rss_kib().map(|r| r.0 >> 10);
     drop((links, ranges));
-    eprintln!("address sweep {sweep_s:.2}s (peak RSS {sweep_peak:?} MiB, mapped files included)");
+    let t = Instant::now();
+    let folded = heapspy_analyzer::allocations::folded_allocations(
+        &prof,
+        heapspy_analyzer::MinWidth::Bytes(0),
+    )
+    .unwrap();
+    eprintln!(
+        "address sweep {sweep_s:.2}s (peak RSS {sweep_peak:?} MiB, mapped files included); \
+         stack grouping {:.2}s ({} folded lines)",
+        t.elapsed().as_secs_f64(),
+        folded.lines.len()
+    );
 
     reset_peak();
     let t = Instant::now();

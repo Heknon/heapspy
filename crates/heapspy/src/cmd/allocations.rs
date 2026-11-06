@@ -1,4 +1,4 @@
-//! `--allocations FILE.hpya` on analyze, query and diff.
+//! `--allocations FILE.hpya` on analyze, query, diff and flamegraph.
 //!
 //! The profile is opened (which validates it) and checked against the
 //! snapshot with `heapspy_analyzer::allocations::compatibility`; each
