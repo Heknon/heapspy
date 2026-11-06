@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/heapspy-snapshot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/Heknon/heapspy"
+
+[workspace.dependencies]
+heapspy-snapshot = { path = "crates/heapspy-snapshot", version = "0.1.0" }
+heapspy-reader = { path = "crates/heapspy-reader", version = "0.1.0" }
+heapspy-analyzer = { path = "crates/heapspy-analyzer", version = "0.1.0" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
