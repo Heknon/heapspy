@@ -13,6 +13,7 @@ mod analysis;
 mod dominators;
 mod graph;
 mod notes;
+mod query;
 pub mod render;
 pub mod report;
 
@@ -256,24 +257,27 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
     })
 }
 
-/// Instances of one type with sizes and sample holders. **Stub.**
+/// Instances of one type with sizes and sample holders. Fails with
+/// [`Error::NotFound`] if no type matches.
 pub fn query_type(
-    _snap: &Snapshot,
-    _path: &str,
-    _type_name: &str,
-    _opts: &QueryOptions,
+    snap: &Snapshot,
+    path: &str,
+    type_name: &str,
+    opts: &QueryOptions,
 ) -> Result<TypeQueryReport> {
-    Err(Error::Unimplemented("query --type"))
+    query::query_type(snap, path, type_name, opts)
 }
 
-/// Shortest retaining paths for an address or a type's instances. **Stub.**
+/// Shortest retaining paths for an address or a type's instances. Fails
+/// with [`Error::NotFound`] if the address is not an object or no type
+/// matches.
 pub fn retaining_path(
-    _snap: &Snapshot,
-    _path: &str,
-    _target: &PathTarget,
-    _opts: &QueryOptions,
+    snap: &Snapshot,
+    path: &str,
+    target: &PathTarget,
+    opts: &QueryOptions,
 ) -> Result<RetainingPathReport> {
-    Err(Error::Unimplemented("query --retaining-path"))
+    query::retaining_path(snap, path, target, opts)
 }
 
 /// Growth by type and by retaining site between two snapshots. **Stub.**
@@ -305,11 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn stubs_are_unimplemented() {
+    fn missing_address_is_not_found() {
         let s = SnapshotBuilder::new().build().unwrap();
         assert!(matches!(
             retaining_path(&s, "a", &PathTarget::Address(1), &Default::default()),
-            Err(Error::Unimplemented(_))
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            query_type(&s, "a", "builtins.dict", &Default::default()),
+            Err(Error::NotFound(_))
         ));
     }
 }

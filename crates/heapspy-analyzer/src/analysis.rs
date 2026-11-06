@@ -187,10 +187,6 @@ impl<'s> Analysis<'s> {
         &self.types.names[self.group(v) as usize]
     }
 
-    pub fn address(&self, v: u32) -> Address {
-        Address(self.snap.object_addr(v))
-    }
-
     /// The snapshot's label for CSR edge `e`, or `None` for super-root edges.
     pub fn edge_label(&self, e: u32) -> Option<EdgeLabel> {
         (e < self.g.snapshot_edges).then(|| self.snap.edge(e as u64).label)
