@@ -60,6 +60,45 @@ const ARENA_LINE: u32 = 5;
 /// `bytes(64 * 1024)`: the large objects.
 const PAYLOAD_LINE: u32 = 6;
 
+/// A leak whose payload is allocated on memory that churn just freed.
+/// `render_page` allocates and drops 20 KB buffers; each `Session` keeps
+/// an 8 KB blob, which glibc often places where a freed buffer was. Most
+/// blobs are not sampled, so the latest sample over a blob's address is
+/// often a `render_page` buffer, which the join must not link to it.
+/// `Session(uid)` runs often enough to be specialized, so on 3.13 and 3.14
+/// `__init__` runs above CPython's `_Py_InitCleanup` shim frame, which
+/// recorded stacks must not show.
+const REUSE_VICTIM: &str = r#"import os, sys, time
+
+class Session:
+    def __init__(self, uid):
+        self.uid = uid
+        self.blob = os.urandom(8192)          # line 6: the leak's payload
+
+SESSIONS = {}
+
+def login(uid):
+    SESSIONS[uid] = Session(uid)              # line 11: never evicted
+
+def render_page(n):
+    return b"x" * 20000                        # line 14: churn, freed right away
+
+def main():
+    open(sys.argv[1], "w").write(str(os.getpid()))
+    i = 0
+    while True:
+        login(i); i += 1
+        for _ in range(3):
+            render_page(i)
+        time.sleep(0.0005)
+
+main()
+"#;
+/// `os.urandom(8192)` in `Session.__init__`.
+const BLOB_LINE: u32 = 6;
+/// `Session(uid)` in `login`.
+const LOGIN_LINE: u32 = 11;
+
 fn python(minor: u8) -> PathBuf {
     if let Ok(p) = std::env::var(format!("HEAPSPY_PY3{minor}")) {
         return p.into();
@@ -92,8 +131,12 @@ impl Drop for Victim {
 }
 
 fn start(py: &Path, dir: &Path) -> Victim {
+    start_victim(py, dir, VICTIM)
+}
+
+fn start_victim(py: &Path, dir: &Path, victim: &str) -> Victim {
     let script = dir.join("victim.py");
-    std::fs::write(&script, VICTIM).unwrap();
+    std::fs::write(&script, victim).unwrap();
     let ready = dir.join("ready");
     let child = Command::new(py)
         .arg(&script)
@@ -242,6 +285,135 @@ live!(python314_ebpf, 14, "ebpf");
 live!(python312_ptrace, 12, "ptrace");
 live!(python313_ptrace, 13, "ptrace");
 live!(python314_ptrace, 14, "ptrace");
+
+/// CPython's `_Py_InitCleanup` frame as it resolves: `__init__` in file
+/// `__init__`, no line.
+fn is_shim(f: &StackFrame) -> bool {
+    f.function == "__init__" && f.file.as_deref() == Some("__init__")
+}
+
+/// Record [`REUSE_VICTIM`] through eBPF, then check that the reused
+/// addresses are not linked to the churn and that no stack shows the
+/// init shim.
+fn run_reuse(minor: u8) {
+    let dir = tempfile::tempdir().unwrap();
+    let v = start_victim(&python(minor), dir.path(), REUSE_VICTIM);
+    let prof = dir.path().join("a.hpya");
+    let snap = dir.path().join("a.hpy");
+    let pid = v.pid.to_string();
+    let o = heapspy(&[
+        "record",
+        "--pid",
+        &pid,
+        "--duration",
+        "3s",
+        "--mechanism",
+        "ebpf",
+        // 64K keeps about one blob in eight (and one buffer in four), so
+        // most blobs are unsampled and sit where a sampled buffer was: the
+        // case the join must reject. The sampled blobs, several hundred,
+        // then outweigh the arena links of the small objects by far.
+        "--interval",
+        "64K",
+        "-o",
+        s(&prof),
+        "--then-dump",
+        s(&snap),
+    ]);
+    assert!(
+        o.status.success(),
+        "record failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let o = heapspy(&["analyze", s(&snap), "--allocations", s(&prof), "--json"]);
+    assert!(
+        o.status.success(),
+        "analyze failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let r: AnalyzeReport = serde_json::from_slice(&o.stdout).unwrap();
+    let a = r.allocations.as_ref().expect("allocations in the report");
+
+    // The churn was sampled, its memory was reused under unsampled blobs,
+    // and none of that is linked.
+    let render = a
+        .top_stacks
+        .iter()
+        .find(|t| has(&t.frames, "render_page", 14))
+        .unwrap_or_else(|| panic!("render_page was not sampled: {:?}", a.top_stacks));
+    assert_eq!(render.linked_bytes, 0, "render_page linked: {render:?}");
+    assert!(
+        a.coverage.unlinked_reused_objects > 0,
+        "no reused address seen, the test proves nothing: {:?}",
+        a.coverage
+    );
+
+    let sessions = r
+        .top_retainers
+        .iter()
+        .find(|t| heapspy_analyzer::root_path_string(&t.path).ends_with("['SESSIONS']"))
+        .unwrap_or_else(|| {
+            let paths: Vec<String> = r
+                .top_retainers
+                .iter()
+                .map(|t| heapspy_analyzer::root_path_string(&t.path))
+                .collect();
+            panic!("no SESSIONS retainer in {paths:?}")
+        });
+    let at = sessions.allocated_at.as_ref().expect("allocated_at");
+    let top = at.stacks.first().expect("SESSIONS has linked objects");
+    assert!(
+        has(&top.frames, "Session.__init__", BLOB_LINE),
+        "SESSIONS' top stack is not Session.__init__:{BLOB_LINE}: {at:?}"
+    );
+    assert_eq!(top.exact_linked_bytes, top.linked_bytes, "{top:?}");
+    // The caller of __init__ is login, with no shim frame in between.
+    let i = top
+        .frames
+        .iter()
+        .position(|f| f.function == "Session.__init__")
+        .unwrap();
+    assert!(
+        has(&top.frames[i + 1..i + 2], "login", LOGIN_LINE),
+        "{:?}",
+        top.frames
+    );
+    for st in &at.stacks {
+        assert!(
+            !st.frames.iter().any(|f| f.function == "render_page"),
+            "SESSIONS linked to render_page: {at:?}"
+        );
+    }
+    for st in r
+        .top_retainers
+        .iter()
+        .filter_map(|t| t.allocated_at.as_ref())
+        .flat_map(|at| &at.stacks)
+    {
+        assert!(!st.frames.iter().any(|f| f.function == "render_page"));
+    }
+    for t in &a.top_stacks {
+        assert!(!t.frames.iter().any(is_shim), "shim frame: {:?}", t.frames);
+    }
+}
+
+#[test]
+#[ignore = "needs root and specific interpreters"]
+fn python312_reused_addresses() {
+    run_reuse(12);
+}
+
+#[test]
+#[ignore = "needs root and specific interpreters"]
+fn python313_reused_addresses() {
+    run_reuse(13);
+}
+
+#[test]
+#[ignore = "needs root and specific interpreters"]
+fn python314_reused_addresses() {
+    run_reuse(14);
+}
 
 /// SHA-256-free fingerprint of the target's executable mappings.
 fn code_bytes(pid: u32) -> Vec<u8> {
