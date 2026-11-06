@@ -1,63 +1,160 @@
-//! Live Linux process via `process_vm_readv`. **Stub.**
+//! Live Linux process via `process_vm_readv`.
 //!
-//! Implementation notes:
-//!
-//! - Consistency: stop every thread before the first read (`PTRACE_SEIZE` +
-//!   `PTRACE_INTERRUPT` on each TID in `/proc/<pid>/task`, or `SIGSTOP`) and
-//!   resume them on drop. The pause must be as short as possible; for large
-//!   heaps the recommended path is still `gcore` + [`super::elf_core`].
-//! - Memory: `process_vm_readv`, falling back to `/proc/<pid>/mem` for ranges
-//!   that `process_vm_readv` refuses. Split reads at mapping boundaries from
-//!   `/proc/<pid>/maps` so one unmapped page does not fail a whole read.
-//! - Modules and ranges: `/proc/<pid>/maps`. Threads: `/proc/<pid>/task`.
-//! - Memory summary: `/proc/<pid>/smaps_rollup` for RSS, `/proc/<pid>/smaps`
-//!   for per-kind totals (`[heap]`, `[stack]`, anonymous, file-backed).
+//! - Consistency: every thread is stopped before the first read with
+//!   `PTRACE_SEIZE` + `PTRACE_INTERRUPT` on each TID in `/proc/<pid>/task`,
+//!   repeated until a pass finds no new threads (a thread can be created
+//!   while earlier ones are being stopped). This was chosen over `SIGSTOP`
+//!   because it is invisible to the target and its parent: no job-control
+//!   stop is reported to a shell or supervisor, no `SIGCONT` is needed, and
+//!   signals that arrive meanwhile stay queued. A signal that was being
+//!   delivered when a thread stopped is re-injected on detach.
+//! - Threads are resumed by [`MemorySource::release`] (which `dump` calls as
+//!   soon as the walk is done, before the snapshot is written) or on drop,
+//!   including when attaching fails halfway. ptrace ties a tracee to the
+//!   tracer *thread*, so release or drop must happen on the thread that
+//!   called [`LiveProcess::attach`]. If that thread has gone away, the
+//!   kernel detaches the tracees when the tracer exits.
+//! - Memory: `process_vm_readv`, falling back to `/proc/<pid>/mem` for
+//!   ranges it refuses. Reads go through a cache of 64 KiB blocks (up to
+//!   256 MiB), valid because the target is stopped; it turns the walker's
+//!   many small reads into few system calls.
+//! - Modules and ranges: `/proc/<pid>/maps`. Threads: `/proc/<pid>/task`,
+//!   names from `comm`, stack pointer and `fs_base` from `PTRACE_GETREGS`.
+//! - Memory summary: `/proc/<pid>/smaps` for per-kind mapped and resident
+//!   totals, `/proc/<pid>/smaps_rollup` for RSS.
 //! - Errors: `EPERM` maps to [`Error::PermissionDenied`] with a hint about
 //!   `CAP_SYS_PTRACE` and `kernel.yama.ptrace_scope`.
-//! - Platform code must be behind `#[cfg(target_os = "linux")]`; on other
-//!   platforms `attach` returns [`Error::Unsupported`].
+//!
+//! On other platforms [`LiveProcess::attach`] returns [`Error::Unsupported`].
+
+use std::time::Duration;
 
 use super::{MappedRange, MemorySource, MemorySummary, Module, TargetInfo, ThreadInfo};
-use crate::error::{Error, Result};
+#[cfg(not(target_os = "linux"))]
+use crate::error::Error;
+use crate::error::Result;
+
+#[cfg(target_os = "linux")]
+mod imp;
 
 /// A stopped live process.
-#[derive(Debug)]
 pub struct LiveProcess {
     pid: u32,
     target: TargetInfo,
+    #[cfg(target_os = "linux")]
+    inner: imp::Inner,
+}
+
+impl std::fmt::Debug for LiveProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveProcess")
+            .field("pid", &self.pid)
+            .field("target", &self.target)
+            .finish()
+    }
 }
 
 impl LiveProcess {
     /// Stop `pid` and prepare to read it.
     pub fn attach(pid: u32) -> Result<LiveProcess> {
-        if !cfg!(target_os = "linux") {
-            return Err(Error::Unsupported(format!(
-                "reading a live process (pid {pid}) is only implemented on Linux"
-            )));
+        #[cfg(target_os = "linux")]
+        {
+            let inner = imp::Inner::attach(pid)?;
+            Ok(LiveProcess {
+                pid,
+                target: inner.target(),
+                inner,
+            })
         }
-        Err(Error::Unimplemented("live Linux process reader"))
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::Unsupported(format!(
+                "reading a live process (pid {pid}) is only implemented on Linux"
+            )))
+        }
     }
 
     pub fn pid(&self) -> u32 {
         self.pid
     }
+
+    /// How long stopping all threads took.
+    pub fn attach_time(&self) -> Duration {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.attach_time()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Duration::ZERO
+        }
+    }
+
+    /// Resume the target now. Later reads still work for cached blocks and
+    /// may otherwise see a changing image. Returns how long the target was
+    /// stopped, or `None` if it was already resumed.
+    pub fn resume(&self) -> Option<Duration> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.detach()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
 }
 
+#[cfg(target_os = "linux")]
 impl MemorySource for LiveProcess {
     fn target(&self) -> TargetInfo {
         self.target
     }
-    fn read(&self, _addr: u64, _buf: &mut [u8]) -> Result<()> {
-        Err(Error::Unimplemented("live Linux process reader"))
+    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read(addr, buf)
     }
     fn mapped_ranges(&self) -> Result<Vec<MappedRange>> {
-        Err(Error::Unimplemented("live Linux process reader"))
+        Ok(self.inner.mapped_ranges())
     }
     fn modules(&self) -> Result<Vec<Module>> {
-        Err(Error::Unimplemented("live Linux process reader"))
+        Ok(self.inner.modules())
     }
     fn threads(&self) -> Result<Vec<ThreadInfo>> {
-        Err(Error::Unimplemented("live Linux process reader"))
+        Ok(self.inner.threads())
+    }
+    fn memory_summary(&self) -> Option<MemorySummary> {
+        self.inner.memory_summary()
+    }
+    fn captured_at(&self) -> Option<u64> {
+        Some(self.inner.captured_at())
+    }
+    fn find_symbol(&self, module: &Module, name: &str) -> Result<Option<u64>> {
+        self.inner.find_symbol(self, module, name)
+    }
+    fn release(&self) -> Option<Duration> {
+        self.resume()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl MemorySource for LiveProcess {
+    fn target(&self) -> TargetInfo {
+        self.target
+    }
+    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        Err(Error::Unmapped {
+            addr,
+            len: buf.len(),
+        })
+    }
+    fn mapped_ranges(&self) -> Result<Vec<MappedRange>> {
+        Ok(Vec::new())
+    }
+    fn modules(&self) -> Result<Vec<Module>> {
+        Ok(Vec::new())
+    }
+    fn threads(&self) -> Result<Vec<ThreadInfo>> {
+        Ok(Vec::new())
     }
     fn memory_summary(&self) -> Option<MemorySummary> {
         None

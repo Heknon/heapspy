@@ -6,8 +6,8 @@
 //!
 //! | module | source | status |
 //! |---|---|---|
-//! | [`elf_core`] | Linux ELF core file (`gcore`, kernel core dump) | stub |
-//! | [`linux_live`] | live Linux process via `process_vm_readv` | stub |
+//! | [`elf_core`] | Linux ELF core file (`gcore`, kernel core dump) | implemented |
+//! | [`linux_live`] | live Linux process via `process_vm_readv` | implemented |
 //! | [`minidump`] | Windows full-memory minidump | implemented |
 //! | `windows_live` | live Windows process, via a temporary full minidump (`cfg(windows)`) | implemented |
 //! | [`mem`] | in-memory segments, for tests | implemented |
@@ -176,6 +176,15 @@ pub trait MemorySource: Send + Sync {
     /// Returns `Ok(None)` if the module has no such export.
     fn find_symbol(&self, module: &Module, name: &str) -> Result<Option<u64>> {
         crate::symbols::find_exported(self, module, name)
+    }
+
+    /// The walker has finished reading. A live backend resumes the target
+    /// here instead of waiting for drop, so the pause does not include
+    /// writing the snapshot. Returns how long the target was stopped, or
+    /// `None` for file sources and if it was already resumed. Reads after
+    /// this may fail or see a changing image. The default does nothing.
+    fn release(&self) -> Option<std::time::Duration> {
+        None
     }
 }
 

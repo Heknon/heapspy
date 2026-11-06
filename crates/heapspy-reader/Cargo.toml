@@ -10,7 +10,11 @@ repository.workspace = true
 [dependencies]
 heapspy-snapshot.workspace = true
 memmap2.workspace = true
+object.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

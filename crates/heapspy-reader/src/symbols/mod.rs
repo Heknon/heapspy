@@ -7,34 +7,40 @@
 //! candidate; [`find_exported`] resolves a name in it.
 //!
 //! [`find_exported`] is the default for [`MemorySource::find_symbol`]. It
-//! reads only from target memory and dispatches on the image magic at the
-//! module base: `MZ` goes to [`pe`]; ELF is a **stub** for now.
+//! reads the module's first bytes and dispatches on the image magic:
 //!
-//! - ELF: read the ELF header at `module.base`, the program headers, then the
-//!   `PT_DYNAMIC` segment for `DT_SYMTAB`, `DT_STRTAB`, `DT_GNU_HASH` /
-//!   `DT_HASH`. Use the hash table to find the symbol (the symbol count is
-//!   not stored directly). Addresses in the dynamic section may be absolute
-//!   or base-relative depending on the loader; check against the module range.
-//! - PE: see [`pe::find_export`]. Forwarded exports resolve to `None`.
+//! - ELF (`\x7fELF`): [`elf::find_exported`], which reads the ELF header at
+//!   `module.base`, the program headers, then the `PT_DYNAMIC` segment for
+//!   `DT_SYMTAB`, `DT_STRTAB`, `DT_GNU_HASH` / `DT_HASH`, and looks the name
+//!   up through the hash table. [`elf::find_in_file`] does the same from the
+//!   file on disk and also searches `.symtab` and the `.PyRuntime` section;
+//!   the ELF core and live Linux backends use it as a fallback.
+//! - PE (`MZ`): [`pe::find_export`]. Forwarded exports resolve to `None`.
 
 use crate::error::{Error, Result};
-use crate::source::{MemorySource, Module};
+use crate::source::{MemorySource, MemorySourceExt, Module};
+
+pub mod elf;
 
 pub mod pe;
 
 /// Resolve `name` in the dynamic symbol table / export directory of `module`
-/// by reading the image out of `src`. PE images are handled by [`pe`]; ELF
-/// lookup is a **stub** that returns `Error::Unimplemented`.
+/// by reading the image out of `src`, dispatching on the image magic.
 pub fn find_exported<S: MemorySource + ?Sized>(
     src: &S,
     module: &Module,
     name: &str,
 ) -> Result<Option<u64>> {
-    let mut magic = [0u8; 2];
-    src.read(module.base, &mut magic)?;
-    match &magic {
-        b"MZ" => pe::find_export(src, module, name),
-        _ => Err(Error::Unimplemented("exported symbol lookup (ELF .dynsym)")),
+    let magic = src.read_array::<4>(module.base)?;
+    if magic == elf::ELF_MAGIC {
+        elf::find_exported(src, module, name)
+    } else if magic[..2] == *b"MZ" {
+        pe::find_export(src, module, name)
+    } else {
+        Err(Error::Format(format!(
+            "unknown image format at {:#x} ({})",
+            module.base, module.name
+        )))
     }
 }
 

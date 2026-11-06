@@ -166,9 +166,23 @@ Retainer (`top_retainers[]`):
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
 
-The list skips objects that are dominated by an object already listed with
-the same retained size (a chain of single-owner wrappers is reported once, at
-its top).
+Which objects are listed:
+
+1. Namespaces are never listed: module objects, frame objects, type objects,
+   and the `__dict__` each of them dominates. The variables inside them are
+   listed instead.
+2. A chain of wrappers that only restate their contents is reported once, at
+   the object where the memory accumulates. Starting at an object A, follow
+   A's largest dominated child while it still retains at least 90% of A's
+   `retained_bytes`, for at most 8 steps; only the last object of the chain
+   is listed. So `module -> __dict__ -> CACHE` lists `CACHE`, and
+   `function -> closure cell -> large object` lists the large object. The
+   `path` still shows the wrappers. The 90% is measured against the top of
+   the chain, so a long linked list is reported near its head, not at its
+   tail.
+3. Entries are ranked by `retained_bytes` (ties by address), and an object
+   dominated by an entry already listed is skipped. The entries are therefore
+   disjoint: their retained sets do not overlap.
 
 TypeRow (`type_histogram[]`):
 
@@ -178,6 +192,13 @@ TypeRow (`type_histogram[]`):
 | `count` | integer | instances |
 | `shallow_bytes` | integer | sum of instance shallow sizes |
 | `retained_bytes` | integer | retained size of the set of instances: sum of `retained_bytes` over instances not dominated by another instance of the same type |
+
+The `retained_bytes` rule means nested instances are not counted twice: for
+a dict of dicts, only the outer dict's retained size counts, since it already
+includes the inner ones. The result equals the total shallow size of every
+object dominated by at least one instance. Unreachable instances count in
+`count` and `shallow_bytes` but retain nothing. Types are grouped by display
+name, so two type objects with the same `module.qualname` are one row.
 
 ## `type_query`
 
@@ -221,8 +242,11 @@ Holder:
 
 ## `retaining_path`
 
-`heapspy query SNAP --retaining-path ADDR --json`. Example:
-`docs/examples/retaining_path.json`.
+`heapspy query SNAP --retaining-path ADDR --json`, or
+`heapspy query SNAP --retaining-path-type T --json` for the largest
+instances of a type (`query.by` is then `"type"`). `--top N` bounds the
+number of targets and `--max-paths N` the paths per target (default 3).
+Example: `docs/examples/retaining_path.json`.
 
 | field | type | meaning |
 |---|---|---|
@@ -289,6 +313,34 @@ SiteGrowth:
 | `delta_retained_bytes` | signed integer | |
 | `before_retained_objects`, `after_retained_objects` | integer | |
 | `delta_retained_objects` | signed integer | |
+
+How sites are built. A site is a position in the dominator tree, named by
+labels so that it can be found again in another dump:
+
+- The site of a root object is its root label. When an object is a root
+  more than once, one entry is chosen: `module_dict` first, then
+  `frame_local`, `thread_locals`, `interp`, `other`, ties broken by label.
+- The site of any other object is the site of its immediate dominator plus
+  the label of the edge into the object, joined as in a root path. If the
+  object's shortest-path parent is not its immediate dominator (it is
+  reached through several objects its dominator owns), the label is written
+  as `...` followed by the label of the last edge, e.g.
+  `sys.modules['app'].__dict__['PENDING']...[<index>]`.
+- List and tuple indices are generalised to `[<index>]`, since positions
+  shift as a container changes.
+- Only the first 6 levels of the dominator tree get sites (level 1 is the
+  root objects). Deeper objects are counted in the retained size of their
+  ancestor's site.
+- Objects that end up with the same site are summed: every value of a dict
+  with redacted keys of one length, every item of one list. `type` is the
+  type of the largest contributor.
+
+Which sites are listed: sites whose retained bytes and objects did not
+change are left out, and so is a site whose change is at least 90% in one
+child site that is a single object in both snapshots (with the same sign).
+Growth in `CACHE` also shows as growth in the module and the module's
+`__dict__`; only `CACHE` is listed. A child site that sums many objects does
+not hide its parent.
 
 ## `error`
 
