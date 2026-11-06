@@ -20,7 +20,7 @@ libc.workspace = true
 object.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Diagnostics_Etw", "Win32_System_ProcessStatus", "Win32_System_Time"] }
+windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_System_Diagnostics_Etw", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_Time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

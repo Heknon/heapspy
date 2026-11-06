@@ -98,8 +98,10 @@ fn error_code(doc: &serde_json::Value) -> &str {
 }
 
 /// A child process that is not CPython, killed on drop.
+#[cfg(target_os = "linux")]
 struct Child(std::process::Child);
 
+#[cfg(target_os = "linux")]
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -107,7 +109,7 @@ impl Drop for Child {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn sleeper() -> Child {
     Child(Command::new("sleep").arg("60").spawn().expect("run sleep"))
 }

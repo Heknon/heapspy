@@ -1,11 +1,15 @@
 //! Pieces every recorder shares: which event kinds actually ran, code
 //! object recognition, instruction offsets.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
 use heapspy_alloc::{EventKind, EventKinds};
+#[cfg(target_os = "linux")]
 use heapspy_reader::cpython::frames::{RawFrame, MAX_INSTR_OFFSET};
+#[cfg(target_os = "linux")]
 use heapspy_reader::cpython::FrameOffsets;
+#[cfg(target_os = "linux")]
 use heapspy_reader::{MemorySource, MemorySourceExt};
 
 use crate::error::Result;
@@ -32,6 +36,7 @@ pub fn note_events(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 /// Remembers which type addresses are `code` (`tp_name == "code"`), the
 /// same test `read_stack` applies.
 #[derive(Default)]
@@ -39,6 +44,7 @@ pub struct CodeTypes {
     types: HashMap<u64, bool>,
 }
 
+#[cfg(target_os = "linux")]
 impl CodeTypes {
     pub fn is_code(&mut self, src: &dyn MemorySource, fo: &FrameOffsets, ty: u64) -> bool {
         if ty == 0 {
@@ -59,6 +65,7 @@ impl CodeTypes {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// A frame from a code object address and the frame's instruction pointer,
 /// as `read_stack` computes it.
 pub fn raw_frame(fo: &FrameOffsets, code: u64, instr_ptr: u64) -> RawFrame {
@@ -74,7 +81,7 @@ pub fn raw_frame(fo: &FrameOffsets, code: u64, instr_ptr: u64) -> RawFrame {
 
 /// `CLOCK_REALTIME - CLOCK_MONOTONIC` in ns, to turn monotonic event
 /// times into Unix-epoch times. Measured once, at start.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn monotonic_to_epoch_offset() -> i128 {
     let read = |clk| {
         let mut t = libc::timespec {
@@ -92,7 +99,7 @@ pub fn monotonic_to_epoch_offset() -> i128 {
 }
 
 /// Monotonic ns now.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn monotonic_ns() -> u64 {
     let mut t = libc::timespec {
         tv_sec: 0,
@@ -103,6 +110,7 @@ pub fn monotonic_ns() -> u64 {
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
 }
 
+#[cfg(target_os = "linux")]
 pub fn to_epoch(mono: u64, offset: i128) -> u64 {
     (mono as i128 + offset).clamp(0, u64::MAX as i128) as u64
 }
