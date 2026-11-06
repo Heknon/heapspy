@@ -9,6 +9,7 @@ from typing import Any
 
 import psutil
 
+from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
 from .config import Config
 from .processes import describe_cmdline, matches_allowlist
@@ -192,19 +193,43 @@ def capture_snapshot(
             "cli_failed", f"heapspy dump exited 0 but did not write {out}", stderr=result.stderr
         )
     size = out.stat().st_size
-    log.warning("capture done: handle=%s file=%s size=%s", handle, out, size)
-    return {
+    log.warning(
+        "capture done: handle=%s file=%s size=%s report=%s pause_ms=%s",
+        handle,
+        out,
+        size,
+        result.report,
+        result.pause_ms,
+    )
+    stats: dict[str, Any] = {
+        "objects": result.objects,
+        "edges": result.edges,
+        "types": result.types,
+        "roots": result.roots,
+        "file_bytes": size,
+        "file_human": human_bytes(size),
+        "truncated": result.truncated,
+        "missing_bytes": result.missing_bytes,
+        "read_errors": result.read_errors,
+        "pause_ms": result.pause_ms,
+    }
+    out_doc: dict[str, Any] = {
         "snapshot": handle,
         "path": str(out),
         "target": target,
+        "python_version": result.python_version,
         "contents_captured": capture_contents,
-        "stats": {
-            "objects": result.objects,
-            "edges": result.edges,
-            "roots": result.roots,
-            "file_bytes": size,
-            "file_human": human_bytes(size),
-            "truncated": result.truncated,
-        },
+        "stats": stats,
+        "notes": S.notes(list(result.notes)),
+        # "json": the dump report; "stderr_line": an older heapspy without
+        # `dump --json`, so types, read_errors, missing_bytes, pause_ms and
+        # python_version are null.
+        "report": result.report,
         "next_step": f"Call heap_summary(snapshot={handle!r}) to see the top retainers.",
     }
+    if result.truncated:
+        out_doc["warning"] = (
+            "The snapshot is marked truncated (the walk did not finish, or the image is "
+            "incomplete). Sizes and counts from it are lower bounds."
+        )
+    return out_doc

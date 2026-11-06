@@ -159,7 +159,10 @@ def build_server(config: Config) -> MCPServer:
             "server, and under its RSS limit; refusals explain which gate failed, and only the "
             "user can change the gates. capture_contents=true records string/bytes contents "
             "(may include secrets) and needs --allow-contents on the server. Returns a snapshot "
-            "handle to pass to heap_summary, retaining_path, type_detail and diff_snapshots."
+            "handle to pass to heap_summary, retaining_path, type_detail and diff_snapshots, "
+            "and the dump's stats (objects, roots, pause_ms, truncated, missing_bytes, "
+            "read_errors) and notes. A failed dump returns heapspy's error code (e.g. "
+            "permission_denied, not_python, no_such_process) with a hint."
         ),
     )
     def capture_snapshot(

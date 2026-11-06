@@ -1,12 +1,18 @@
 """A stand-in for the heapspy binary, driven by argv and environment variables.
 
-It prints the documents from ``docs/examples`` (adjusted to the arguments)
-the way ``heapspy ... --json`` would.
+It prints the documents from ``docs/examples`` and ``tests/fixtures/heapspy``
+(adjusted to the arguments) the way ``heapspy ... --json`` would.
 
 Environment:
     FAKE_HEAPSPY_EXAMPLES  directory holding the example JSON documents (required)
+    FAKE_HEAPSPY_FIXTURES  directory holding examples from unmerged heapspy branches
+                           (needed for dump --json and --allocations output)
     FAKE_HEAPSPY_MODE      ok (default), error:<code>, bad_schema, not_json, timeout,
-                           usage, wrong_kind, crash, big, error_exit0
+                           usage, wrong_kind, crash, big, error_exit0;
+                           for dump also dump_fail (text error, no document),
+                           dump_no_file, dump_truncated, dump_no_json (exit 0, no
+                           document), dump_usage (usage error naming --json in its
+                           Usage line), old_binary (a heapspy without dump --json)
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
 """
 
@@ -25,6 +31,12 @@ MODE = os.environ.get("FAKE_HEAPSPY_MODE", "ok")
 
 def load(name: str) -> dict:
     return json.loads((EXAMPLES / f"{name}.json").read_text())
+
+
+def load_fixture(name: str) -> dict:
+    """An example from a heapspy branch not merged here (tests/fixtures/heapspy)."""
+    fixtures = Path(os.environ["FAKE_HEAPSPY_FIXTURES"])
+    return json.loads((fixtures / f"{name}.json").read_text())
 
 
 def emit(doc: dict, status: int = 0) -> None:
@@ -84,6 +96,65 @@ def big_analyze() -> dict:
     return doc
 
 
+def usage_error(flag: str, usage: str) -> None:
+    """clap's message for an argument this heapspy version does not know."""
+    print(
+        f"error: unexpected argument '{flag}' found\n\nUsage: {usage}\n\n"
+        "For more information, try '--help'.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def dump(args: list[str]) -> None:
+    out = opt(args, "output")
+    if not out:
+        sys.exit(2)
+    json_out = "--json" in args
+    if json_out and MODE == "old_binary":
+        usage_error("--json", "heapspy dump --output <OUT> <--pid <PID>|--core <PATH>>")
+    if MODE == "dump_usage":
+        # A newer heapspy prints --json in the Usage line of every dump usage error.
+        print(
+            "error: the following required arguments were not provided:\n"
+            "  --capture-contents\n\n"
+            "Usage: heapspy dump --output <OUT> --capture-contents --json --max-str <N> "
+            "<--pid <PID>|--core <PATH>|--minidump <PATH>>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if MODE == "dump_fail":
+        print("heapspy: error: cannot open pid 1: permission denied", file=sys.stderr)
+        sys.exit(1)
+    if MODE == "dump_no_file":
+        sys.exit(0)
+    truncated = MODE == "dump_truncated"
+    Path(out).write_bytes(b"HPYSNAP\0" + b"\0" * 120)
+    trunc = " (truncated)" if truncated else ""
+    print(f"wrote {out}: 10 objects, 20 edges, 3 roots, 128 bytes{trunc}", file=sys.stderr)
+    if not json_out or MODE in ("old_binary", "dump_no_json"):
+        sys.exit(0)
+    doc = load_fixture("dump")
+    doc["path"] = out
+    for kind in ("pid", "core", "minidump"):
+        ref = opt(args, kind)
+        if ref is not None:
+            doc["source"] = {"kind": kind, "ref": ref}
+            if kind != "pid":
+                doc["pause_ms"] = None
+    doc["contents_captured"] = "--capture-contents" in args
+    doc.update(objects=10, edges=20, roots=3, bytes_written=128)
+    if truncated:
+        doc["truncated"] = True
+        doc["image"]["missing_bytes"] = 4096
+        doc["notes"] = [
+            {"code": "truncated_snapshot", "message": "The snapshot is marked truncated."},
+            {"code": "image_incomplete", "message": "The image is missing 4096 bytes."},
+            *doc["notes"],
+        ]
+    emit(doc)
+
+
 def main() -> None:
     log = os.environ.get("FAKE_HEAPSPY_LOG")
     if log:
@@ -110,18 +181,7 @@ def main() -> None:
 
     cmd = args[0] if args else ""
     if cmd == "dump":
-        out = opt(args, "output")
-        if not out:
-            sys.exit(2)
-        if MODE == "dump_fail":
-            print("heapspy: error: cannot open pid 1: permission denied", file=sys.stderr)
-            sys.exit(1)
-        if MODE == "dump_no_file":
-            sys.exit(0)
-        Path(out).write_bytes(b"HPYSNAP\0" + b"\0" * 120)
-        trunc = " (truncated)" if MODE == "dump_truncated" else ""
-        print(f"wrote {out}: 10 objects, 20 edges, 3 roots, 128 bytes{trunc}", file=sys.stderr)
-        sys.exit(0)
+        dump(args)
 
     if "--json" not in args:
         sys.exit(2)
