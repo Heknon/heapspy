@@ -138,35 +138,57 @@ pub fn dominators(g: &Csr, root: u32) -> Dominators {
     let m = order.len();
 
     // Predecessors in preorder space, reachable sources only, no self-loops.
-    let mut pred_off = vec![0u32; m + 1];
+    // First translate every out-edge to preorder numbers in one sequential
+    // pass (one random `dfn` lookup per edge), then counting-sort by target.
+    let mut src_off = Vec::with_capacity(m + 1);
+    let mut out_dfn: Vec<u32> = Vec::new();
     for &v in &order {
+        src_off.push(out_dfn.len());
         for w in g.out(v) {
             let dw = dfn[w as usize];
             if w != v && dw != NONE {
-                pred_off[dw as usize + 1] += 1;
+                out_dfn.push(dw);
             }
         }
+    }
+    src_off.push(out_dfn.len());
+    drop(dfn);
+    let mut pred_off = vec![0u32; m + 1];
+    for &dw in &out_dfn {
+        pred_off[dw as usize + 1] += 1;
     }
     for i in 0..m {
         pred_off[i + 1] += pred_off[i];
     }
     let mut fill = pred_off.clone();
-    let mut preds = vec![0u32; pred_off[m] as usize];
-    for (i, &v) in order.iter().enumerate() {
-        for w in g.out(v) {
-            let dw = dfn[w as usize];
-            if w != v && dw != NONE {
-                preds[fill[dw as usize] as usize] = i as u32;
-                fill[dw as usize] += 1;
-            }
+    let mut preds = vec![0u32; out_dfn.len()];
+    for i in 0..m {
+        for &dw in &out_dfn[src_off[i]..src_off[i + 1]] {
+            preds[fill[dw as usize] as usize] = i as u32;
+            fill[dw as usize] += 1;
         }
     }
-    drop(fill);
-    drop(dfn);
+    drop((fill, out_dfn, src_off));
 
+    // The link-eval forest. Each entry packs the forest parent, the label
+    // (the vertex of minimum semidominator on the compressed path) and that
+    // label's semidominator, so a compression step reads two cache lines
+    // instead of five. A label's semidominator is final by the time it is
+    // copied: labels only ever point at vertices already processed.
+    #[derive(Clone, Copy)]
+    struct Node {
+        ancestor: u32,
+        label: u32,
+        label_semi: u32,
+    }
+    let mut forest: Vec<Node> = (0..m as u32)
+        .map(|i| Node {
+            ancestor: NONE,
+            label: i,
+            label_semi: i,
+        })
+        .collect();
     let mut semi: Vec<u32> = (0..m as u32).collect();
-    let mut label: Vec<u32> = (0..m as u32).collect();
-    let mut ancestor = vec![NONE; m];
     let mut idom = vec![NONE; m];
     // Buckets as intrusive singly linked lists: every vertex is in at most one
     // bucket (that of its semidominator) at a time.
@@ -174,53 +196,57 @@ pub fn dominators(g: &Csr, root: u32) -> Dominators {
     let mut bucket_next = vec![NONE; m];
     let mut stack: Vec<u32> = Vec::new();
 
-    // eval(v): the vertex with minimum semi on the forest path above v.
-    let eval = |v: u32,
-                ancestor: &mut [u32],
-                label: &mut [u32],
-                semi: &[u32],
-                stack: &mut Vec<u32>|
-     -> u32 {
-        if ancestor[v as usize] == NONE {
-            return v;
+    // eval(v): the vertex with minimum semi on the forest path above v, and
+    // that semi. An unlinked v is its own answer.
+    let eval = |v: u32, forest: &mut [Node], stack: &mut Vec<u32>| -> (u32, u32) {
+        let fv = forest[v as usize];
+        if fv.ancestor == NONE {
+            return (v, fv.label_semi);
         }
         // compress(v), iteratively: collect the path, then apply the
         // recursive version's updates from the top down.
         let mut x = v;
-        while ancestor[ancestor[x as usize] as usize] != NONE {
+        loop {
+            let a = forest[x as usize].ancestor;
+            if forest[a as usize].ancestor == NONE {
+                break;
+            }
             stack.push(x);
-            x = ancestor[x as usize];
+            x = a;
         }
         while let Some(x) = stack.pop() {
-            let a = ancestor[x as usize] as usize;
-            if semi[label[a] as usize] < semi[label[x as usize] as usize] {
-                label[x as usize] = label[a];
+            let a = forest[forest[x as usize].ancestor as usize];
+            let fx = &mut forest[x as usize];
+            if a.label_semi < fx.label_semi {
+                fx.label = a.label;
+                fx.label_semi = a.label_semi;
             }
-            ancestor[x as usize] = ancestor[a];
+            fx.ancestor = a.ancestor;
         }
-        label[v as usize]
+        let fv = forest[v as usize];
+        (fv.label, fv.label_semi)
     };
 
     for w in (1..m).rev() {
+        let mut sw = semi[w];
         for &v in &preds[pred_off[w] as usize..pred_off[w + 1] as usize] {
-            let u = eval(v, &mut ancestor, &mut label, &semi, &mut stack);
-            if semi[u as usize] < semi[w] {
-                semi[w] = semi[u as usize];
-            }
+            let (_, su) = eval(v, &mut forest, &mut stack);
+            sw = sw.min(su);
         }
-        let s = semi[w] as usize;
-        bucket_next[w] = bucket_head[s];
-        bucket_head[s] = w as u32;
+        semi[w] = sw;
+        bucket_next[w] = bucket_head[sw as usize];
+        bucket_head[sw as usize] = w as u32;
         let p = parent[w];
-        ancestor[w] = p; // link(parent(w), w)
+        // link(parent(w), w); w's semi is final now.
+        forest[w] = Node {
+            ancestor: p,
+            label: w as u32,
+            label_semi: sw,
+        };
         let mut v = std::mem::replace(&mut bucket_head[p as usize], NONE);
         while v != NONE {
-            let u = eval(v, &mut ancestor, &mut label, &semi, &mut stack);
-            idom[v as usize] = if semi[u as usize] < semi[v as usize] {
-                u
-            } else {
-                p
-            };
+            let (u, su) = eval(v, &mut forest, &mut stack);
+            idom[v as usize] = if su < semi[v as usize] { u } else { p };
             v = bucket_next[v as usize];
         }
     }

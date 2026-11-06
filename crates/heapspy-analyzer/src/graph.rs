@@ -51,23 +51,55 @@ fn root_rank(kind: RootKind) -> u8 {
     }
 }
 
+/// Exact-match lookup in the sorted object addresses.
+///
+/// A plain binary search over tens of millions of addresses misses the cache
+/// on almost every probe. This keeps every [`BLOCK`]th address in a small
+/// array (n / 64 entries, a few MiB at most, so it stays cached), searches
+/// that first, then searches one 64-entry block of the full array. That is
+/// two or three cache misses per lookup instead of about twenty, and it does
+/// not depend on how addresses are distributed.
+struct AddrIndex {
+    addrs: Vec<u64>,
+    sample: Vec<u64>,
+}
+
+const BLOCK: usize = 64;
+
+impl AddrIndex {
+    fn new(addrs: Vec<u64>) -> AddrIndex {
+        let sample = addrs.iter().step_by(BLOCK).copied().collect();
+        AddrIndex { addrs, sample }
+    }
+
+    #[inline]
+    fn find(&self, a: u64) -> Option<u32> {
+        // Block b holds addrs[b * BLOCK ..]; pick the last block starting <= a.
+        let b = self.sample.partition_point(|&s| s <= a).checked_sub(1)?;
+        let start = b * BLOCK;
+        let end = (start + BLOCK).min(self.addrs.len());
+        self.addrs[start..end]
+            .binary_search(&a)
+            .ok()
+            .map(|i| (start + i) as u32)
+    }
+}
+
 fn limit(what: &'static str) -> crate::Error {
     crate::Error::Snapshot(heapspy_snapshot::Error::LimitExceeded(what))
 }
 
 /// Resolve every edge target and build the graph.
 ///
-/// Targets are resolved by binary search over a copy of the (sorted) object
-/// addresses. The copy is contiguous, so the top levels of the search stay
-/// in cache; it is dropped before returning.
+/// Targets are resolved with [`AddrIndex`]; it is dropped before returning.
 pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     let n = snap.object_count();
     let e = snap.edge_count();
     if n >= NONE as usize {
         return Err(limit("more than 2^32 - 2 objects"));
     }
-    let addrs: Vec<u64> = (0..n as u32).map(|i| snap.object_addr(i)).collect();
-    let find = |a: u64| addrs.binary_search(&a).ok().map(|i| i as u32);
+    let index = AddrIndex::new((0..n as u32).map(|i| snap.object_addr(i)).collect());
+    let find = |a: u64| index.find(a);
 
     // Roots: one super-root edge per distinct root object.
     let mut missing_roots = 0u64;
@@ -128,6 +160,24 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
 mod tests {
     use super::*;
     use heapspy_snapshot::SnapshotBuilder;
+
+    #[test]
+    fn addr_index_matches_binary_search() {
+        let addrs: Vec<u64> = (0..1000u64).map(|i| 0x1000 + i * i * 16 + i).collect();
+        let idx = AddrIndex::new(addrs.clone());
+        for probe in [0, 0x1000, 0x1001, u64::MAX]
+            .into_iter()
+            .chain(addrs.iter().copied())
+            .chain(addrs.iter().map(|a| a + 1))
+        {
+            assert_eq!(
+                idx.find(probe),
+                addrs.binary_search(&probe).ok().map(|i| i as u32),
+                "{probe:#x}"
+            );
+        }
+        assert_eq!(AddrIndex::new(Vec::new()).find(5), None);
+    }
 
     #[test]
     fn resolves_edges_and_counts_misses() {
