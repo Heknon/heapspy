@@ -7,9 +7,12 @@ What runs depends on what the binary has (checked with --help):
 - ``dump --json`` (feature/dump-json-errors): captures are parsed from the dump
   report, and failures carry specific codes. Without it, the server must fall
   back to the stderr line and report failures as ``cli_failed``.
-- ``--allocations`` (feature/alloc-join): the allocation tools run against
-  ``tests/fixtures/heapspy/contract.snapshot`` (a ``.hpy``) and ``contract.hpya``
-  (see the README there). Without it, they must fail with ``allocations_unsupported``.
+- the allocation join (feature/alloc-join, which adds ``flamegraph --allocations``):
+  the allocation tools run against ``tests/fixtures/heapspy/contract.snapshot`` (a
+  ``.hpy``) and ``contract.hpya`` (see the README there). Without it, they must fail
+  with ``allocations_unsupported``. A heapspy with ``analyze --allocations`` but no
+  join (feature/alloc-format alone) still checks the profile, so a corrupt one is
+  ``invalid_allocations`` there.
 
 The live tests start ``/usr/bin/python3.12`` (``HEAPSPY_MCP_REAL_PYTHON``
 overrides it) and ``sleep``, and need ptrace rights on them; they are skipped
@@ -71,7 +74,9 @@ def _help(*args: str) -> str:
 def features() -> dict[str, bool]:
     return {
         "dump_json": "--json" in _help("dump"),
-        "allocations": "--allocations" in _help("analyze"),
+        "allocations_flag": "--allocations" in _help("analyze"),
+        "allocations": "--allocations" in _help("analyze")
+        and "--allocations" in _help("flamegraph"),
     }
 
 
@@ -402,6 +407,6 @@ def test_invalid_allocations_code(real_cli, features, contract_files) -> None:
     bogus.write_bytes(b"definitely not a profile")
     with pytest.raises(HeapspyError) as e:
         real_cli.analyze(snap, top=1, allocations=bogus)
-    expected = "invalid_allocations" if features["allocations"] else "allocations_unsupported"
+    expected = "invalid_allocations" if features["allocations_flag"] else "allocations_unsupported"
     assert e.value.code == expected
     assert e.value.to_dict()["hint"]

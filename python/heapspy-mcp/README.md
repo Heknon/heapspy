@@ -200,7 +200,8 @@ errors whose text is a JSON document:
 - one added by the wrapper: `binary_not_found`, `timeout`, `usage_error` for
   exit status 2, `bad_output` for output that is not JSON, `schema_mismatch`,
   `unexpected_kind`, `cli_failed` for a failure with no error document, and
-  `allocations_unsupported` for a heapspy that has no `--allocations`;
+  `allocations_unsupported` for a heapspy that has no `--allocations`, or
+  takes it but does not join (note `allocations_not_joined`);
 - `capture_refused`, with a `reason`.
 
 Most codes come with a `hint`. For captures: `permission_denied` names the
@@ -407,7 +408,10 @@ Limits, also in each result's `caveats`:
   that line alone is not taken as a sign of an older binary. The same
   fallback applies when a dump exits 0 without a dump document on stdout.
 - `--allocations` and `flamegraph`: a heapspy without them gives
-  `allocations_unsupported`.
+  `allocations_unsupported`. So does one that takes `--allocations` but
+  reports the note `allocations_not_joined` (null `allocations` and
+  `allocated_at`): it checks the profile, so a corrupt profile is still
+  `invalid_allocations`, but it has no allocation data to return.
 - Fields added within schema version 1 (such as `allocations` and
   `allocated_at`) are read as `null` when missing.
 
