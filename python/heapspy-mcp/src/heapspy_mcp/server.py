@@ -12,6 +12,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from . import capture as capture_mod
+from . import processes
 from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
 from .config import Config
@@ -65,6 +67,8 @@ def _guard(fn: Callable[[], T]) -> T:
         return fn()
     except HeapspyError as e:
         raise _tool_error(e.to_dict()) from e
+    except capture_mod.CaptureRefused as e:
+        raise _tool_error(e.to_dict()) from e
     except (InvalidArgument, SnapshotRefError) as e:
         raise _tool_error({"code": "invalid_argument", "message": str(e)}) from e
 
@@ -107,6 +111,76 @@ def build_server(config: Config) -> MCPServer:
     store = SnapshotStore(config.snapshot_dir)
     server = MCPServer("heapspy", instructions=WORKFLOW)
     read_only = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "List Python processes on this machine: pid, name, truncated command line, RSS, "
+            "detected CPython version, and whether the server's allowlist permits capturing it. "
+            "Read-only; does not touch the processes. Use this to find the PID for "
+            "capture_snapshot. Sorted by RSS, largest first."
+        ),
+    )
+    def list_python_processes(
+        name_filter: Annotated[
+            str | None,
+            Field(description="Case-insensitive substring to match in the name or command line."),
+        ] = None,
+        limit: Annotated[int, Field(description="Maximum processes to return (1 to 200).")] = 50,
+    ) -> dict[str, Any]:
+        return processes.list_python_processes(
+            name_filter, limit=S.clamp(limit, 1, processes.MAX_PROCESSES), allow=config.allow
+        )
+
+    @server.tool(
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=False,
+        ),
+        description=(
+            "Capture a heap snapshot. PRIVILEGED: this is the only tool that touches a process. "
+            "Give exactly one of pid (dump a live process; it is paused while the image is "
+            "taken), core_path (Linux ELF core) or minidump_path (Windows full minidump). "
+            "confirm must be true, and you must ask the user before setting it. Live capture "
+            "only works for processes on the allowlist the user configured when starting the "
+            "server, and under its RSS limit; refusals explain which gate failed, and only the "
+            "user can change the gates. capture_contents=true records string/bytes contents "
+            "(may include secrets) and needs --allow-contents on the server. Returns a snapshot "
+            "handle to pass to heap_summary, retaining_path, type_detail and diff_snapshots."
+        ),
+    )
+    def capture_snapshot(
+        confirm: Annotated[
+            bool, Field(description="Must be true. Set it only after the user agreed.")
+        ] = False,
+        pid: Annotated[int | None, Field(description="PID of a live CPython process.")] = None,
+        core_path: Annotated[str | None, Field(description="Path to an ELF core file.")] = None,
+        minidump_path: Annotated[
+            str | None, Field(description="Path to a Windows full-memory minidump.")
+        ] = None,
+        capture_contents: Annotated[
+            bool, Field(description="Also record string contents and dict keys (size-capped).")
+        ] = False,
+        max_str: Annotated[
+            int | None,
+            Field(description="Cap on captured text per string, in characters (with contents)."),
+        ] = None,
+    ) -> dict[str, Any]:
+        return _guard(
+            lambda: capture_mod.capture_snapshot(
+                config,
+                cli,
+                store,
+                pid=pid,
+                core_path=core_path,
+                minidump_path=minidump_path,
+                confirm=confirm,
+                capture_contents=capture_contents,
+                max_str=max_str,
+            )
+        )
 
     @server.tool(
         annotations=read_only,
