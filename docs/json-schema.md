@@ -169,8 +169,9 @@ Retainer (`top_retainers[]`):
 Which objects are listed:
 
 1. Namespaces are never listed: module objects, frame objects, type objects,
-   and the `__dict__` each of them dominates. The variables inside them are
-   listed instead.
+   and the `__dict__` of each, also when something else references that
+   dict (a function's `__globals__` is its module's `__dict__`). The
+   variables inside them are listed instead.
 2. A chain of wrappers that only restate their contents is reported once, at
    the object where the memory accumulates. Starting at an object A, follow
    A's largest dominated child while it still retains at least 90% of A's
