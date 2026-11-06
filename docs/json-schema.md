@@ -335,8 +335,11 @@ labels so that it can be found again in another dump:
   `sys.modules['app'].__dict__['PENDING']...[<index>]`.
 - An object that is not a root but is dominated only by the super-root
   (several roots reach it and none of them owns it, e.g. a list imported
-  into two modules) has no owning site. Its site is `...` followed by the
-  label of the edge it was first reached through, e.g. `...['SHARED']`.
+  into two modules, or a module `__dict__` that is also the `__globals__` of
+  a function a running frame holds) has no owning site. Its site is its
+  shortest path (the `path` that `analyze` reports for it), rendered as a
+  root path with indices generalised, e.g.
+  `sys.modules['app.a'].__dict__['SHARED']`.
 - List and tuple indices are generalised to `[<index>]`, since positions
   shift as a container changes.
 - Only the first 6 levels of the dominator tree get sites (level 1 is the
