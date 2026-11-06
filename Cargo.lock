@@ -172,6 +172,7 @@ name = "heapspy-reader"
 version = "0.1.0"
 dependencies = [
  "heapspy-snapshot",
+ "memmap2",
  "tempfile",
  "thiserror",
 ]

@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | [`elf_core`] | Linux ELF core file (`gcore`, kernel core dump) | stub |
 //! | [`linux_live`] | live Linux process via `process_vm_readv` | stub |
-//! | [`minidump`] | Windows full-memory minidump | stub |
+//! | [`minidump`] | Windows full-memory minidump | implemented |
 //! | [`mem`] | in-memory segments, for tests | implemented |
 //!
 //! # Contract for implementers

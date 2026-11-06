@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 heapspy-snapshot.workspace = true
+memmap2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
