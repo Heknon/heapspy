@@ -47,8 +47,11 @@ pub struct DumpStats {
     pub roots: u64,
     pub bytes_written: u64,
     pub read_errors: u64,
-    /// The snapshot is marked truncated (the walk did not finish).
+    /// The snapshot is marked truncated: the walk did not finish, or the
+    /// image is missing memory its headers describe.
     pub truncated: bool,
+    /// [`MemorySource::missing_bytes`] of the source.
+    pub image_missing_bytes: u64,
 }
 
 /// Read the CPython heap from `source` and write a snapshot to `out`.
@@ -98,7 +101,14 @@ pub fn dump(source: &dyn MemorySource, opts: &DumpOptions, out: &Path) -> Result
     }
 
     let walk = cpython::walk(source, &runtime, opts, &mut writer)?;
-    writer.info_mut().truncated = walk.truncated;
+    // An image that is missing part of its own memory (a cut core) can make
+    // the walk skip objects without noticing, so it is never complete.
+    let image_missing_bytes = source.missing_bytes();
+    let truncated = walk.truncated || image_missing_bytes > 0;
+    writer.info_mut().truncated = truncated;
+    if image_missing_bytes > 0 {
+        writer.add_meta("image.missing_bytes", &image_missing_bytes.to_string())?;
+    }
     let w = writer.finish_to_path(out)?;
     Ok(DumpStats {
         objects: w.objects,
@@ -107,6 +117,7 @@ pub fn dump(source: &dyn MemorySource, opts: &DumpOptions, out: &Path) -> Result
         roots: w.roots,
         bytes_written: w.bytes_written,
         read_errors: walk.read_errors,
-        truncated: walk.truncated,
+        truncated,
+        image_missing_bytes,
     })
 }
