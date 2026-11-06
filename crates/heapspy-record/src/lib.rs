@@ -20,7 +20,10 @@
 //!
 //! # Flow
 //!
-//! 1. [`RecordOptions::validate`].
+//! 1. [`RecordOptions::validate`], then, on Linux, check that the pid
+//!    exists (`NoSuchProcess` otherwise). Nothing reads the target before
+//!    a recorder's probe succeeds, so with the stub recorders a pid that
+//!    is not CPython also ends with `Unimplemented`.
 //! 2. [`select`] the recorders for `--mechanism` on this OS and call
 //!    [`Recorder::probe`] on each in order; the first that succeeds runs.
 //!    `Unsupported`, `PermissionDenied` and `Unimplemented` move on to the

@@ -149,7 +149,7 @@ heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
 heapspy analyze app.hpy --allocations app.hpya
 ```
 
-`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The command and the `--allocations` flag on `analyze`, `query` and `diff` are wired up, and the `.hpya` file format is final for version 1. The recorders and the join are not implemented yet: `record` exits with a "not implemented yet" error, and `--allocations` checks the file against the snapshot but adds no allocation data. See [docs/allocation-sampling.md](docs/allocation-sampling.md).
+`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The command and the `--allocations` flag on `analyze`, `query` and `diff` are wired up, and the `.hpya` file format is final for version 1. The recorders and the join are not implemented yet: `record` exits with a "not implemented yet" error (with `--json`, an error document with code `unimplemented`; a PID with no process gives `no_such_process`), and `--allocations` checks the file against the snapshot but adds no allocation data. See [docs/allocation-sampling.md](docs/allocation-sampling.md).
 
 ### JSON output
 

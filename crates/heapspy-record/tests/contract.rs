@@ -226,6 +226,7 @@ fn record_with_writes_a_profile() {
     let before = now_ns();
     let stats = record_with(&mut rec, &f.target, &f.src, &opts, &AtomicBool::new(false)).unwrap();
     assert_eq!(stats.recorder, "fake");
+    assert_eq!(stats.python, PythonVersion::new(3, 13, 1));
     assert_eq!(stats.samples, 4);
     // `main` is past max_frames everywhere, so only `load` and the bad address.
     assert_eq!(stats.codes, 2);
@@ -390,4 +391,19 @@ fn record_is_unimplemented_on_this_host() {
         record(&bad, &AtomicBool::new(false)),
         Err(Error::InvalidOption(_))
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn record_checks_the_pid_before_probing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("a.hpya");
+    // Above the default pid_max (4194304), so no process has it.
+    let opts = RecordOptions::new(999_999_999, Duration::from_secs(1), &out);
+    let err = record(&opts, &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        matches!(err, Error::Reader(heapspy_reader::Error::NoSuchProcess(_))),
+        "{err}"
+    );
+    assert!(!out.exists());
 }

@@ -70,6 +70,121 @@ fn record_is_not_implemented_yet() {
     assert!(!out_path.exists());
 }
 
+/// `record --json ARGS` with `-o` in a fresh directory. Returns the exit
+/// status, the parsed stdout (`Null` when empty) and whether the profile
+/// exists afterwards.
+fn record_json(args: &[&str]) -> (Option<i32>, serde_json::Value, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("a.hpya");
+    let mut argv = vec!["record", "--json", "-o", out_path.to_str().unwrap()];
+    argv.extend_from_slice(args);
+    let out = heapspy(&argv);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc = if stdout.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"))
+    };
+    (out.status.code(), doc, out_path.exists())
+}
+
+fn error_code(doc: &serde_json::Value) -> &str {
+    assert_eq!(doc["schema_version"], 1, "{doc}");
+    assert_eq!(doc["kind"], "error", "{doc}");
+    doc["error"]["code"].as_str().unwrap()
+}
+
+/// A child process that is not CPython, killed on drop.
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn sleeper() -> Child {
+    Child(Command::new("sleep").arg("60").spawn().expect("run sleep"))
+}
+
+#[test]
+fn record_json_reports_unimplemented() {
+    let pid = std::process::id().to_string();
+    let (status, doc, written) = record_json(&["--pid", &pid, "--duration", "1s"]);
+    assert_eq!(status, Some(1));
+    assert_eq!(error_code(&doc), "unimplemented");
+    let msg = doc["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("cannot record pid"), "{msg}");
+    if cfg!(target_os = "linux") {
+        // `auto` tries eBPF first; its stub's error is the one reported.
+        assert!(msg.contains("eBPF"), "{msg}");
+    }
+    assert!(!written);
+}
+
+/// The stub recorders fail before anything reads the target, so a pid that
+/// is not CPython is not detected yet: the error is `unimplemented`, not
+/// `not_python`. This test pins that order; it changes when a recorder
+/// attaches.
+#[cfg(unix)]
+#[test]
+fn record_json_on_a_non_python_pid_is_unimplemented() {
+    let child = sleeper();
+    let pid = child.0.id().to_string();
+    let (status, doc, written) = record_json(&["--pid", &pid, "--duration", "1s"]);
+    assert_eq!(status, Some(1));
+    assert_eq!(error_code(&doc), "unimplemented");
+    assert!(!written);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn record_json_missing_pid() {
+    // Above the default pid_max (4194304), so no process has it.
+    let (status, doc, written) = record_json(&["--pid", "999999999", "--duration", "1s"]);
+    assert_eq!(status, Some(1));
+    assert_eq!(error_code(&doc), "no_such_process");
+    assert!(!written);
+}
+
+#[test]
+fn record_json_option_errors() {
+    let pid = std::process::id().to_string();
+    let pid = pid.as_str();
+    for args in [
+        &["--pid", pid, "--duration", "0s"][..],
+        &["--pid", pid, "--duration", "1s", "--max-frames", "0"],
+        &["--pid", "0", "--duration", "1s"],
+    ] {
+        let (status, doc, written) = record_json(args);
+        assert_eq!(status, Some(1), "{args:?}");
+        assert_eq!(error_code(&doc), "invalid_argument", "{args:?}");
+        assert!(!written);
+    }
+    // A mechanism of the other OS.
+    let other = if cfg!(windows) { "ebpf" } else { "etw" };
+    let (status, doc, _) = record_json(&["--pid", pid, "--duration", "1s", "--mechanism", other]);
+    assert_eq!(status, Some(1));
+    assert_eq!(error_code(&doc), "unsupported");
+}
+
+#[test]
+fn record_json_usage_errors_exit_2_without_json() {
+    for args in [
+        &["--pid", "1"][..],
+        &["--pid", "1", "--duration", "later"],
+        &["--pid", "1", "--duration", "1s", "--events", "heap"],
+        &["--duration", "1s"],
+    ] {
+        let (status, doc, written) = record_json(args);
+        assert_eq!(status, Some(2), "{args:?}");
+        assert_eq!(doc, serde_json::Value::Null, "{args:?}");
+        assert!(!written);
+    }
+}
+
 #[test]
 fn record_argument_errors() {
     // Missing --duration and malformed values are usage errors.

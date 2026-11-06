@@ -40,7 +40,7 @@ impl Command {
             Command::Query(a) => a.json,
             Command::Diff(a) => a.json,
             Command::Flamegraph(_) => false,
-            Command::Record(_) => false,
+            Command::Record(a) => a.json,
         }
     }
 }
@@ -162,6 +162,10 @@ pub struct RecordArgs {
     /// auto, ebpf, ptrace (Linux), etw, debugger (Windows).
     #[arg(long, value_name = "MECH", default_value = "auto")]
     pub mechanism: heapspy_record::MechanismChoice,
+    /// Print a JSON report (schema version 1) on stdout. The summary lines
+    /// on stderr are printed either way.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

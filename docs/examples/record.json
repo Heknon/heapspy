@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "kind": "record",
+  "path": "app.hpya",
+  "pid": 1234,
+  "python_version": "3.12.4",
+  "duration_ms": 60004,
+  "mechanisms": [
+    "ebpf"
+  ],
+  "sampling": {
+    "events": [
+      "arena",
+      "large_object"
+    ],
+    "byte_interval": 524288,
+    "max_frames": 64
+  },
+  "samples": 1932,
+  "bytes_written": 81920,
+  "overhead": {
+    "samples_taken": 1932,
+    "samples_dropped": 0,
+    "probe_hits": 1210443,
+    "total_pause_ns": 0
+  },
+  "truncated": false,
+  "then_dump": "app.hpy"
+}

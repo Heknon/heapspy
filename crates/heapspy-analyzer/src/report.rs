@@ -84,6 +84,10 @@ kind_marker!(
     DumpKind = "dump"
 );
 kind_marker!(
+    /// `"kind": "record"`
+    RecordKind = "record"
+);
+kind_marker!(
     /// `"kind": "error"`
     ErrorKind = "error"
 );
@@ -613,6 +617,38 @@ pub struct DumpImage {
     /// Bytes of memory the image's own headers describe but the file does
     /// not contain (a core cut short). 0 when complete or unknown.
     pub missing_bytes: u64,
+}
+
+// ---------------------------------------------------------------- record
+
+/// `heapspy record --json`, printed after the profile (and the
+/// `--then-dump` snapshot, if asked for) is written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordReport {
+    pub schema_version: SchemaVersion,
+    pub kind: RecordKind,
+    /// The allocation profile written, as given with `-o`.
+    pub path: String,
+    /// Process recorded.
+    pub pid: u32,
+    /// CPython version found in the target, `sys.version` style.
+    pub python_version: String,
+    /// Measured length of the recording window, in milliseconds.
+    pub duration_ms: u64,
+    /// Mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"`.
+    pub mechanisms: Vec<String>,
+    /// Same as `allocations.sampling` in the analyze report.
+    pub sampling: SamplingInfo,
+    /// Samples written to the profile.
+    pub samples: u64,
+    /// Size of the profile file.
+    pub bytes_written: u64,
+    /// Same as `allocations.overhead` in the analyze report.
+    pub overhead: OverheadInfo,
+    /// Recording stopped early or lost samples the overhead does not count.
+    pub truncated: bool,
+    /// The `--then-dump` snapshot written, as given; `null` without it.
+    pub then_dump: Option<String>,
 }
 
 // ---------------------------------------------------------------- error

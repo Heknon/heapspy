@@ -1,7 +1,7 @@
 # JSON report schema, version 1
 
-`heapspy dump`, `analyze`, `query` and `diff` print a JSON document on
-stdout when given `--json`. This is the machine interface that tooling (including
+`heapspy dump`, `record`, `analyze`, `query` and `diff` print a JSON
+document on stdout when given `--json`. This is the machine interface that tooling (including
 `heapspy-mcp`) binds to. The Rust definitions are in
 `crates/heapspy-analyzer/src/report.rs`. Complete example documents are in
 `docs/examples/`; a test (`crates/heapspy-analyzer/tests/examples.rs`) checks
@@ -10,8 +10,8 @@ that each example matches the structs field for field.
 ## Rules
 
 - Every document has `"schema_version": 1` and a `"kind"`:
-  `"dump"`, `"analyze"`, `"type_query"`, `"retaining_path"`, `"diff"` or
-  `"error"`.
+  `"dump"`, `"record"`, `"analyze"`, `"type_query"`, `"retaining_path"`,
+  `"diff"` or `"error"`.
 - Within version 1, fields are only added, never removed or redefined.
   Consumers must ignore fields they do not know. A breaking change means
   `schema_version: 2`.
@@ -164,6 +164,47 @@ wrote OUT: N objects, N edges, N roots, N bytes (truncated)
 | `image.missing_bytes` | integer | bytes of memory the image's headers describe but the file does not contain (a core cut short); 0 when complete or not known |
 | `pause_ms` | float, nullable | how long a live target was stopped, in milliseconds; `null` for cores and minidumps, and on Windows, where the pause is inside the minidump write and not measured |
 | `notes` | array of Note | |
+
+## `record`
+
+`heapspy record --pid PID --duration D -o OUT.hpya [--then-dump SNAP] --json`.
+Added in M7. Example: `docs/examples/record.json`.
+
+Printed after the allocation profile (and the `--then-dump` snapshot, when
+asked for) has been written. The summary lines on stderr are printed with or
+without `--json`.
+
+The recorders are not implemented yet, so no build prints this document
+today. Every valid request fails: `record --json` prints an
+[error document](#error) and exits with status 1. The checks run in this
+order, and the first that fails gives the code:
+
+1. option values (`--duration 0s`, `--max-frames 0`, `--then-dump` equal to
+   `-o`): `invalid_argument`
+2. on Linux, whether a process has the PID: `no_such_process`
+3. the recorders for `--mechanism`, in order: `unsupported` when the
+   mechanism is not available on this OS, otherwise `unimplemented` from
+   the first stub (eBPF on Linux)
+
+The target's memory is only read after a recorder has attached, so today a
+PID that is not CPython also fails with `unimplemented`, not `not_python`.
+No profile file is written on failure.
+
+| field | type | meaning |
+|---|---|---|
+| `schema_version` | 1 | |
+| `kind` | `"record"` | |
+| `path` | string | the allocation profile written, as given with `-o` |
+| `pid` | integer | the process recorded |
+| `python_version` | string | CPython version found in the target, `sys.version` style |
+| `duration_ms` | integer | measured length of the recording window, in milliseconds |
+| `mechanisms` | array of string | mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"` |
+| `sampling` | object | as `allocations.sampling` in [Allocations](#allocations-allocations): `events`, `byte_interval`, `max_frames` |
+| `samples` | integer | samples written to the profile |
+| `bytes_written` | integer | size of the profile file |
+| `overhead` | object | as `allocations.overhead`: `samples_taken`, `samples_dropped`, `probe_hits`, `total_pause_ns` |
+| `truncated` | bool | recording stopped early or lost samples that `overhead` does not count |
+| `then_dump` | string, nullable | the `--then-dump` snapshot written, as given; `null` without `--then-dump` |
 
 ## `analyze`
 
@@ -515,19 +556,19 @@ status 1. Example: `docs/examples/error.json`.
 
 | code | meaning |
 |---|---|
-| `unimplemented` | the command or feature is not built yet |
-| `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`) |
+| `unimplemented` | the command or feature is not built yet (today every valid `record`, see [`record`](#record)) |
+| `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`), or a `record` option is out of range (`--duration 0s`, `--max-frames 0`) |
 | `not_found` | the requested address or type is not in the snapshot |
 | `invalid_snapshot` | the file is not a snapshot, is truncated or corrupt, or has an unsupported format version |
 | `invalid_allocations` | the `--allocations` file is not an allocation profile, is truncated or corrupt, or has an unsupported format version |
 | `io` | a file could not be read or written (missing core file, unreadable snapshot, full disk) |
-| `permission_denied` | reading the target process was refused: ptrace `EPERM` on Linux (needs root or `CAP_SYS_PTRACE`, see `kernel.yama.ptrace_scope`), access denied on Windows (needs `SeDebugPrivilege` or the same user) |
-| `no_such_process` | dump: no process has that PID, or it exited before it could be stopped |
-| `not_python` | dump: no CPython runtime in the target (no module exports `_PyRuntime`, or it could not be read) |
-| `unsupported_python` | dump: CPython was found, but its version or build is refused (outside 3.12 to 3.14, free-threaded, or debug) |
+| `permission_denied` | reading the target process was refused: ptrace `EPERM` on Linux (needs root or `CAP_SYS_PTRACE`, see `kernel.yama.ptrace_scope`), access denied on Windows (needs `SeDebugPrivilege` or the same user). For `record`, also a recorder that lacks its privileges (`CAP_BPF` and `CAP_PERFMON` for eBPF) |
+| `no_such_process` | dump, record: no process has that PID, or it exited before it could be stopped |
+| `not_python` | dump, record: no CPython runtime in the target (no module exports `_PyRuntime`, or it could not be read) |
+| `unsupported_python` | dump, record: CPython was found, but its version or build is refused (outside 3.12 to 3.14, free-threaded, or debug) |
 | `invalid_image` | dump: the core or minidump is not one heapspy reads (not an ELF core or minidump, corrupt, 32-bit, big-endian, another CPU), or memory the runtime points to is not in the image |
 | `truncated_image` | dump: the image file ends before data its own headers describe (cut short by a size limit or a full disk), and the dump could not go on. A core cut only inside memory segments can still give a snapshot, marked `truncated`. A minidump cut inside data that only a stream refers to (a module or thread name) is reported as `invalid_image` |
-| `unsupported` | dump: the request cannot be done here (dumping heapspy itself, a live process on a platform without a live backend, a target that keeps creating threads while it is being stopped) |
+| `unsupported` | dump, record: the request cannot be done here (dumping heapspy itself, a live process on a platform without a live backend, a target that keeps creating threads while it is being stopped; for `record`, a `--mechanism` this OS does not have, or a recording larger than the profile format holds) |
 | `internal` | a bug in heapspy |
 
 The codes are stable; `error.message` is for people and may change. New

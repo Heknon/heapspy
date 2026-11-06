@@ -8,7 +8,7 @@ use heapspy_alloc::{
     AllocWriter, LineTableFormat, Mechanism, Mechanisms, Overhead, ProfileInfo, FORMAT_VERSION,
 };
 use heapspy_reader::{DumpOptions, DumpStats, MemorySource, SourceSpec};
-use heapspy_snapshot::Os;
+use heapspy_snapshot::{Os, PythonVersion};
 
 use crate::error::{Error, Result};
 use crate::options::{MechanismChoice, RecordOptions};
@@ -21,6 +21,8 @@ use crate::{linux_ebpf, linux_ptrace, live, windows};
 pub struct RecordStats {
     /// [`Recorder::name`] of the recorder that ran.
     pub recorder: &'static str,
+    /// CPython version found in the target (as written to the header).
+    pub python: PythonVersion,
     /// Mechanisms that actually ran (as written to the header).
     pub mechanisms: Mechanisms,
     pub samples: u64,
@@ -88,6 +90,7 @@ pub fn select(choice: MechanismChoice, os: Option<Os>) -> Result<Vec<Box<dyn Rec
 /// the `--then-dump` snapshot if asked. `stop` ends the window early.
 pub fn record(opts: &RecordOptions, stop: &AtomicBool) -> Result<RecordStats> {
     opts.validate()?;
+    check_exists(opts.pid)?;
     let mut first_err: Option<Error> = None;
     let mut chosen = None;
     for r in select(opts.mechanism, host_os())? {
@@ -181,6 +184,7 @@ pub fn record_with(
     let ws = w.finish_to_path(&opts.output)?;
     Ok(RecordStats {
         recorder: rec.name(),
+        python: target.runtime.version,
         mechanisms,
         samples: ws.samples,
         frames: ws.frames,
@@ -192,6 +196,18 @@ pub fn record_with(
         elapsed,
         snapshot: None,
     })
+}
+
+/// Fail with `NoSuchProcess` before any recorder is probed when no process
+/// has `pid`. Checked on Linux only (`/proc/<pid>`); on Windows the
+/// recorder's probe or [`live::open`] reports it.
+fn check_exists(pid: u32) -> Result<()> {
+    if cfg!(target_os = "linux") && !Path::new(&format!("/proc/{pid}")).exists() {
+        return Err(Error::Reader(heapspy_reader::Error::NoSuchProcess(
+            format!("no process with pid {pid}"),
+        )));
+    }
+    Ok(())
 }
 
 /// Take a snapshot of `pid` right away (the `--then-dump` step).
