@@ -15,6 +15,8 @@ EXPECTED_TOOLS = {
     "diff_snapshots",
     "map_to_source",
     # process diagnostics (heapspy_mcp.system)
+    "find_processes",
+    "scan_processes",
     "process_cpu",
     "hw_counters",
     "snapshot_process_metrics",

@@ -24,6 +24,7 @@ from ..processes import matches_allowlist, version_from_exe, version_from_maps_t
 from . import diagnose as dg
 from . import perf, views, windows
 from . import procfs as pf
+from . import search as srch
 from .sampling import ProcessGone, identify
 
 T = TypeVar("T")
@@ -91,7 +92,7 @@ async def _guard(fn: Callable[[], Awaitable[T]]) -> T:
         raise _tool_error(e.to_dict()) from e
     except ProcessGone as e:
         raise _tool_error({"code": "no_such_process", "message": str(e)}) from e
-    except windows.SnapshotError as e:
+    except (srch.SearchError, windows.SnapshotError) as e:
         raise _tool_error({"code": "invalid_argument", "message": str(e)}) from e
 
 
@@ -170,6 +171,110 @@ def register(server: MCPServer, config: Config) -> None:
         if m.hw is None:
             return None
         return {**perf.derived(m.hw, m.window_s), "counters": m.hw}
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Rank every process this server can see (any language) by one measured metric, "
+            "with optional filters: name/exe glob, cmdline substring or regex, user, pids, "
+            "parent_pid (with descendants), cgroup path substring, container_id prefix, pod_uid, "
+            "/proc state letters, is_python. Rates are measured over window_s in one pass over "
+            "all candidates. Each row has its metrics, cgroup, pod and container; command lines "
+            "are redacted and truncated. Processes that exit or cannot be read are skipped and "
+            "counted. Read-only; no allowlist needed."
+        ),
+    )
+    async def find_processes(
+        sort_by: Annotated[
+            str | None,
+            Field(description=f"One of: {', '.join(srch.METRICS)}. Default cpu_percent_on_cpu."),
+        ] = None,
+        name: Annotated[str | None, Field(description="Glob on process name or exe.")] = None,
+        cmdline: Annotated[str | None, Field(description="Case-insensitive substring.")] = None,
+        cmdline_regex: Annotated[str | None, Field(description="Python regex.")] = None,
+        user: Annotated[str | None, Field(description="User name or numeric uid.")] = None,
+        pids: Annotated[list[int] | None, Field(description="Only these pids.")] = None,
+        parent_pid: Annotated[int | None, Field(description="Children of this pid.")] = None,
+        include_descendants: Annotated[
+            bool, Field(description="With parent_pid: all descendants, not only children.")
+        ] = True,
+        cgroup: Annotated[str | None, Field(description="Substring of the cgroup path.")] = None,
+        container_id: Annotated[str | None, Field(description="Container id prefix.")] = None,
+        pod_uid: Annotated[str | None, Field(description="Kubernetes pod UID.")] = None,
+        state: Annotated[
+            str | None, Field(description="/proc state letters to keep, e.g. D or RD.")
+        ] = None,
+        is_python: Annotated[bool | None, Field(description="Keep only (non-)Python.")] = None,
+        include_kernel_threads: bool = False,
+        descending: bool = True,
+        limit: Annotated[int, Field(description=f"Rows (1 to {srch.MAX_LIMIT}).")] = 20,
+        window_s: Annotated[
+            float, Field(description="Window for rate metrics; 0 for an instant listing.")
+        ] = 1.0,
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            f = srch.Filters(
+                name=name,
+                cmdline=cmdline,
+                cmdline_regex=cmdline_regex,
+                user=user,
+                pids=pids,
+                parent_pid=parent_pid,
+                include_descendants=include_descendants,
+                cgroup=cgroup,
+                container_id=container_id,
+                pod_uid=pod_uid,
+                state=state,
+                is_python=is_python,
+                include_kernel_threads=include_kernel_threads,
+            )
+            return await srch.find_processes(
+                d.proc_root,
+                f,
+                sort_by=sort_by,
+                descending=descending,
+                limit=max(1, min(limit, srch.MAX_LIMIT)),
+                window_s=window_s,
+                window_cap=d.max_window_s,
+                cgroup_root=d.cgroup_root,
+            )
+
+        return await _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "One pass over every process: the top processes for each metric (outliers by "
+            "metric: CPU, RSS and its growth, threads, context switches, run-queue wait, "
+            "iowait, open fds and fd limit use, read/write bytes, uptime, cgroup throttling), "
+            "and factual conditions with raw values: threads in disk wait for the whole "
+            "window, zombies by parent, fd use above a stated share of RLIMIT_NOFILE, RSS that "
+            "grew on every sample, cgroups throttled in the window, OOM-kill counters. Use it "
+            "when you do not yet know which process to look at. Read-only; no allowlist needed."
+        ),
+    )
+    async def scan_processes(
+        window_s: WindowArg = DEFAULT_WINDOW,
+        limit_per_metric: Annotated[
+            int, Field(description=f"Rows per metric (1 to {srch.MAX_PER_METRIC}).")
+        ] = 5,
+        fd_threshold_pct: Annotated[
+            float, Field(description="Report fd use above this % of the soft limit.")
+        ] = srch.DEFAULT_FD_THRESHOLD_PCT,
+        include_kernel_threads: bool = False,
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            return await srch.scan_processes(
+                d.proc_root,
+                window_s=window_s,
+                window_cap=d.max_window_s,
+                limit_per_metric=max(1, min(limit_per_metric, srch.MAX_PER_METRIC)),
+                fd_threshold_pct=fd_threshold_pct,
+                include_kernel_threads=include_kernel_threads,
+                cgroup_root=d.cgroup_root,
+            )
+
+        return await _guard(body)
 
     @server.tool(
         annotations=read_only,

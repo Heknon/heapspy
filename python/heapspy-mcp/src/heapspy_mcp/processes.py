@@ -69,7 +69,9 @@ def _looks_like_python(name: str | None, exe: str | None) -> bool:
 
 
 def describe_cmdline(cmdline: list[str] | None) -> str:
-    text = " ".join(cmdline or [])
+    from .system.redact import redact_args  # secret-looking values become <redacted>
+
+    text = " ".join(redact_args(cmdline or []))
     return text if len(text) <= MAX_CMDLINE else text[: MAX_CMDLINE - 3] + "..."
 
 
