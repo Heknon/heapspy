@@ -14,6 +14,7 @@ EXPECTED_TOOLS = {
     "type_detail",
     "diff_snapshots",
     "map_to_source",
+    "allocation_sites",
     # process diagnostics (heapspy_mcp.system)
     "find_processes",
     "scan_processes",
@@ -45,7 +46,8 @@ async def test_workflow_resource_and_prompt(make_config) -> None:
     async with Client(build_server(make_config())) as client:
         resource = await client.read_resource("heapspy://workflow")
         text = resource.contents[0].text
-        assert "No allocation history" in text
+        assert "allocation profile (.hpya)" in text
+        assert "heapspy record` is not implemented" in text
         assert "Native memory" in text
         prompt = await client.get_prompt("investigate_memory", {"target": "pid 1234"})
         assert "pid 1234" in prompt.messages[0].content.text

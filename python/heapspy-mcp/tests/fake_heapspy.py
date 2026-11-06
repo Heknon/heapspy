@@ -1,13 +1,23 @@
 """A stand-in for the heapspy binary, driven by argv and environment variables.
 
-It prints the documents from ``docs/examples`` (adjusted to the arguments)
-the way ``heapspy ... --json`` would.
+It prints the documents from ``docs/examples`` and ``tests/fixtures/heapspy``
+(adjusted to the arguments) the way ``heapspy ... --json`` would.
 
 Environment:
     FAKE_HEAPSPY_EXAMPLES  directory holding the example JSON documents (required)
+    FAKE_HEAPSPY_FIXTURES  directory holding examples from unmerged heapspy branches
+                           (needed for dump --json and --allocations output)
     FAKE_HEAPSPY_MODE      ok (default), error:<code>, bad_schema, not_json, timeout,
-                           usage, wrong_kind, crash, big, error_exit0,
-                           dump_hang (dump writes a temporary file and hangs)
+                           usage, wrong_kind, crash, big, error_exit0;
+                           for dump also dump_fail (text error, no document),
+                           dump_no_file, dump_hang (writes a temporary file and
+                           hangs), dump_truncated, dump_no_json (exit 0, no
+                           document), dump_usage (usage error naming --json in its
+                           Usage line), old_binary (a heapspy without dump --json,
+                           --allocations or flamegraph);
+                           with --allocations also alloc_not_linked (a profile from
+                           another pid); a profile path containing "corrupt" fails with
+                           invalid_allocations, a missing one with io
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
 """
 
@@ -26,6 +36,12 @@ MODE = os.environ.get("FAKE_HEAPSPY_MODE", "ok")
 
 def load(name: str) -> dict:
     return json.loads((EXAMPLES / f"{name}.json").read_text())
+
+
+def load_fixture(name: str) -> dict:
+    """An example from a heapspy branch not merged here (tests/fixtures/heapspy)."""
+    fixtures = Path(os.environ["FAKE_HEAPSPY_FIXTURES"])
+    return json.loads((fixtures / f"{name}.json").read_text())
 
 
 def emit(doc: dict, status: int = 0) -> None:
@@ -85,6 +101,157 @@ def big_analyze() -> dict:
     return doc
 
 
+def usage_error(flag: str, usage: str) -> None:
+    """clap's message for an argument this heapspy version does not know."""
+    print(
+        f"error: unexpected argument '{flag}' found\n\nUsage: {usage}\n\n"
+        "For more information, try '--help'.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def dump(args: list[str]) -> None:
+    out = opt(args, "output")
+    if not out:
+        sys.exit(2)
+    json_out = "--json" in args
+    if json_out and MODE == "old_binary":
+        usage_error("--json", "heapspy dump --output <OUT> <--pid <PID>|--core <PATH>>")
+    if MODE == "dump_usage":
+        # A newer heapspy prints --json in the Usage line of every dump usage error.
+        print(
+            "error: the following required arguments were not provided:\n"
+            "  --capture-contents\n\n"
+            "Usage: heapspy dump --output <OUT> --capture-contents --json --max-str <N> "
+            "<--pid <PID>|--core <PATH>|--minidump <PATH>>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if MODE == "dump_fail":
+        print("heapspy: error: cannot open pid 1: permission denied", file=sys.stderr)
+        sys.exit(1)
+    if MODE == "dump_no_file":
+        sys.exit(0)
+    if MODE == "dump_hang":
+        # Like heapspy's writer: a temporary file next to the output, then a hang.
+        (Path(out).parent / ".tmpAbC123").write_bytes(b"partial")
+        time.sleep(30)
+    truncated = MODE == "dump_truncated"
+    Path(out).write_bytes(b"HPYSNAP\0" + b"\0" * 120)
+    trunc = " (truncated)" if truncated else ""
+    print(f"wrote {out}: 10 objects, 20 edges, 3 roots, 128 bytes{trunc}", file=sys.stderr)
+    if not json_out or MODE in ("old_binary", "dump_no_json"):
+        sys.exit(0)
+    doc = load_fixture("dump")
+    doc["path"] = out
+    for kind in ("pid", "core", "minidump"):
+        ref = opt(args, kind)
+        if ref is not None:
+            doc["source"] = {"kind": kind, "ref": ref}
+            if kind != "pid":
+                doc["pause_ms"] = None
+    doc["contents_captured"] = "--capture-contents" in args
+    doc.update(objects=10, edges=20, roots=3, bytes_written=128)
+    if truncated:
+        doc["truncated"] = True
+        doc["image"]["missing_bytes"] = 4096
+        doc["notes"] = [
+            {"code": "truncated_snapshot", "message": "The snapshot is marked truncated."},
+            {"code": "image_incomplete", "message": "The image is missing 4096 bytes."},
+            *doc["notes"],
+        ]
+    emit(doc)
+
+
+def check_profile(args: list[str]) -> str | None:
+    """The --allocations path, after the checks heapspy makes when opening it."""
+    profile = opt(args, "allocations")
+    if profile is None:
+        return None
+    if MODE == "old_binary":
+        usage_error("--allocations", f"heapspy {args[0]} <SNAP>")
+    if "corrupt" in profile:
+        fail("invalid_allocations", f"{profile} is not an allocation profile")
+    if not Path(profile).is_file():
+        fail("io", f"cannot open {profile}: No such file or directory (os error 2)")
+    return profile
+
+
+NOT_LINKED_NOTES = [
+    {
+        "code": "allocations_pid_mismatch",
+        "message": "The allocation profile was recorded from pid 999, the snapshot from 1234.",
+    },
+    {
+        "code": "allocations_not_linked",
+        "message": "No object was linked to an allocation sample.",
+    },
+]
+
+
+def analyze_with_allocations(args: list[str], profile: str, top: int) -> dict:
+    doc = load_fixture("analyze_allocations")
+    doc["snapshot"]["path"] = args[1]
+    doc["allocations"]["path"] = profile
+    doc["top_retainers"] = doc["top_retainers"][:top]
+    doc["type_histogram"] = doc["type_histogram"][:top]
+    doc["allocations"]["top_stacks"] = doc["allocations"]["top_stacks"][:top]
+    if MODE == "alloc_not_linked":
+        cov = doc["allocations"]["coverage"]
+        for k in cov:
+            cov[k] = 0
+        for s in doc["allocations"]["top_stacks"]:
+            s["linked_bytes"] = s["exact_linked_bytes"] = 0
+        for r in doc["top_retainers"]:
+            r["allocated_at"] = {
+                "linked_objects": 0,
+                "linked_bytes": 0,
+                "exact_linked_bytes": 0,
+                "stacks": [],
+                "approximate": False,
+            }
+        doc["notes"] = [*doc["notes"], *NOT_LINKED_NOTES]
+    if MODE == "big":
+        stack = doc["allocations"]["top_stacks"][0]
+        frame = stack["frames"][0]
+        many = [{**frame, "function": "f" * 1000, "file": "x/" * 400 + "y.py"}] * 200
+        doc["allocations"]["top_stacks"] = [
+            {**copy.deepcopy(stack), "rank": i + 1, "frames": many} for i in range(top)
+        ]
+        at = doc["top_retainers"][0]["allocated_at"]
+        at["stacks"] = [{**copy.deepcopy(at["stacks"][0]), "frames": many}] * 5
+    return doc
+
+
+def flamegraph(args: list[str]) -> None:
+    """flamegraph --allocations FILE --folded, from the fixture's top stacks."""
+    if MODE == "old_binary":
+        print(
+            "error: unrecognized subcommand 'flamegraph'\n\nUsage: heapspy <COMMAND>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    profile = opt(args, "allocations")
+    if profile is None or "--folded" not in args:
+        sys.exit(2)
+    if "corrupt" in profile:
+        print(f"heapspy: error: {profile} is not an allocation profile", file=sys.stderr)
+        sys.exit(1)
+    doc = load_fixture("analyze_allocations")
+    lines = []
+    for stack in doc["allocations"]["top_stacks"]:
+        frames = [f"{f['function']} ({f['location']})" for f in reversed(stack["frames"])]
+        lines.append(f"{';'.join(frames)} {stack['estimated_bytes']}")
+    if MODE == "big":
+        lines = [f"main (app/main.py:1);f{i} (app/f.py:{i}) {i + 1}" for i in range(5000)]
+    # A stack without Python frames, and one split across two lines (merged by the reader).
+    lines.append("[no Python stack] 4096")
+    lines.append(lines[0].rsplit(" ", 1)[0] + " 1024")
+    print("\n".join(sorted(lines)))
+    sys.exit(0)
+
+
 def main() -> None:
     log = os.environ.get("FAKE_HEAPSPY_LOG")
     if log:
@@ -111,27 +278,17 @@ def main() -> None:
 
     cmd = args[0] if args else ""
     if cmd == "dump":
-        out = opt(args, "output")
-        if not out:
-            sys.exit(2)
-        if MODE == "dump_fail":
-            print("heapspy: error: cannot open pid 1: permission denied", file=sys.stderr)
-            sys.exit(1)
-        if MODE == "dump_no_file":
-            sys.exit(0)
-        if MODE == "dump_hang":
-            # Like heapspy's writer: a temporary file next to the output, then a hang.
-            (Path(out).parent / ".tmpAbC123").write_bytes(b"partial")
-            time.sleep(30)
-        Path(out).write_bytes(b"HPYSNAP\0" + b"\0" * 120)
-        trunc = " (truncated)" if MODE == "dump_truncated" else ""
-        print(f"wrote {out}: 10 objects, 20 edges, 3 roots, 128 bytes{trunc}", file=sys.stderr)
-        sys.exit(0)
+        dump(args)
+    if cmd == "flamegraph":
+        flamegraph(args)
 
     if "--json" not in args:
         sys.exit(2)
 
-    if cmd == "analyze":
+    profile = check_profile(args)
+    if cmd == "analyze" and profile is not None:
+        doc = analyze_with_allocations(args, profile, int(opt(args, "top") or 20))
+    elif cmd == "analyze":
         doc = big_analyze() if MODE == "big" else load("analyze")
         doc["snapshot"]["path"] = args[1]
         top = int(opt(args, "top") or 20)
@@ -144,6 +301,20 @@ def main() -> None:
         doc = load("type_query")
         doc["snapshot"]["path"] = args[1]
         doc["query"] = t
+        if profile is not None:
+            # As analyze_allocations' first retainer; query reports have no top_stacks.
+            at = copy.deepcopy(load_fixture("analyze_allocations")["top_retainers"][0])
+            at = at["allocated_at"]
+            for stack in at["stacks"]:
+                stack["top_stack_rank"] = None
+            for inst in doc["top_instances"]:
+                inst["allocated_at"] = at
+            sampled = load_fixture("analyze_allocations")["notes"][-1]
+            doc["notes"] = [*doc["notes"], sampled]
+            if MODE == "alloc_not_linked":
+                for inst in doc["top_instances"]:
+                    inst["allocated_at"] = {**at, "linked_objects": 0, "stacks": []}
+                doc["notes"] = [*doc["notes"], *NOT_LINKED_NOTES]
         if MODE == "big":
             inst = doc["top_instances"][0]
             doc["top_instances"] = [

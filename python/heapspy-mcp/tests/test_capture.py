@@ -145,8 +145,15 @@ async def test_live_capture_allowed_by_pid(
     assert out["stats"]["objects"] == 10
     assert out["contents_captured"] is False
     staged = snapshot_dir / f".{out['snapshot']}.partial" / path.name
-    assert argv_log()[-1] == ["dump", f"--pid={child_python.pid}", f"--output={staged}"]
+    assert argv_log()[-1] == [
+        "dump",
+        f"--pid={child_python.pid}",
+        f"--output={staged}",
+        "--json",
+    ]
     assert sorted(p.name for p in snapshot_dir.iterdir()) == [path.name]
+    assert out["report"] == "json"
+    assert out["stats"]["pause_ms"] == 182.417
     messages = [r.getMessage() for r in caplog.records if r.name == "heapspy_mcp.capture"]
     assert any("capture start" in m and out["snapshot"] in m for m in messages)
     assert any("capture done" in m for m in messages)
@@ -178,7 +185,7 @@ async def test_contents_capture_when_permitted_is_logged(
     )
     assert not err, out
     assert out["contents_captured"] is True
-    assert argv_log()[-1][-2:] == ["--capture-contents", "--max-str=64"]
+    assert argv_log()[-1][-3:] == ["--capture-contents", "--max-str=64", "--json"]
     assert any("CONTENTS" in r.getMessage() for r in caplog.records)
 
 
@@ -210,6 +217,65 @@ async def test_dump_without_output_file_is_an_error(call, core_file, monkeypatch
     monkeypatch.setenv("FAKE_HEAPSPY_MODE", "dump_no_file")
     err, out = await call("capture_snapshot", {"core_path": str(core_file), "confirm": True})
     assert err and out["error"]["code"] == "cli_failed"
+
+
+async def test_capture_returns_dump_report_fields(call, core_file) -> None:
+    err, out = await call("capture_snapshot", {"core_path": str(core_file), "confirm": True})
+    assert not err, out
+    assert out["report"] == "json"
+    assert out["python_version"] == "3.12.4"
+    stats = out["stats"]
+    assert (stats["objects"], stats["edges"], stats["types"], stats["roots"]) == (10, 20, 1184, 3)
+    assert (stats["read_errors"], stats["missing_bytes"], stats["truncated"]) == (2, 0, False)
+    assert stats["pause_ms"] is None  # a core has no pause
+    assert [n["code"] for n in out["notes"]] == ["read_errors"]
+    assert "warning" not in out
+
+
+async def test_truncated_capture_warns(call, core_file, monkeypatch) -> None:
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", "dump_truncated")
+    err, out = await call("capture_snapshot", {"core_path": str(core_file), "confirm": True})
+    assert not err, out
+    assert out["stats"]["truncated"] is True
+    assert out["stats"]["missing_bytes"] == 4096
+    assert "lower bounds" in out["warning"]
+
+
+@pytest.mark.parametrize(
+    ("code", "hint_word"),
+    [
+        ("permission_denied", "CAP_SYS_PTRACE"),
+        ("not_python", "_PyRuntime"),
+        ("unsupported_python", "3.12 to 3.14"),
+        ("no_such_process", "list_python_processes"),
+        ("invalid_image", "minidump"),
+        ("truncated_image", "ulimit"),
+    ],
+)
+async def test_capture_error_codes(
+    call, child_python, snapshot_dir: Path, monkeypatch, code: str, hint_word: str
+) -> None:
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", f"error:{code}")
+    err, out = await call(
+        "capture_snapshot",
+        {"pid": child_python.pid, "confirm": True},
+        allow=[f"pid:{child_python.pid}"],
+    )
+    assert err
+    assert out["error"]["code"] == code
+    assert hint_word in out["error"]["hint"]
+    assert list(snapshot_dir.glob("*.hpy*")) == []
+
+
+async def test_capture_with_binary_without_dump_json(call, core_file, argv_log, monkeypatch):
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", "old_binary")
+    err, out = await call("capture_snapshot", {"core_path": str(core_file), "confirm": True})
+    assert not err, out
+    assert out["report"] == "stderr_line"
+    assert out["stats"]["objects"] == 10
+    assert out["stats"]["pause_ms"] is None and out["python_version"] is None
+    assert [a[-1] for a in argv_log()] == ["--json", argv_log()[-1][-1]]
+    assert "--json" not in argv_log()[-1]
 
 
 async def test_killed_dump_leaves_no_temporary_file(

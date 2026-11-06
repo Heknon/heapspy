@@ -15,10 +15,12 @@ The intended loop for an agent:
 5. `map_to_source` to turn a name from that path into `file:line`.
 6. Read the code and find where the holder grows without being cleared.
 
-heapspy shows what is retained now, not where it was allocated. Memory held by
-C extensions, and leaks made only of untracked objects (bare ints, short
-strings), are not visible in the object graph. `heap_summary` reports how much
-of RSS falls outside the graph.
+heapspy shows what is retained now. Where it was allocated is known only when
+an allocation profile (`.hpya`) was recorded from the process before the
+snapshot; see [Where was this memory allocated?](#where-was-this-memory-allocated).
+Memory held by C extensions, and leaks made only of untracked objects (bare
+ints, short strings), are not visible in the object graph. `heap_summary`
+reports how much of RSS falls outside the graph.
 
 The server also has process diagnostics for any process, not only Python: find
 or scan processes by measured metrics, then measure one process's CPU,
@@ -185,12 +187,26 @@ errors whose text is a JSON document:
            "exit_status": 1, "hint": "..."}}
 ```
 
-`code` is one of the heapspy error codes (`unimplemented`, `invalid_argument`,
-`not_found`, `invalid_snapshot`, `io`, `permission_denied`, `internal`), one
-added by the wrapper (`binary_not_found`, `timeout`, `usage_error` for exit
-status 2, `bad_output` for output that is not JSON, `schema_mismatch`,
-`unexpected_kind`, `cli_failed` for a failure with no error document), or
-`capture_refused` with a `reason`.
+`code` is one of:
+
+- a heapspy error code: `unimplemented`, `invalid_argument`, `not_found`,
+  `invalid_snapshot`, `invalid_allocations`, `io`, `permission_denied`,
+  `internal`, and for dumps `no_such_process`, `not_python`,
+  `unsupported_python`, `invalid_image`, `truncated_image` and `unsupported`.
+  A code this server does not know is reported as `internal`, with heapspy's
+  code in `cli_code`;
+- one added by the wrapper: `binary_not_found`, `timeout`, `usage_error` for
+  exit status 2, `bad_output` for output that is not JSON, `schema_mismatch`,
+  `unexpected_kind`, `cli_failed` for a failure with no error document, and
+  `allocations_unsupported` for a heapspy that has no `--allocations`;
+- `capture_refused`, with a `reason`.
+
+Most codes come with a `hint`. For captures: `permission_denied` names the
+privilege (`CAP_SYS_PTRACE` or `kernel.yama.ptrace_scope` on Linux,
+`SeDebugPrivilege` on Windows), `not_python` suggests checking that the PID is
+the Python process and not a wrapper around it, `unsupported_python` lists the
+versions heapspy reads (3.12 to 3.14 release builds), and `invalid_image` and
+`truncated_image` describe what a core or minidump must contain.
 
 A `snapshot` argument is a handle returned by `capture_snapshot`
 (`hs-1a2b3c4d`, a file in the snapshot directory) or a path to a `.hpy` file.
@@ -216,17 +232,41 @@ instant; then `cpu_percent_on_cpu` is `null` and
 
 ### `capture_snapshot(confirm, pid? | core_path? | minidump_path?, capture_contents=false, max_str?)`
 
-Runs `heapspy dump` into the snapshot directory. Returns `snapshot` (the
-handle), `path`, `target` (pid, name, RSS, the allowlist entry that matched),
-`contents_captured` and `stats` (objects, edges, roots, file size, truncated).
+Runs `heapspy dump --json` into the snapshot directory. Returns `snapshot`
+(the handle), `path`, `target` (pid, name, RSS, the allowlist entry that
+matched), `python_version`, `contents_captured`, `stats` (objects, edges,
+types, roots, file size, `truncated`, `missing_bytes` of the image,
+`read_errors`, and `pause_ms`, how long a live target was stopped; `null` for
+cores and minidumps), the dump's `notes`, and `report` (`json`, or
+`stderr_line` for an older heapspy, see
+[Compatibility with older heapspy binaries](#compatibility-with-older-heapspy-binaries)).
+A truncated snapshot also gets a `warning`: its numbers are lower bounds.
 `max_str` (1 to 4096) only applies with `capture_contents`.
 
-### `heap_summary(snapshot, top=10)`
+heapspy writes into a private staging directory
+(`<snapshot dir>/.<handle>.partial/`) that is removed on every path, so a dump
+that fails or is killed by the capture timeout leaves nothing behind. On a
+failed dump the error has heapspy's code and hint (see above).
+
+### `heap_summary(snapshot, top=10, allocations?)`
 
 Runs `heapspy analyze --json --top N`. Returns `top_retainers` (rank, address,
 type, retained bytes and percentage, and a `path` with the rendered root path,
 `root_kind`, `direct_holder` and `source_hints`), `type_histogram`, `totals`,
 `memory` (RSS, graph bytes, bytes outside the graph) and `notes`.
+
+With `allocations` (a path to a `.hpya` profile), it passes
+`--allocations` and adds:
+
+- `allocated_at` on each top retainer: the linked objects and bytes in what it
+  retains (`exact_linked_bytes` is the exact part), and at most 3 allocating
+  stacks, each with `allocated_in` (`file:line` of the innermost frame), at
+  most 6 frames (innermost first), `top_stack_rank` and `source_hints`;
+- `allocations`: `recording` (pid, Python version, start, duration,
+  mechanisms, sampling parameters, overhead, samples, estimated bytes),
+  `coverage`, the first 5 (or `top`) `top_stacks`, the `allocations_*` notes,
+  and `caveats`; plus a `warning` when the profile does not match the
+  snapshot and nothing was linked.
 
 `source_hints` are `module.qualname` names derived from the path that
 `map_to_source` can resolve: `sys.modules['app.cache'].__dict__['CACHE']`
@@ -240,11 +280,13 @@ With `address`, runs `heapspy query --retaining-path`. With `type`, runs
 Each target has `reachable` and up to `max_paths` paths, each with `rendered`,
 `hops` (root first), `direct_holder` and `source_hints`.
 
-### `type_detail(snapshot, type, top=10)`
+### `type_detail(snapshot, type, top=10, allocations?)`
 
 Runs `heapspy query --type`. Returns `matched_types`, `instances`, shallow and
 retained totals, `top_instances` with their paths, `holders` (referrer type and
-generalised edge, with a count) and `notes`.
+generalised edge, with a count) and `notes`. With `allocations`, each instance
+gets `allocated_at` as in `heap_summary` (`top_stack_rank` is always `null`
+here), and the result gets `allocations` with the notes and caveats.
 
 ### `diff_snapshots(before, after, top=10)`
 
@@ -265,8 +307,18 @@ lines.
 - Modules are looked for in the repository root, in `src/`, `lib/` and
   `python/`, and in project directories up to two levels down that contain the
   top-level package (`services/billing/[src/]billing/`).
-- `__main__.X` is looked up in every `__main__.py` and in every script with a
-  `__name__ == "__main__"` guard.
+- `__main__.X` is heuristic, since `__main__` is whichever script was
+  started. Every `.py` file in the repository (at most 500, with the skip and
+  symlink rules below) that binds `X` at top level is a candidate, also a
+  plain script with no main guard. Candidates are ranked: a file named
+  `__main__.py`, then one with an `if __name__ == "__main__"` guard, then one
+  starting with `#!`, then a definition over an import, then shallower paths.
+  Each candidate lists its `main_evidence`, and the result has
+  `heuristic: true` and `main_resolution` (a note, files scanned, whether the
+  scan limit was reached). Compare with the process's command line from
+  `list_python_processes`.
+- Snapshots record the file and first line of each code object (`source_loc`),
+  but no heapspy JSON report exposes them yet, so they are not used here.
 - Names are found as classes, functions, methods, nested classes,
   module-level and class-level assignments (including those inside `if` and
   `try` blocks), imports, and `self.X = ...` assignments in methods.
@@ -279,6 +331,83 @@ The qualname must be dotted Python identifiers; paths are rejected.
 `repo_path` must be an existing directory and may not contain `..`. Every file
 is opened only if its real path, after following symlinks, is inside the
 repository.
+
+### `allocation_sites(profile, snapshot?, top=10)`
+
+The top allocating Python stacks of a `.hpya` profile, by estimated bytes.
+Each stack has `rank`, `estimated_bytes`, `allocated_in`, `frames` (at most 6,
+innermost first, each with `function`, `file`, `line`, `location` and
+`approximate`), `frames_total` and `source_hints`.
+
+- With `snapshot` (handle or `.hpy` path), it runs
+  `heapspy analyze SNAP --allocations PROFILE --json --top N`. Each stack also
+  has `samples`, `events`, `linked_bytes` (bytes of objects still alive in the
+  snapshot that link to the stack's samples) and `exact_linked_bytes`. The
+  result has `recording` (mechanisms, sampling parameters, overhead and so
+  on), `coverage`, the `allocations_*` notes, `caveats`, and a `warning` when
+  nothing was linked (another pid, another CPython version, or a snapshot
+  taken before recording started).
+- Without `snapshot`, it runs
+  `heapspy flamegraph --allocations PROFILE --folded --min-bytes=0`, the only
+  profile-only output heapspy has, and adds up the folded stacks itself. Each
+  stack then has `estimated_bytes` and `estimated_pct` only: `samples`,
+  `events`, the linked fields, `recording` and `coverage` are not available,
+  and frames have `approximate: null`. The result says so in `note`.
+
+`source_hints` lists up to 3 frames from the innermost: `location`, `file`,
+`line`, `function` and `qualname_guess`, a `module.qualname` for
+`map_to_source` when `co_filename` is a relative path of identifiers
+(`app/session.py` and `Session.__init__` give `app.session.Session.__init__`).
+For an absolute `co_filename` there is no guess; read the file at the line.
+
+### Where was this memory allocated?
+
+1. Record a profile from the process, then take a snapshot of it (see
+   heapspy's `docs/allocation-sampling.md`). The profile must come from the
+   same pid and CPython version, and recording must start before the
+   snapshot.
+2. `allocation_sites(profile, snapshot)`: which stacks allocated the memory
+   that is still alive (`linked_bytes`), next to how much each allocated while
+   recording (`estimated_bytes`).
+3. `heap_summary(snapshot, allocations=profile)`: for each top retainer, the
+   stacks that allocated what it retains. `type_detail(..., allocations=...)`
+   does the same per instance.
+4. Read the file at `allocated_in`, or pass `qualname_guess` to
+   `map_to_source`.
+
+Limits, also in each result's `caveats`:
+
+- Allocation data needs a recorded `.hpya` file. `heapspy record` exists, but
+  its recorders are not implemented yet (it fails with `unimplemented`), and
+  this server has no tool that records. Without a profile, heapspy says what
+  keeps an object alive, not where it was allocated.
+- Samples are taken only for arena, pool and large-object events during the
+  recording window. Objects allocated before recording started, and blocks
+  reused from freed memory, have no stack.
+- Links through arena and pool samples are approximate: they name the most
+  recent growth event that created the memory, not necessarily the call that
+  allocated the object. Links through large-object samples are exact
+  (`exact_linked_bytes`).
+- `estimated_bytes` estimates what was allocated while recording;
+  `linked_bytes` is what is still alive in the snapshot.
+
+### Compatibility with older heapspy binaries
+
+- `dump --json`: a heapspy without it rejects the flag while parsing
+  arguments, before it touches the target, with clap's
+  `unexpected argument '--json'` message. The server then runs the same dump
+  without `--json`, parses the `wrote OUT: N objects, ...` line on stderr, and
+  remembers this for the rest of its run. `report` is then `stderr_line`, and
+  `types`, `read_errors`, `missing_bytes`, `pause_ms`, `python_version` and
+  `notes` are `null` or empty. Failures from such a binary have no error
+  document and are reported as `cli_failed` with heapspy's stderr. A newer
+  heapspy prints `--json` in the `Usage:` line of every dump usage error, so
+  that line alone is not taken as a sign of an older binary. The same
+  fallback applies when a dump exits 0 without a dump document on stdout.
+- `--allocations` and `flamegraph`: a heapspy without them gives
+  `allocations_unsupported`.
+- Fields added within schema version 1 (such as `allocations` and
+  `allocated_at`) are read as `null` when missing.
 
 ### Resource and prompt
 
@@ -956,7 +1085,49 @@ uv run ruff format --check
 The tests use `tests/fake_heapspy.py` as the `heapspy` binary. It prints the
 documents in `docs/examples/` adjusted to its arguments, and can simulate
 error documents, a wrong schema version, timeouts, output that is not JSON,
-usage errors and oversized reports.
+usage errors and oversized reports. The dump report and the analyze report
+with allocations come from heapspy branches not merged here yet; copies are in
+`tests/fixtures/heapspy/`, whose README names the source commits. The fake also
+simulates a heapspy without `dump --json`, `--allocations` and `flamegraph`,
+each dump error code, a profile that does not match the snapshot, and a dump
+killed while writing.
+
+#### Contract tests against a real heapspy
+
+`tests/test_contract_real.py` runs a real heapspy binary. It is off by
+default:
+
+```sh
+HEAPSPY_MCP_REAL_BIN=/path/to/heapspy uv run pytest tests/test_contract_real.py
+```
+
+It reads `--help` to see whether the binary has `dump --json` and
+`--allocations`, and checks the matching behaviour (or the fallback). It
+captures a running `/usr/bin/python3.12` (`HEAPSPY_MCP_REAL_PYTHON` overrides
+it) and checks the capture, `heap_summary`, `type_detail` and `map_to_source`
+on a `__main__` class of a script without a main guard; dumps `sleep`
+(`not_python`), a missing pid, a garbage core and a missing core; runs the
+allocation tools against a synthetic snapshot and profile in
+`tests/fixtures/heapspy/` (the README there has the program that writes them);
+and checks that the real dump and allocation reports have every field of the
+copied examples. Live captures need ptrace rights and are skipped without
+them. Child processes are killed on every path.
+
+No heapspy branch has both features yet, so both were used. Results on the
+development VM (Linux 6.18, CPython 3.12.3, run as root):
+
+| binary | passed | skipped |
+|---|---|---|
+| `feature/dump-json-errors` at 2ae7ec2 (dump --json, no --allocations) | 8 | 1 (allocation report fields) |
+| `feature/alloc-join` at b04cc2f (--allocations, no dump --json) | 8 | 1 (dump report fields) |
+
+With the first, captures were parsed from the dump report, `sleep` gave
+`not_python`, and the allocation tools gave `allocations_unsupported`. With
+the second, captures fell back to the stderr line, dump failures were
+`cli_failed`, and the allocation tools returned the numbers the synthetic
+files were built with (203 linked objects, 3 of them through exact links).
+The `feature/dump-json-errors` head (40c85ed) differs from 2ae7ec2 only in
+`tests/e2e/`.
 
 The process diagnostics have parser tests against fixture files from 5.x and
 6.x kernels (`tests/fixtures/system/`) and fake cgroupfs trees, mocked
