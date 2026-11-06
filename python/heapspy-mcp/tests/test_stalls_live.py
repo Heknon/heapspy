@@ -340,3 +340,85 @@ async def test_d2_frozen_cgroup(call, kind: str) -> None:
             assert out["frozen_or_stopped"]["cgroup_frozen"] is True
             assert n["category_share"] == {"stopped_or_frozen": 1.0}
             assert (n["memory_stall_share_of_active"] or 0) == 0
+
+
+def _pids(rows: list[dict[str, Any]]) -> set[int]:
+    return {pid for row in rows for pid in row.get("pids", [row.get("pid")])}
+
+
+async def test_e_scan_finds_the_thrashing_process(call, data_file: Path) -> None:
+    drop_cache(data_file)
+    with cgroups(f"heapspy-e-{os.getpid()}", mem_limit=LIMIT) as dirs:
+        joined = list(dict.fromkeys(d for k, d in dirs.items() if k in ("v2", "memory")))
+        with started(spawn_in(joined, SCANNER, str(data_file))) as p:
+            time.sleep(WARMUP_S)
+            err, out = await call("scan_processes", {"window_s": 3})
+            assert not err, out
+            top = out["outliers_by_metric"]["major_faults_per_s"]
+            cond = out["conditions"]
+            report(
+                "e.scan",
+                {
+                    "top_major_faults": [(x["pid"] == p.pid, x["value"]) for x in top[:3]],
+                    "major_faults_whole_window": cond["major_faults_whole_window"]["rows"][:3],
+                    "cgroup_memory_pressure_full": [
+                        {k: x[k] for k in ("cgroup", "full_window_pct", "pids")}
+                        for x in cond["cgroup_memory_pressure_full"]["rows"][:3]
+                    ],
+                    "cost": {k: out["cost"][k] for k in ("processes_seen", "sampling_cpu_seconds")},
+                },
+            )
+            assert top[0]["pid"] == p.pid
+            assert p.pid in _pids(cond["major_faults_whole_window"]["rows"])
+            own = [
+                x
+                for x in cond["cgroup_memory_pressure_full"]["rows"]
+                if x["cgroup"].endswith(dirs["v2"].name)
+            ]
+            assert own and own[0]["pids"] == [p.pid]
+            err, found = await call("find_processes", {"sort_by": "major_faults_per_s", "limit": 3})
+            assert not err, found
+            assert found["processes"][0]["pid"] == p.pid
+
+
+async def test_e2_scan_lists_threads_in_a_memory_wait(call, data_file: Path) -> None:
+    drop_cache(data_file)
+    with cgroups(f"heapspy-e2-{os.getpid()}", mem_limit=LIMIT, read_bps=READ_BPS) as dirs:
+        joined = list(dict.fromkeys(d for k, d in dirs.items() if k in ("v2", "memory", "blkio")))
+        with started(spawn_in(joined, SCANNER, str(data_file))) as p:
+            time.sleep(WARMUP_S)
+            err, out = await call("scan_processes", {"window_s": 2})
+            assert not err, out
+            cond = out["conditions"]["disk_wait_in_memory_management"]
+            mine = [x for x in cond["rows"] if x["pid"] == p.pid]
+            report("e2.scan", {"rows": mine, "candidates": len(cond["d_state_candidates"])})
+            assert mine and mine[0]["category"] == "page_fault_io"
+            assert mine[0]["source"] == "stack"
+
+
+async def test_e3_scan_reports_frozen_and_stopped(call) -> None:
+    with cgroups(f"heapspy-e3-{os.getpid()}", freezer=True) as dirs:
+        if "freezer" not in dirs and not ("v2" in dirs and (dirs["v2"] / "cgroup.freeze").exists()):
+            pytest.skip("no cgroup freezer")
+        with (
+            started(spawn_in(list(dirs.values()), SPIN), dirs) as frozen,
+            started(subprocess.Popen([sys.executable, "-c", SPIN])) as stopped,
+        ):
+            time.sleep(0.3)
+            if "freezer" in dirs:
+                (dirs["freezer"] / "freezer.state").write_text("FROZEN")
+            else:
+                (dirs["v2"] / "cgroup.freeze").write_text("1")
+            os.kill(stopped.pid, signal.SIGSTOP)
+            time.sleep(0.3)
+            err, out = await call("scan_processes", {"window_s": 1})
+            assert not err, out
+            cond = out["conditions"]
+            fz = cond["frozen_or_stopped"]
+            report("e3.scan", fz)
+            assert frozen.pid in _pids(fz["frozen_cgroups"])
+            assert stopped.pid in {x["pid"] for x in fz["stopped_processes"]}
+            # A v1-frozen task sits in D in __refrigerator: not a memory wait.
+            d_rows = cond["disk_wait_in_memory_management"]
+            assert frozen.pid not in {x["pid"] for x in d_rows["rows"]}
+            assert frozen.pid not in {x["pid"] for x in d_rows["d_state_candidates"]}

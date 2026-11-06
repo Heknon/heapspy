@@ -27,6 +27,7 @@ import anyio
 
 from . import cgroups as cg
 from . import procfs as pf
+from . import wait_categories as wc
 from .redact import redact_cmdline
 
 MAX_CMDLINE = 200
@@ -37,6 +38,8 @@ MAX_THREADS_TOTAL = 20000
 SCAN_TICKS = 3
 MAX_FACT_ROWS = 20
 DEFAULT_FD_THRESHOLD_PCT = 80.0
+DEFAULT_MAJOR_FAULT_THRESHOLD_PER_S = 100.0
+MAX_D_STATE_INSPECTED = 64
 
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
@@ -56,6 +59,7 @@ METRICS: dict[str, bool] = {
     "write_bytes_per_s": True,
     "uptime_s": False,
     "cfs_throttled_ratio": True,
+    "major_faults_per_s": True,
 }
 
 _PY_NAME = re.compile(r"^python(?:w)?(?:\d(?:\.?\d+)?)?[dmt]*(?:\.exe)?$", re.IGNORECASE)
@@ -85,6 +89,9 @@ class Counters:
     utime: int
     stime: int
     rss_pages: int
+    minflt: int
+    majflt: int
+    state: str
     threads: int
     vol: int | None
     nonvol: int | None
@@ -98,14 +105,46 @@ class Counters:
 
 
 @dataclass
+class MemoryCounters:
+    """OOM and limit-hit counters of one memory cgroup (v2 memory.events, or v1
+    memory.oom_control and memory.failcnt)."""
+
+    location: cg.MemoryLocation
+    a: dict[str, int] | None = None
+    b: dict[str, int] | None = None
+    pids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class PressureCounters:
+    """memory.pressure of one cgroup v2 directory at the start and end of the window."""
+
+    path: str
+    directory: Path
+    a: dict[str, dict[str, float]] | None = None
+    b: dict[str, dict[str, float]] | None = None
+    pids: list[int] = field(default_factory=list)
+
+
+@dataclass
 class ScanState:
     proc_root: Path
     statics: dict[int, Static] = field(default_factory=dict)
     first: dict[int, Counters] = field(default_factory=dict)
     last: dict[int, Counters] = field(default_factory=dict)
     rss_series: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
+    majflt_series: dict[int, list[tuple[float, int]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
     d_all_window: dict[int, set[int]] = field(default_factory=dict)
     cgroup_of_pid: dict[int, str] = field(default_factory=dict)
+    pid_cgroups: dict[int, cg.PidCgroups] = field(default_factory=dict)
+    memory: dict[str, MemoryCounters] = field(default_factory=dict)
+    pressure: dict[str, PressureCounters] = field(default_factory=dict)
+    freezers: list[dict[str, Any]] = field(default_factory=list)
+    d_inspected: list[dict[str, Any]] = field(default_factory=list)
+    d_inspect_reason: str | None = None
+    cgroup_files_read: int = 0
     skipped_exited: int = 0
     partially_unreadable: int = 0
     thread_budget: int = MAX_THREADS_TOTAL
@@ -218,6 +257,9 @@ def _read_counters(state: ScanState, pid: int) -> Counters | None:
         utime=st.utime_ticks,
         stime=st.stime_ticks,
         rss_pages=st.rss_pages,
+        minflt=st.minflt,
+        majflt=st.majflt,
+        state=st.state,
         threads=st.num_threads,
         vol=vol if have_sw else None,
         nonvol=nonvol if have_sw else None,
@@ -231,12 +273,15 @@ def _read_counters(state: ScanState, pid: int) -> Counters | None:
     )
 
 
-def _rss_pages(proc_root: Path, pid: int) -> int | None:
-    text = pf.read_text(proc_root / str(pid) / "statm")
+def _tick_stat(proc_root: Path, pid: int) -> pf.PidStat | None:
+    """``/proc/<pid>/stat`` for the in-window samples: RSS pages and the major-fault count."""
+    text = pf.read_text(proc_root / str(pid) / "stat")
     if not text:
         return None
-    parts = text.split()
-    return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    try:
+        return pf.parse_pid_stat(text)
+    except (ValueError, IndexError):
+        return None
 
 
 def _d_tids(proc_root: Path, pid: int) -> set[int]:
@@ -391,18 +436,113 @@ class CgroupCounters:
     location: cg.CgroupLocation | None
     a: dict[str, int | None] = field(default_factory=dict)
     b: dict[str, int | None] = field(default_factory=dict)
-    oom_a: dict[str, int] | None = None
-    oom_b: dict[str, int] | None = None
     pids: list[int] = field(default_factory=list)
 
 
-def _oom_events(loc: cg.CgroupLocation) -> dict[str, int] | None:
-    if loc.pressure_dir is not None:  # v2 directory of the process
-        text = pf.read_text(loc.pressure_dir / "memory.events")
-        if text:
-            ev = cg.parse_flat_keyed(text)
-            return {k: v for k, v in ev.items() if k in ("oom", "oom_kill", "oom_group_kill")}
-    return None
+def _memory_events(loc: cg.MemoryLocation) -> dict[str, int] | None:
+    """``oom``, ``oom_kill`` and ``max`` counters: v2 memory.events, or v1
+    memory.oom_control ``oom_kill`` and memory.failcnt (usage hit the limit)."""
+    if loc.version == "v2":
+        text = pf.read_text(loc.dir / "memory.events")
+        if not text:
+            return None
+        ev = cg.parse_flat_keyed(text)
+        return {k: v for k, v in ev.items() if k in ("max", "oom", "oom_kill", "oom_group_kill")}
+    text = pf.read_text(loc.dir / "memory.oom_control")
+    if not text:
+        return None
+    out = {k: v for k, v in cg.parse_flat_keyed(text).items() if k == "oom_kill"}
+    fail = pf.read_text(loc.dir / "memory.failcnt")
+    if fail and fail.strip().isdigit():
+        out["max"] = int(fail)
+    return out
+
+
+def _psi(directory: Path) -> dict[str, dict[str, float]] | None:
+    text = pf.read_text(directory / "memory.pressure")
+    return pf.parse_psi(text) if text else None
+
+
+def _group_cgroups(state: ScanState, mounts: cg.CgroupMounts) -> None:
+    """Distinct memory cgroups, v2 directories (for memory.pressure) and freezer
+    cgroups of the scanned processes, with their start values."""
+    freezer_keys: dict[tuple[str | None, str | None], list[int]] = defaultdict(list)
+    for pid, pc in state.pid_cgroups.items():
+        mloc = cg.locate_memory(pc, mounts)
+        if mloc is not None:
+            key = str(mloc.dir)
+            entry = state.memory.get(key)
+            if entry is None:
+                entry = state.memory[key] = MemoryCounters(mloc, _memory_events(mloc))
+                state.cgroup_files_read += 1
+            entry.pids.append(pid)
+            if mloc.pressure_dir is not None:
+                pkey = str(mloc.pressure_dir)
+                pe = state.pressure.get(pkey)
+                if pe is None:
+                    pe = state.pressure[pkey] = PressureCounters(
+                        pc.v2_path or "/", mloc.pressure_dir, _psi(mloc.pressure_dir)
+                    )
+                    state.cgroup_files_read += 1
+                pe.pids.append(pid)
+        freezer_keys[(pc.v2_path, pc.v1_paths.get("freezer"))].append(pid)
+    for (v2_path, v1_path), pids in freezer_keys.items():
+        if v2_path in (None, "/") and v1_path in (None, "/"):
+            continue  # root cgroups cannot be frozen
+        pc = cg.PidCgroups(v2_path, {"freezer": v1_path} if v1_path else {})
+        fr = cg.read_freezer(pc, mounts)
+        state.cgroup_files_read += 1
+        if fr.get("frozen"):
+            state.freezers.append({"freezer": fr, "pids": sorted(pids)})
+
+
+def _inspect_d_threads(state: ScanState) -> None:
+    """Wait category of threads in D at the end of the window, from their kernel stack
+    (root) or wchan. Bounded by MAX_D_STATE_INSPECTED threads."""
+    budget = MAX_D_STATE_INSPECTED
+    stack_ok: bool | None = None
+    for pid, c in sorted(state.last.items()):
+        for tid in sorted(c.d_tids):
+            if budget <= 0:
+                state.d_inspect_reason = (
+                    f"more than {MAX_D_STATE_INSPECTED} threads in D; the rest were not inspected"
+                )
+                return
+            budget -= 1
+            tdir = state.proc_root / str(pid) / "task" / str(tid)
+            frames = None
+            if stack_ok is not False:
+                raw = pf.read_text(tdir / "stack")
+                stack_ok = raw is not None
+                frames = pf.parse_stack(raw) if raw is not None else None
+            wchan = pf.parse_wchan(pf.read_text(tdir / "wchan"))
+            got: wc.Classified | None
+            if frames:
+                got = wc.classify_stack(frames, "D")
+                source = "stack"
+            else:
+                source = "wchan"
+                # A page wait seen through wchan alone may be a fault or a read(2).
+                got = (
+                    wc.classify_stack([wchan], "D")
+                    if wchan and wchan not in wc.PAGE_WAIT_FRAMES
+                    else None
+                )
+            state.d_inspected.append(
+                {
+                    "pid": pid,
+                    "tid": tid,
+                    "category": got.category if got else None,
+                    "source": source,
+                    "wchan": wchan,
+                    "stack_top": frames[:3] if frames else None,
+                }
+            )
+    if stack_ok is False:
+        state.d_inspect_reason = (
+            "/proc/<tid>/stack is not readable (needs root); categories come from wchan, where "
+            "a page or folio wait cannot be told apart from a read(2) wait"
+        )
 
 
 async def sample_all(
@@ -427,31 +567,37 @@ async def sample_all(
                 continue
             state.first[pid] = c
             state.rss_series[pid].append(c.rss_pages)
+            state.majflt_series[pid].append((c.t, c.majflt))
             if c.d_tids:
                 state.d_all_window[pid] = set(c.d_tids)
             if mounts is not None:
                 text = pf.read_text(proc_root / str(pid) / "cgroup")
                 if text:
-                    loc = cg.locate(cg.parse_pid_cgroup(text), mounts)
+                    pc = cg.parse_pid_cgroup(text)
+                    state.pid_cgroups[pid] = pc
+                    loc = cg.locate(pc, mounts)
                     if loc is not None and loc.cpu_dir is not None:
                         key = str(loc.cpu_dir)
                         entry = cgroups.get(key)
                         if entry is None:
                             entry = CgroupCounters(loc)
                             entry.a = cg.read_cpu_stat(loc)
-                            entry.oom_a = _oom_events(loc)
                             cgroups[key] = entry
+                            state.cgroup_files_read += 1
                         entry.pids.append(pid)
                         loc_by_pid[pid] = key
+        if mounts is not None:
+            _group_cgroups(state, mounts)
     if window_s > 0:
         step = window_s / (SCAN_TICKS + 1)
         for _ in range(SCAN_TICKS):
             await anyio.sleep(step)
             with _Cost(state):
                 for pid in list(state.first):
-                    rss = _rss_pages(proc_root, pid)
-                    if rss is not None:
-                        state.rss_series[pid].append(rss)
+                    st = _tick_stat(proc_root, pid)
+                    if st is not None:
+                        state.rss_series[pid].append(st.rss_pages)
+                        state.majflt_series[pid].append((time.monotonic(), st.majflt))
                 for pid in list(state.d_all_window):
                     state.d_all_window[pid] &= _d_tids(proc_root, pid)
         await anyio.sleep(step)
@@ -465,12 +611,17 @@ async def sample_all(
                 continue
             state.last[pid] = c
             state.rss_series[pid].append(c.rss_pages)
+            state.majflt_series[pid].append((c.t, c.majflt))
             if pid in state.d_all_window:
                 state.d_all_window[pid] &= c.d_tids
         for entry in cgroups.values():
             assert entry.location is not None
             entry.b = cg.read_cpu_stat(entry.location)
-            entry.oom_b = _oom_events(entry.location)
+        for mem in state.memory.values():
+            mem.b = _memory_events(mem.location)
+        for pe in state.pressure.values():
+            pe.b = _psi(pe.directory)
+        _inspect_d_threads(state)
     state.cgroup_of_pid = loc_by_pid
     return cgroups
 
@@ -563,6 +714,7 @@ def build_rows(
             "write_bytes_per_s": per_s(a.write_bytes, b.write_bytes),
             "uptime_s": _r(uptime - s.starttime_ticks / hz, 1) if uptime is not None else None,
             "cfs_throttled_ratio": cg_ratio[cg_key][0] if cg_key in cg_ratio else None,
+            "major_faults_per_s": per_s(a.majflt, b.majflt),
         }
         rows.append(
             {
@@ -611,7 +763,17 @@ def _cost(state: ScanState) -> dict[str, Any]:
         "sampling_passes": state.samples,
         "sampling_wall_seconds": round(state.sample_wall_s, 4),
         "sampling_cpu_seconds": round(state.sample_cpu_s, 4),
-        "note": "time spent reading /proc in this call, excluding the window's sleeps",
+        "distinct_cgroups_read": state.cgroup_files_read,
+        "d_state_threads_inspected": len(state.d_inspected),
+        "reads": "per process at the start and end: stat, status, cgroup, io, fd count, limits, "
+        "and stat, status and schedstat of up to "
+        f"{MAX_THREADS_PER_PROCESS} threads; at each in-window sample: stat (RSS, major "
+        "faults) and thread states of processes with threads in D; once per distinct "
+        "cgroup: cpu.stat, memory.events (or v1 memory.oom_control and memory.failcnt), "
+        "memory.pressure, freezer state; at the end: wchan (and stack, as root) of up to "
+        f"{MAX_D_STATE_INSPECTED} threads in D",
+        "note": "time spent reading /proc and cgroup files in this call, excluding the "
+        "window's sleeps",
     }
 
 
@@ -687,10 +849,13 @@ async def scan_processes(
     fd_threshold_pct: float,
     include_kernel_threads: bool,
     cgroup_root: Path | None,
+    major_fault_threshold_per_s: float = DEFAULT_MAJOR_FAULT_THRESHOLD_PER_S,
 ) -> dict[str, Any]:
     w = _window(window_s, window_cap)
     if w <= 0:
         raise SearchError("scan_processes needs window_s > 0")
+    if major_fault_threshold_per_s <= 0:
+        raise SearchError("major_fault_threshold_per_s must be positive")
     state = collect_statics(proc_root)
     filters = Filters(include_kernel_threads=include_kernel_threads)
     pids = apply_filters(state.statics, filters, proc_root)
@@ -778,7 +943,6 @@ async def scan_processes(
         "rows": growing[:MAX_FACT_ROWS],
     }
     throttled = []
-    ooms = []
     for entry in cgroups.values():
         loc = entry.location
         assert loc is not None
@@ -799,26 +963,12 @@ async def scan_processes(
                     "pids": sorted(entry.pids)[:10],
                 }
             )
-        if entry.oom_b and entry.oom_b.get("oom_kill"):
-            ooms.append(
-                {
-                    "cgroup": loc.path,
-                    "oom_kill_total": entry.oom_b.get("oom_kill"),
-                    "oom_kill_in_window": entry.oom_b.get("oom_kill", 0)
-                    - (entry.oom_a or {}).get("oom_kill", 0),
-                    "pids": sorted(entry.pids)[:10],
-                }
-            )
     throttled.sort(key=lambda x: -x["nr_throttled"])
     facts["cgroups_throttled_in_window"] = {
         "definition": "cgroups (of scanned processes) whose nr_throttled rose in the window",
         "rows": throttled[:MAX_FACT_ROWS],
     }
-    facts["oom_kill_counters"] = {
-        "definition": "cgroups whose memory.events oom_kill counter is above 0 (cumulative)",
-        "rows": ooms[:MAX_FACT_ROWS],
-        "note": "read from cgroup v2 memory.events; not available for cgroup v1 memory",
-    }
+    facts.update(_memory_conditions(state, row_by_pid, major_fault_threshold_per_s, samples, w))
     return {
         "measurement": {"window_s": w, "window_requested_s": window_s, "samples": samples},
         "processes_scanned": len(rows),
@@ -828,3 +978,132 @@ async def scan_processes(
         "skipped": describe_skips(state),
         "cost": _cost(state),
     }
+
+
+def _memory_conditions(
+    state: ScanState,
+    row_by_pid: dict[int, dict[str, Any]],
+    threshold: float,
+    samples: int,
+    window: float,
+) -> dict[str, Any]:
+    """Memory-stall conditions: sustained major faults, memory PSI full in the window,
+    threads in D in a memory-management wait, frozen cgroups and stopped processes."""
+    facts: dict[str, Any] = {}
+    sustained = []
+    for pid, series in state.majflt_series.items():
+        if pid not in row_by_pid or len(series) < 3:
+            continue
+        rates = [(b - a) / (tb - ta) for (ta, a), (tb, b) in itertools.pairwise(series) if tb > ta]
+        if rates and min(rates) >= threshold:
+            sustained.append(
+                {
+                    "pid": pid,
+                    "comm": state.statics[pid].comm,
+                    "major_faults_per_s": row_by_pid[pid]["metrics"]["major_faults_per_s"],
+                    "lowest_interval_rate_per_s": round(min(rates), 1),
+                    "cgroup": row_by_pid[pid]["cgroup"],
+                }
+            )
+    sustained.sort(key=lambda x: -(x["major_faults_per_s"] or 0))
+    facts["major_faults_whole_window"] = {
+        "definition": f"major faults at or above {threshold:g}/s in each of the "
+        f"{samples - 1} intervals between the {samples} samples",
+        "threshold_per_s": threshold,
+        "rows": sustained[:MAX_FACT_ROWS],
+    }
+    full = []
+    for pe in state.pressure.values():
+        a = ((pe.a or {}).get("full") or {}).get("total_us")
+        b = ((pe.b or {}).get("full") or {}).get("total_us")
+        if a is None or b is None or b <= a:
+            continue
+        sa = ((pe.a or {}).get("some") or {}).get("total_us")
+        sb = ((pe.b or {}).get("some") or {}).get("total_us")
+        span = window
+        full.append(
+            {
+                "cgroup": pe.path,
+                "root_cgroup": pe.path == "/",
+                "full_stall_seconds": round((b - a) / 1e6, 4),
+                "full_window_pct": round((b - a) / (span * 1e6) * 100, 2) if span > 0 else None,
+                "some_window_pct": round((sb - sa) / (span * 1e6) * 100, 2)
+                if span > 0 and sa is not None and sb is not None
+                else None,
+                "avg10_full_pct": ((pe.b or {}).get("full") or {}).get("avg10"),
+                "pids": sorted(pe.pids)[:10],
+                "process_count": len(pe.pids),
+            }
+        )
+    full.sort(key=lambda x: (x["root_cgroup"], -x["full_stall_seconds"]))
+    facts["cgroup_memory_pressure_full"] = {
+        "definition": "cgroup v2 directories (of scanned processes) whose memory.pressure "
+        "'full' total rose in the window: time when every non-idle task in the cgroup was "
+        "stalled on memory at once",
+        "rows": full[:MAX_FACT_ROWS],
+        "note": "the root cgroup's memory.pressure covers the whole host"
+        if state.pressure
+        else "no cgroup v2 hierarchy: memory.pressure is not available (cgroup v1 "
+        "memory.pressure_level is an eventfd notification and cannot be read)",
+    }
+    memory_d = []
+    candidates = []
+    for row in state.d_inspected:
+        if row["pid"] not in row_by_pid:
+            continue
+        item = {**row, "comm": state.statics[row["pid"]].comm}
+        if row["category"] in wc.MEMORY_MANAGEMENT:
+            memory_d.append(item)
+        elif row["category"] != "stopped_or_frozen":
+            candidates.append(item)
+    facts["disk_wait_in_memory_management"] = {
+        "definition": "threads in state D at the end of the window whose kernel stack (or "
+        "wchan) is in a memory-management wait: page_fault_io, direct_reclaim, "
+        "memcg_high_throttle, dirty_throttle, compaction or oom",
+        "rows": memory_d[:MAX_FACT_ROWS],
+        "d_state_candidates": candidates[:MAX_FACT_ROWS],
+        "candidates_note": "threads in D whose wait is block I/O, not in the category table, "
+        "or a page or folio wait seen only through wchan (a fault or a read(2)); "
+        "watch_process_stalls samples them over time with kernel stacks",
+        **({"truncated_reason": state.d_inspect_reason} if state.d_inspect_reason else {}),
+    }
+    stopped = [
+        {"pid": pid, "comm": state.statics[pid].comm, "state": c.state}
+        for pid, c in sorted(state.last.items())
+        if c.state in ("T", "t") and pid in row_by_pid
+    ]
+    facts["frozen_or_stopped"] = {
+        "definition": "cgroups (of scanned processes) frozen by the cgroup freezer (v2 "
+        "cgroup.events frozen, or v1 freezer.state FROZEN or FREEZING), and processes "
+        "stopped by a signal or ptrace (state T or t): held on purpose, not stalled",
+        "frozen_cgroups": [
+            {
+                "cgroup_v2": (f["freezer"].get("v2") or {}).get("path"),
+                "freezer_v1": (f["freezer"].get("v1") or {}).get("path"),
+                "freezer_v1_state": (f["freezer"].get("v1") or {}).get("state"),
+                "pids": f["pids"][:10],
+                "process_count": len(f["pids"]),
+            }
+            for f in state.freezers
+        ][:MAX_FACT_ROWS],
+        "stopped_processes": stopped[:MAX_FACT_ROWS],
+    }
+    ooms = []
+    for mem in state.memory.values():
+        if mem.b and mem.b.get("oom_kill"):
+            ooms.append(
+                {
+                    "cgroup": mem.location.path,
+                    "cgroup_version": mem.location.version,
+                    "oom_kill_total": mem.b.get("oom_kill"),
+                    "oom_kill_in_window": mem.b.get("oom_kill", 0)
+                    - (mem.a or {}).get("oom_kill", 0),
+                    "pids": sorted(mem.pids)[:10],
+                }
+            )
+    facts["oom_kill_counters"] = {
+        "definition": "memory cgroups whose oom_kill counter is above 0 (cumulative)",
+        "rows": ooms[:MAX_FACT_ROWS],
+        "note": "cgroup v2 memory.events, or cgroup v1 memory.oom_control",
+    }
+    return facts

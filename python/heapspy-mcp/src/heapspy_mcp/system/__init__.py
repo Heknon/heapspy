@@ -246,11 +246,15 @@ def register(server: MCPServer, config: Config) -> None:
         description=(
             "One pass over every process: the top processes for each metric (outliers by "
             "metric: CPU, RSS and its growth, threads, context switches, run-queue wait, "
-            "iowait, open fds and fd limit use, read/write bytes, uptime, cgroup throttling), "
-            "and factual conditions with raw values: threads in disk wait for the whole "
-            "window, zombies by parent, fd use above a stated share of RLIMIT_NOFILE, RSS that "
-            "grew on every sample, cgroups throttled in the window, OOM-kill counters. Use it "
-            "when you do not yet know which process to look at. Read-only; no allowlist needed."
+            "iowait, open fds and fd limit use, read/write bytes, uptime, cgroup throttling, "
+            "major faults), and factual conditions with raw values: threads in disk wait for "
+            "the whole window, zombies by parent, fd use above a stated share of "
+            "RLIMIT_NOFILE, RSS that grew on every sample, cgroups throttled in the window, "
+            "major faults above a stated rate for the whole window, cgroups with memory "
+            "pressure 'full' in the window, threads in D in a memory-management wait (with "
+            "other D threads as candidates for watch_process_stalls), frozen cgroups and "
+            "stopped processes, OOM-kill counters. Use it when you do not yet know which "
+            "process to look at. Read-only; no allowlist needed."
         ),
     )
     async def scan_processes(
@@ -261,6 +265,13 @@ def register(server: MCPServer, config: Config) -> None:
         fd_threshold_pct: Annotated[
             float, Field(description="Report fd use above this % of the soft limit.")
         ] = srch.DEFAULT_FD_THRESHOLD_PCT,
+        major_fault_threshold_per_s: Annotated[
+            float,
+            Field(
+                description="Report processes with at least this many major faults per "
+                "second in every interval of the window."
+            ),
+        ] = srch.DEFAULT_MAJOR_FAULT_THRESHOLD_PER_S,
         include_kernel_threads: bool = False,
     ) -> dict[str, Any]:
         async def body() -> dict[str, Any]:
@@ -272,6 +283,7 @@ def register(server: MCPServer, config: Config) -> None:
                 fd_threshold_pct=fd_threshold_pct,
                 include_kernel_threads=include_kernel_threads,
                 cgroup_root=d.cgroup_root,
+                major_fault_threshold_per_s=major_fault_threshold_per_s,
             )
 
         return await _guard(body)

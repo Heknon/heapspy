@@ -183,3 +183,68 @@ async def test_tool_is_gated_by_the_allowlist(call) -> None:
         "watch_process_stalls", {"pid": os.getpid(), "rate_hz": 0}, allow=[f"pid:{os.getpid()}"]
     )
     assert err and out["error"]["reason"] == "invalid_argument"
+
+
+def test_scan_memory_conditions_from_a_crafted_state(tmp_path: Path) -> None:
+    from heapspy_mcp.system import cgroups as cg
+    from heapspy_mcp.system import search
+
+    state = search.ScanState(tmp_path)
+    for pid, comm in ((10, "thrash"), (11, "burst"), (12, "stopped")):
+        state.statics[pid] = search.Static(pid, comm, 1, "S", 0, None, None, None, False, 0)
+    # pid 10 faults at >= 100/s in every interval; pid 11 only in one.
+    state.majflt_series[10] = [(0.0, 0), (0.5, 200), (1.0, 400), (1.5, 600), (2.0, 800)]
+    state.majflt_series[11] = [(0.0, 0), (0.5, 0), (1.0, 900), (1.5, 900), (2.0, 900)]
+    last = search.Counters(
+        t=2.0,
+        utime=0,
+        stime=0,
+        rss_pages=0,
+        minflt=0,
+        majflt=0,
+        state="T",
+        threads=1,
+        vol=None,
+        nonvol=None,
+        run_ns=None,
+        wait_ns=None,
+        blkio=None,
+        d_tids=set(),
+        threads_truncated=False,
+        read_bytes=None,
+        write_bytes=None,
+    )
+    state.last[12] = last
+    state.pressure["/x"] = search.PressureCounters(
+        "/job",
+        tmp_path,
+        {"some": {"total_us": 0}, "full": {"total_us": 0}},
+        {"some": {"total_us": 400_000}, "full": {"total_us": 200_000}},
+        [10],
+    )
+    state.pressure["/"] = search.PressureCounters(
+        "/", tmp_path, {"full": {"total_us": 5}}, {"full": {"total_us": 5}}, [11]
+    )
+    state.d_inspected = [
+        {"pid": 10, "tid": 10, "category": "page_fault_io", "source": "stack"},
+        {"pid": 11, "tid": 11, "category": "block_io", "source": "stack"},
+        {"pid": 11, "tid": 13, "category": "stopped_or_frozen", "source": "stack"},
+    ]
+    state.freezers = [{"freezer": {"v2": {"path": "/frozen"}, "v1": None}, "pids": [11]}]
+    mloc = cg.MemoryLocation("v2", "/job", tmp_path, tmp_path, tmp_path)
+    state.memory["/job"] = search.MemoryCounters(mloc, {"oom_kill": 1}, {"oom_kill": 3}, [10])
+    rows = {
+        pid: {"metrics": {"major_faults_per_s": 400.0}, "cgroup": "/job"} for pid in (10, 11, 12)
+    }
+    facts = search._memory_conditions(state, rows, 100.0, 5, 2.0)
+    assert [x["pid"] for x in facts["major_faults_whole_window"]["rows"]] == [10]
+    (full,) = facts["cgroup_memory_pressure_full"]["rows"]
+    assert full["cgroup"] == "/job" and full["full_window_pct"] == 10.0
+    assert full["some_window_pct"] == 20.0
+    d = facts["disk_wait_in_memory_management"]
+    assert [x["pid"] for x in d["rows"]] == [10]
+    assert [x["tid"] for x in d["d_state_candidates"]] == [11]
+    fz = facts["frozen_or_stopped"]
+    assert fz["frozen_cgroups"][0]["cgroup_v2"] == "/frozen"
+    assert fz["stopped_processes"] == [{"pid": 12, "comm": "stopped", "state": "T"}]
+    assert facts["oom_kill_counters"]["rows"][0]["oom_kill_in_window"] == 2
