@@ -31,6 +31,7 @@ static long (*map_delete)(void *map, const void *key) = (void *)3;
 static u64 (*ktime_get_ns)(void) = (void *)5;
 static u32 (*prandom_u32)(void) = (void *)7;
 static u64 (*get_current_pid_tgid)(void) = (void *)14;
+static u64 (*get_attach_cookie)(void *ctx) = (void *)174;
 static long (*probe_read_user)(void *dst, u32 size, const void *src) = (void *)112;
 static long (*probe_read_kernel)(void *dst, u32 size, const void *src) = (void *)113;
 static long (*ringbuf_output)(void *ringbuf, void *data, u64 size, u64 flags) = (void *)130;
@@ -272,6 +273,7 @@ INLINE void emit(struct config *c, u64 tid, u8 kind, u64 addr, u64 size, u64 ret
 #define R_SI 104
 #define R_DI 112
 #define R_ORIG_AX 120
+#define R_IP 128
 #define R_SP 152
 
 INLINE u64 kreg(void *regs, u32 off) {
@@ -351,7 +353,8 @@ INLINE int sampled(struct config *c, u64 size) {
     return 1;
 }
 
-INLINE int on_entry(u64 *regs, u64 size) {
+// Returns 1 when the call was sampled and its return is wanted.
+INLINE int sample_entry(u64 *regs, u64 size) {
     struct config *c = config();
     if (!c || !c->large_on)
         return 0;
@@ -374,6 +377,11 @@ INLINE int on_entry(u64 *regs, u64 size) {
             count(C_ORPHANS);
     }
     map_update(&pending, &k, &p, 0);
+    return 1;
+}
+
+INLINE int on_entry(u64 *regs, u64 size) {
+    sample_entry(regs, size);
     return 0;
 }
 
@@ -386,8 +394,7 @@ SEC("uprobe/malloc") int malloc_libc(u64 *r) { return on_entry(r, r[R_DI / 8]); 
 SEC("uprobe/calloc") int calloc_libc(u64 *r) { return on_entry(r, r[R_DI / 8] * r[R_SI / 8]); }
 SEC("uprobe/realloc") int realloc_libc(u64 *r) { return on_entry(r, r[R_SI / 8]); }
 
-SEC("uretprobe/alloc_ret")
-int alloc_ret(u64 *r) {
+INLINE int on_return(u64 *r) {
     struct config *c = config();
     if (!c)
         return 0;
@@ -406,4 +413,32 @@ int alloc_ret(u64 *r) {
         return 0;
     emit(c, k.tid, KIND_LARGE, addr, size, ret, EF_HAS_RET);
     return 0;
+}
+
+SEC("uretprobe/alloc_ret")
+int alloc_ret(u64 *r) {
+    return on_return(r);
+}
+
+// Kernel 6.13+: one program for entry and return (a uprobe session).
+// Returning non-zero at entry skips the return probe for that call, so
+// unsampled calls pay for one probe, not two. The attach cookie holds the
+// probe's address (bits 8+) and which function it is (bits 0-7); the
+// return is told apart from the entry by `ip`, which at entry is the
+// probe address and at return is the caller's.
+SEC("uprobe.session/alloc")
+int alloc_session(u64 *r) {
+    u64 ck = get_attach_cookie(r);
+    if (r[R_IP / 8] != ck >> 8)
+        return on_return(r);
+    u64 size;
+    switch (ck & 0xff) {
+    case 0: size = r[R_SI / 8]; break;                 // _PyMem_RawMalloc(ctx, size)
+    case 1: size = r[R_SI / 8] * r[R_DX / 8]; break;   // _PyMem_RawCalloc(ctx, n, size)
+    case 2: size = r[R_DX / 8]; break;                 // _PyMem_RawRealloc(ctx, p, size)
+    case 3: size = r[R_DI / 8]; break;                 // malloc(size)
+    case 4: size = r[R_DI / 8] * r[R_SI / 8]; break;   // calloc(n, size)
+    default: size = r[R_SI / 8]; break;                // realloc(p, size)
+    }
+    return sample_entry(r, size) ? 0 : 1;
 }

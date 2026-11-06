@@ -176,8 +176,14 @@ mod imp {
     struct Site {
         path: String,
         offset: u64,
+        /// Address of the probe in the target (after any `endbr64`).
+        addr: u64,
         section: &'static str,
+        /// Which function, for the session program's cookie.
+        variant: u64,
     }
+
+    const ENDBR64: [u8; 4] = [0xf3, 0x0f, 0x1e, 0xfa];
 
     const RAW: [(&str, &str); 3] = [
         ("_PyMem_RawMalloc", "uprobe/malloc_ctx"),
@@ -222,29 +228,41 @@ mod imp {
         ctx: &RecordContext<'_>,
         module: &Module,
         set: &[(&str, &'static str); 3],
+        first_variant: u64,
     ) -> Option<Vec<Site>> {
         set.iter()
-            .map(|&(name, section)| {
-                let addr = ctx.src.find_symbol(module, name).ok()??;
+            .zip(first_variant..)
+            .map(|(&(name, section), variant)| {
+                let mut addr = ctx.src.find_symbol(module, name).ok()??;
+                // Skip `endbr64` (CET builds of glibc): the kernel must
+                // single-step it out of line, which made each hit tens of
+                // microseconds; the next instruction (`push %rbp`) is
+                // emulated. Registers and the stack are the same there.
+                let mut head = [0u8; 4];
+                if ctx.src.read(addr, &mut head).is_ok() && head == ENDBR64 {
+                    addr += 4;
+                }
                 let (path, offset) = file_offset(ctx.target.pid, addr)?;
                 Some(Site {
                     path,
                     offset,
+                    addr,
                     section,
+                    variant,
                 })
             })
             .collect()
     }
 
     fn large_sites(ctx: &RecordContext<'_>) -> Result<(Vec<Site>, &'static str)> {
-        if let Some(s) = sites(ctx, &ctx.target.runtime.module, &RAW) {
+        if let Some(s) = sites(ctx, &ctx.target.runtime.module, &RAW, 0) {
             return Ok((s, "_PyMem_Raw*"));
         }
         let mods = ctx.src.modules()?;
         let libc = mods
             .iter()
             .find(|m| m.name.starts_with("libc.so") || m.name.starts_with("libc-"));
-        if let Some(s) = libc.and_then(|m| sites(ctx, m, &LIBC)) {
+        if let Some(s) = libc.and_then(|m| sites(ctx, m, &LIBC, 3)) {
             return Ok((s, "libc malloc"));
         }
         Err(Error::Unsupported(
@@ -301,14 +319,12 @@ mod imp {
             )));
         }
 
-        let mut wanted = vec!["uretprobe/alloc_ret"];
+        let mut loaded = sys::load()?;
         if arenas {
-            wanted.extend(["raw_tracepoint/sys_enter", "raw_tracepoint/sys_exit"]);
+            loaded.load_program("raw_tracepoint/sys_enter", 0)?;
+            loaded.load_program("raw_tracepoint/sys_exit", 0)?;
         }
-        for s in &large_sites_found {
-            wanted.push(s.section);
-        }
-        let loaded = sys::load(&wanted)?;
+
         let interval = ctx.opts.sampling.byte_interval;
         let cfg = Config {
             tgid: pid as u64,
@@ -344,18 +360,50 @@ mod imp {
                 )?);
             }
         }
-        let ret = loaded.program("uretprobe/alloc_ret").unwrap();
-        for s in &large_sites_found {
-            // Return probe first, so no sampled entry waits for a return
-            // probe that is not there yet.
-            links.push(sys::attach_uprobe(ret, &s.path, s.offset, pid, true)?);
-            links.push(sys::attach_uprobe(
-                loaded.program(s.section).unwrap(),
-                &s.path,
-                s.offset,
-                pid,
-                false,
-            )?);
+        // Large objects: one uprobe session where the kernel has them
+        // (unsampled calls skip the return probe), else a uprobe and a
+        // uretprobe per function.
+        let mut large_mode = "none";
+        if large {
+            let path = &large_sites_found[0].path;
+            let offsets: Vec<u64> = large_sites_found.iter().map(|s| s.offset).collect();
+            let cookies: Vec<u64> = large_sites_found
+                .iter()
+                .map(|s| (s.addr << 8) | s.variant)
+                .collect();
+            let session = loaded
+                .load_program("uprobe.session/alloc", sys::BPF_TRACE_UPROBE_SESSION)
+                .and_then(|()| {
+                    let p = loaded.program("uprobe.session/alloc").unwrap();
+                    sys::attach_uprobe_session(p, path, &offsets, &cookies, pid)
+                });
+            match session {
+                Ok(link) => {
+                    links.push(link);
+                    large_mode = "session";
+                }
+                Err(Error::PermissionDenied(m)) => return Err(Error::PermissionDenied(m)),
+                Err(_) => {
+                    loaded.load_program("uretprobe/alloc_ret", 0)?;
+                    for s in &large_sites_found {
+                        loaded.load_program(s.section, 0)?;
+                    }
+                    let ret = loaded.program("uretprobe/alloc_ret").unwrap();
+                    for s in &large_sites_found {
+                        // Return probe first, so no sampled entry waits for
+                        // a return probe that is not there yet.
+                        links.push(sys::attach_uprobe(ret, &s.path, s.offset, pid, true)?);
+                        links.push(sys::attach_uprobe(
+                            loaded.program(s.section).unwrap(),
+                            &s.path,
+                            s.offset,
+                            pid,
+                            false,
+                        )?);
+                    }
+                    large_mode = "uprobe+uretprobe";
+                }
+            }
         }
         let attached = Attached { _links: links };
         {
@@ -364,6 +412,7 @@ mod imp {
                 "heapspy.ebpf.large_object_probes",
                 if large { large_via } else { "none" },
             )?;
+            w.add_meta("heapspy.ebpf.large_object_attach", large_mode)?;
         }
         common::note_events(&mut ctx.sink, recorded, &skipped)?;
 

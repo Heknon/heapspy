@@ -31,6 +31,9 @@ const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;
 const BPF_PROG_LOAD: u32 = 5;
 const BPF_RAW_TRACEPOINT_OPEN: u32 = 17;
+const BPF_LINK_CREATE: u32 = 28;
+/// `enum bpf_attach_type`: uprobe sessions, kernel 6.13+.
+pub const BPF_TRACE_UPROBE_SESSION: u32 = 57;
 
 const PROG_KPROBE: u32 = 2;
 const PROG_RAW_TRACEPOINT: u32 = 17;
@@ -158,10 +161,12 @@ pub struct Program {
     pub fd: Fd,
 }
 
-/// Every map and program of [`OBJECT`].
+/// The maps of [`OBJECT`], and its programs as loaded so far.
 pub struct Loaded {
     pub maps: HashMap<String, Map>,
     pub programs: Vec<Program>,
+    /// Section name -> instructions with map references patched in.
+    insns: HashMap<String, Vec<u8>>,
 }
 
 impl Loaded {
@@ -171,12 +176,36 @@ impl Loaded {
     pub fn program(&self, section: &str) -> Option<&Program> {
         self.programs.iter().find(|p| p.section == section)
     }
+
+    /// Load the program in `section` with `expected_attach_type` (0 for
+    /// none). Errors leave the other programs as they are.
+    pub fn load_program(&mut self, section: &str, expected_attach_type: u32) -> Result<()> {
+        if self.program(section).is_some() {
+            return Ok(());
+        }
+        let insns = self
+            .insns
+            .get(section)
+            .ok_or_else(|| Error::Unsupported(format!("BPF object has no program {section}")))?;
+        let kind = if section.starts_with("raw_tracepoint/") {
+            PROG_RAW_TRACEPOINT
+        } else {
+            PROG_KPROBE
+        };
+        let license = CString::new("GPL").unwrap();
+        let fd = load_prog(kind, expected_attach_type, insns, &license, section)?;
+        self.programs.push(Program {
+            section: section.to_string(),
+            fd,
+        });
+        Ok(())
+    }
 }
 
-/// Load [`OBJECT`]: create its maps (legacy `maps` section, no BTF), patch
-/// map references into the instructions, and load each program whose
-/// section name is in `wanted`.
-pub fn load(wanted: &[&str]) -> Result<Loaded> {
+/// Read [`OBJECT`]: create its maps (legacy `maps` section, no BTF) and
+/// patch map references into each program's instructions. Programs are
+/// loaded with [`Loaded::load_program`].
+pub fn load() -> Result<Loaded> {
     let fmt = |e: object::Error| Error::Unsupported(format!("bad BPF object: {e}"));
     let obj = object::File::parse(OBJECT).map_err(fmt)?;
     let maps_sec = obj
@@ -201,11 +230,18 @@ pub fn load(wanted: &[&str]) -> Result<Loaded> {
         by_symbol.insert(sym.index(), m.fd.as_raw_fd());
         maps.insert(name, m);
     }
-    let license = CString::new("GPL").unwrap();
-    let mut programs = Vec::new();
+    let mut insns_by = HashMap::new();
     for sec in obj.sections() {
         let Ok(name) = sec.name() else { continue };
-        if !wanted.contains(&name) {
+        if ![
+            "raw_tracepoint/",
+            "uprobe/",
+            "uretprobe/",
+            "uprobe.session/",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
+        {
             continue;
         }
         let mut insns = sec.data().map_err(fmt)?.to_vec();
@@ -222,27 +258,23 @@ pub fn load(wanted: &[&str]) -> Result<Loaded> {
             insns[o + 1] = (insns[o + 1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
             insns[o + 4..o + 8].copy_from_slice(&(fd as u32).to_ne_bytes());
         }
-        let kind = if name.starts_with("raw_tracepoint/") {
-            PROG_RAW_TRACEPOINT
-        } else {
-            PROG_KPROBE
-        };
-        let fd = load_prog(kind, &insns, &license, name)?;
-        programs.push(Program {
-            section: name.to_string(),
-            fd,
-        });
+        insns_by.insert(name.to_string(), insns);
     }
-    Ok(Loaded { maps, programs })
+    Ok(Loaded {
+        maps,
+        programs: Vec::new(),
+        insns: insns_by,
+    })
 }
 
-fn load_prog(kind: u32, insns: &[u8], license: &CString, name: &str) -> Result<Fd> {
+fn load_prog(kind: u32, expected: u32, insns: &[u8], license: &CString, name: &str) -> Result<Fd> {
     let attempt = |log: &mut [u8]| {
         let mut a = [0u8; 128];
         put32(&mut a, 0, kind);
         put32(&mut a, 4, (insns.len() / 8) as u32);
         put64(&mut a, 8, insns.as_ptr() as u64);
         put64(&mut a, 16, license.as_ptr() as u64);
+        put32(&mut a, 68, expected);
         if !log.is_empty() {
             put32(&mut a, 24, 1);
             put32(&mut a, 28, log.len() as u32);
@@ -281,6 +313,29 @@ pub fn attach_raw_tracepoint(prog: &Program, tp: &str) -> Result<Fd> {
     put32(&mut a, 8, prog.fd.as_raw_fd() as u32);
     let r = bpf(BPF_RAW_TRACEPOINT_OPEN, &mut a)
         .map_err(|e| privilege_error(&format!("attaching to raw tracepoint {tp}"), &e))?;
+    Ok(fd_from(r))
+}
+
+/// Attach a uprobe session program to `offsets` of `path`, for `pid`, with
+/// one cookie per offset (kernel 6.13+). The descriptor is the link.
+pub fn attach_uprobe_session(
+    prog: &Program,
+    path: &str,
+    offsets: &[u64],
+    cookies: &[u64],
+    pid: u32,
+) -> Result<Fd> {
+    let cpath = CString::new(path).map_err(|_| Error::Unsupported("bad module path".into()))?;
+    let mut a = [0u8; 128];
+    put32(&mut a, 0, prog.fd.as_raw_fd() as u32);
+    put32(&mut a, 8, BPF_TRACE_UPROBE_SESSION);
+    put64(&mut a, 16, cpath.as_ptr() as u64);
+    put64(&mut a, 24, offsets.as_ptr() as u64);
+    put64(&mut a, 40, cookies.as_ptr() as u64);
+    put32(&mut a, 48, offsets.len() as u32);
+    put32(&mut a, 56, pid);
+    let r = bpf(BPF_LINK_CREATE, &mut a)
+        .map_err(|e| privilege_error(&format!("uprobe session on {path}"), &e))?;
     Ok(fd_from(r))
 }
 
