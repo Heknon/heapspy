@@ -55,7 +55,7 @@ Also used for `before` and `after` in a diff.
 | `source.kind` | string | `"pid"`, `"core"` or `"minidump"` |
 | `source.ref` | string | the PID as text, or the core / minidump path as given to `dump` |
 | `contents_captured` | bool | the snapshot holds string contents and ordinary dict keys |
-| `truncated` | bool | the dump did not finish; all numbers are lower bounds |
+| `truncated` | bool | the dump did not finish, or the memory image was incomplete (e.g. a core file cut short); all numbers are lower bounds |
 
 ### Path hop (PathHop)
 
