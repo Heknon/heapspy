@@ -234,8 +234,11 @@ ENV_MAX_WINDOW = "HEAPSPY_MCP_MAX_WINDOW"
 ENV_NO_HOST_CONTEXT = "HEAPSPY_MCP_NO_HOST_CONTEXT"
 ENV_PROC_ROOT = "HEAPSPY_MCP_PROC_ROOT"
 ENV_CGROUP_ROOT = "HEAPSPY_MCP_CGROUP_ROOT"
+ENV_MAX_STALL_RATE = "HEAPSPY_MCP_MAX_STALL_RATE"
 DEFAULT_WINDOW = 2.0
 DEFAULT_MAX_WINDOW = 10.0
+DEFAULT_MAX_STALL_RATE = 100.0
+MAX_STALL_RATE_LIMIT = 1000.0
 
 
 @dataclass
@@ -243,12 +246,14 @@ class DiagnosticsConfig:
     """``max_window_s`` caps every measurement window. ``host_context=False`` leaves
     host-wide figures (load, steal, host PSI) out of the process tools. ``proc_root``
     and ``cgroup_root`` point at a host ``/proc`` or cgroup v2 mount when the server
-    sees them somewhere other than the usual place."""
+    sees them somewhere other than the usual place. ``max_stall_rate_hz`` caps the
+    per-thread sampling rate of ``watch_process_stalls``."""
 
     max_window_s: float = DEFAULT_MAX_WINDOW
     host_context: bool = True
     proc_root: Path = Path("/proc")
     cgroup_root: Path | None = None
+    max_stall_rate_hz: float = DEFAULT_MAX_STALL_RATE
 
     @classmethod
     def from_sources(
@@ -258,6 +263,7 @@ class DiagnosticsConfig:
         no_host_context: bool = False,
         proc_root: str | None = None,
         cgroup_root: str | None = None,
+        max_stall_rate: float | None = None,
         env: dict[str, str] | None = None,
     ) -> DiagnosticsConfig:
         env = dict(os.environ) if env is None else env
@@ -268,11 +274,15 @@ class DiagnosticsConfig:
                 raise ConfigError(f"{name}={value!r} is not a directory")
         if max_window is not None and max_window <= 0:
             raise ConfigError("--max-window must be positive")
+        rate = max_stall_rate or _float_env(env, ENV_MAX_STALL_RATE, DEFAULT_MAX_STALL_RATE)
+        if not 1 <= rate <= MAX_STALL_RATE_LIMIT:
+            raise ConfigError(f"--max-stall-rate must be 1 to {MAX_STALL_RATE_LIMIT:g} Hz")
         return cls(
             max_window_s=max_window or _float_env(env, ENV_MAX_WINDOW, DEFAULT_MAX_WINDOW),
             host_context=not (no_host_context or parse_bool(env.get(ENV_NO_HOST_CONTEXT))),
             proc_root=Path(proc) if proc else Path("/proc"),
             cgroup_root=Path(cgroup) if cgroup else None,
+            max_stall_rate_hz=rate,
         )
 
 
@@ -297,6 +307,13 @@ def add_diagnostics_arguments(parser: argparse.ArgumentParser) -> None:
         help=f"cgroup v2 mount to read instead of the one in /proc/self/mountinfo "
         f"(also ${ENV_CGROUP_ROOT})",
     )
+    g.add_argument(
+        "--max-stall-rate",
+        type=float,
+        metavar="HZ",
+        help=f"cap on the per-thread sampling rate of watch_process_stalls "
+        f"(also ${ENV_MAX_STALL_RATE}; default {DEFAULT_MAX_STALL_RATE:g})",
+    )
 
 
 def diagnostics_from_args(args: argparse.Namespace) -> DiagnosticsConfig:
@@ -305,4 +322,5 @@ def diagnostics_from_args(args: argparse.Namespace) -> DiagnosticsConfig:
         no_host_context=args.no_host_context,
         proc_root=args.proc_root,
         cgroup_root=args.cgroup_root,
+        max_stall_rate=getattr(args, "max_stall_rate", None),
     )

@@ -110,8 +110,10 @@ def top(overrides: dict[str, Any]) -> str:
                 "psi_memory_some_window_pct": 30,
                 "psi_memory_full_window_pct": 10,
                 "major_faults_per_s": 900,
+                "refaults_per_s": 5000,
+                "memory_stall_share_of_active": 0.8,
             },
-            "memory_pressure",
+            "memory_thrashing",
         ),
         (
             {"psi_io_some_window_pct": 40, "iowait_seconds_per_s": 0.6, "disk_wait_share": 0.5},
@@ -167,3 +169,96 @@ def test_throttling_explains_runqueue_wait_on_idle_host() -> None:
     assert res[0]["id"] == "cfs_throttling"
     rq = next(h for h in res if h["id"] == "runqueue_contention")
     assert any(e["signal"] == "cfs_throttled_ratio" for e in rq["evidence_against"])
+
+
+THRASH = {
+    "major_faults_per_s": 150.0,
+    "refaults_per_s": 1000.0,
+    "refaults_source": "cgroup memory.stat",
+    "psi_memory_some_window_pct": 0.4,
+    "psi_memory_full_window_pct": 0.4,
+    "memory_stall_share_of_active": 1.0,
+    "memory_stall_no_progress_seconds_per_s": 0.95,
+    "cpu_cores_used": 0.01,
+    # The same fault waits show up as I/O pressure and D state.
+    "psi_io_some_window_pct": 60.0,
+    "disk_wait_share": 0.0,
+    "block_io_wait_share": 0.0,
+    "stopped_or_frozen_share": 0.0,
+    "deliberately_frozen": False,
+}
+
+
+def test_thrashing_with_slow_refaults_ranks_above_io_pressure() -> None:
+    res = rank(THRASH)
+    assert res[0]["id"] == "memory_thrashing"
+    io = next(h for h in res if h["id"] == "io_pressure")
+    assert io["score"] < res[0]["score"]
+    assert any(e["signal"] == "disk_wait_share" for e in io["evidence_against"])
+
+
+def test_no_memory_stall_signals_is_not_indicated() -> None:
+    res = rank({"refaults_per_s": 0.0, "memory_stall_share_of_active": 0.0})
+    mem = next(h for h in res if h["id"] == "memory_thrashing")
+    assert mem["assessment"] == "not_indicated"
+    signals = {e["signal"] for e in mem["evidence_against"]}
+    assert {"major_faults_per_s", "refaults_per_s", "memory_stall_share_of_active"} <= signals
+
+
+def test_memory_signals_missing_are_unknown() -> None:
+    res = rank(
+        {"refaults_per_s": None, "memory_stall_share_of_active": None},
+        {"refaults_per_s": "no counters", "memory_stall_share_of_active": "not sampled"},
+    )
+    mem = next(h for h in res if h["id"] == "memory_thrashing")
+    unknown = {u["signal"] for u in mem["unknown"]}
+    assert unknown >= {"refaults_per_s", "memory_stall_share_of_active"}
+
+
+def test_deliberately_frozen_makes_the_rest_moot() -> None:
+    s = {**BASE, **THRASH, "deliberately_frozen": True, "stopped_or_frozen_share": 1.0}
+    s["cgroup_frozen"] = True
+    res = dg.evaluate(s, {})
+    assert all(h["moot_because"] == "deliberately_frozen" for h in res)
+    mem = next(h for h in res if h["id"] == "memory_thrashing")
+    assert any(e["threshold_name"] == "frozen_share" for e in mem["evidence_against"])
+    (fact,) = dg.fact_checks(s, {})
+    assert fact["id"] == "deliberately_frozen" and fact["value"] is True
+    assert "moot" in fact["consequence"]
+    (fact,) = dg.fact_checks({**BASE, "deliberately_frozen": None}, {"deliberately_frozen": "x"})
+    assert fact["value"] is None and fact["reason"] == "x"
+
+
+def test_stall_signals_from_a_watch_result() -> None:
+    stalls = {
+        "process": {
+            "memory_stall_share_of_active": 0.6,
+            "memory_stall_no_progress_seconds_per_s": 0.0,
+            "category_share": {"page_fault_io": 0.6, "running": 0.3, "block_io": 0.1},
+            "system_share": 0.97,
+        },
+        "environment": {"cgroup_memory": {"refaults_per_s": 2500.0}, "host": {}},
+        "frozen_or_stopped": {"cgroup_frozen": False, "assessment": "not_frozen_or_stopped"},
+    }
+    s: dict[str, Any] = {}
+    reasons: dict[str, str] = {}
+    dg._stall_signals(s, reasons, stalls, None)
+    assert s["refaults_per_s"] == 2500.0 and s["refaults_source"] == "cgroup memory.stat"
+    assert s["disk_wait_share"] == 0.1 and s["deliberately_frozen"] is False
+    s, reasons = {}, {}
+    dg._stall_signals(s, reasons, None, "pid exited")
+    assert s["memory_stall_share_of_active"] is None
+    assert reasons["memory_stall_share_of_active"] == "pid exited"
+
+
+def test_every_new_threshold_has_a_meaning() -> None:
+    for name in ("refaults_per_s_high", "memory_stall_share_high", "frozen_share"):
+        value, unit, meaning = dg.THRESHOLDS[name]
+        assert value > 0 and unit and len(meaning) > 10
+
+
+def test_focus_groups_name_real_hypotheses() -> None:
+    ids = {h["id"] for h in rank({})}
+    for group in dg.FOCUS.values():
+        assert group <= ids
+    assert "memory_pressure" not in ids

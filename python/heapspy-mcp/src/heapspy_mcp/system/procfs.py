@@ -383,3 +383,89 @@ def parse_nofile_limit(text: str) -> int | None:
 
 def parse_uptime(text: str) -> float:
     return float(text.split()[0])
+
+
+# --- memory -------------------------------------------------------------------
+
+
+def parse_kb_fields(text: str, keys: tuple[str, ...] | None = None) -> dict[str, int]:
+    """``Key:   123 kB`` lines (``status``, ``smaps_rollup``, ``meminfo``) to bytes.
+
+    Lines without a ``kB`` unit (``HugePages_Total: 0``) are kept as plain counts.
+    ``keys`` limits the result to those names.
+    """
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep or (keys is not None and key not in keys):
+            continue
+        parts = value.split()
+        if not parts or not parts[0].isdigit():
+            continue
+        n = int(parts[0])
+        out[key] = n * 1024 if len(parts) > 1 and parts[1] == "kB" else n
+    return out
+
+
+STATUS_MEMORY_KEYS = ("VmRSS", "VmHWM", "VmSwap", "RssAnon", "RssFile", "RssShmem")
+SMAPS_ROLLUP_KEYS = ("Rss", "Pss", "Swap", "SwapPss", "Anonymous", "Pss_Anon", "Pss_File")
+MEMINFO_KEYS = ("MemTotal", "MemFree", "MemAvailable", "SwapTotal", "SwapFree", "Dirty")
+
+
+def parse_status_memory(text: str) -> dict[str, int]:
+    """Memory lines of ``/proc/<pid>/status`` in bytes (``VmSwap`` and ``Rss*`` need 4.5+)."""
+    return parse_kb_fields(text, STATUS_MEMORY_KEYS)
+
+
+def parse_smaps_rollup(text: str) -> dict[str, int]:
+    """``/proc/<pid>/smaps_rollup`` (4.14+) totals in bytes; the header line is skipped."""
+    return parse_kb_fields(text, SMAPS_ROLLUP_KEYS)
+
+
+def parse_vmstat(text: str) -> dict[str, int]:
+    """``/proc/vmstat``: one ``name value`` counter per line."""
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            try:
+                out[parts[0]] = int(parts[1])
+            except ValueError:
+                continue
+    return out
+
+
+def _bare_function(name: str) -> str:
+    """``shrink_node.isra.0`` -> ``shrink_node``; a leading ``.`` (ppc64) is kept."""
+    head, dot, _ = name[1:].partition(".")
+    return name[0] + head if dot else name
+
+
+def parse_stack(text: str | None) -> list[str]:
+    """Function names of ``/proc/<tid>/stack``, innermost first, without offsets.
+
+    Lines look like ``[<0>] folio_wait_bit_common+0x110/0x310`` (addresses are
+    hidden unless ``kptr_restrict`` allows them) and may end with a module name
+    in brackets. Compiler suffixes such as ``.isra.0`` or ``.constprop.0`` are
+    removed so names match across builds.
+    """
+    if not text:
+        return []
+    frames: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            _, _, line = line.partition("] ")
+        name = line.split("+", 1)[0].split(" ", 1)[0].strip()
+        if not name or name.startswith("0x"):
+            continue
+        frames.append(_bare_function(name))
+    return frames
+
+
+def parse_wchan(text: str | None) -> str | None:
+    """``/proc/<tid>/wchan``: a function name, or None for ``0`` (running) and empty."""
+    if text is None:
+        return None
+    value = text.strip()
+    return None if value in ("", "0") else _bare_function(value)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
@@ -22,31 +23,44 @@ from pydantic import Field
 from ..config import DEFAULT_WINDOW, Config
 from ..processes import matches_allowlist, version_from_exe, version_from_maps_text
 from . import diagnose as dg
-from . import perf, views, windows
+from . import perf, stalls, views, windows
 from . import procfs as pf
 from . import search as srch
 from .sampling import ProcessGone, identify
 
 T = TypeVar("T")
 
+if sys.version_info < (3, 11):  # pragma: no cover
+    from exceptiongroup import BaseExceptionGroup
+
 PROCESS_WORKFLOW = """\
 Process diagnostics (any process, not only Python):
 
 1. If you do not know the pid: scan_processes (outliers by metric over one window, plus
    factual conditions such as threads in disk wait, zombies, fd use near the limit, RSS that
-   grew on every sample, throttled cgroups, OOM kills), or find_processes (filters such as
-   name, cmdline, user, parent, cgroup, container id, pod UID, state; sort_by one metric).
+   grew on every sample, throttled cgroups, sustained major faults, memory pressure, threads
+   in D in a memory wait, frozen cgroups and stopped processes, OOM kills), or find_processes
+   (filters such as name, cmdline, user, parent, cgroup, container id, pod UID, state; sort_by
+   one metric).
 2. process_cpu(pid): CPU split, context switches (voluntary vs non-voluntary), run-queue wait,
    migrations, thread states, wait sites, top threads, and the process's environment: its
    cgroup (quota, throttling, pressure, cpuset, pod/container) and host CPU, steal and PSI.
-3. hw_counters(pid): IPC and last-level cache misses per 1000 instructions, when the host
+3. Process hangs or is intermittently slow: watch_process_stalls(pid), then diagnose_process.
+   It samples every thread at 20 Hz: the share of time in each kernel wait category
+   (page-fault I/O, direct reclaim, memory.high throttling, compaction, futex, poll, block
+   I/O, stopped or frozen, ...), fault rates, and the longest stretches with no CPU progress
+   with example kernel stacks; plus the memory cgroup's limits, events, refaults and pressure,
+   and whether the process is frozen or stopped on purpose.
+4. hw_counters(pid): IPC and last-level cache misses per 1000 instructions, when the host
    exposes a PMU; software events otherwise.
-4. diagnose_process_cpu(pid): all of the above in one window, with each competing explanation
-   scored against the numbers (evidence for, against, and unknown), plus next measurements.
-   It ranks fits; it does not establish a cause.
-5. snapshot_process_metrics(pid, work_rate?) before and after a change, then
+5. diagnose_process(pid, focus?): all of the above in one window, with each competing
+   explanation scored against the numbers (evidence for, against, and unknown), plus next
+   measurements, after a check for a deliberately frozen or stopped process.
+   diagnose_process_cpu is the same tool under its earlier name. It ranks fits; it does not
+   establish a cause.
+6. snapshot_process_metrics(pid, work_rate?) before and after a change, then
    compare_process_snapshots: CPU per unit of work and how each metric moved.
-6. For Python processes, go deeper with the heap tools (capture_snapshot, heap_summary) or
+7. For Python processes, go deeper with the heap tools (capture_snapshot, heap_summary) or
    stack tools where available.
 
 Search and scan are open to any process the server can see. Per-pid tools need the pid on the
@@ -139,6 +153,35 @@ def python_info(proc_root: Path, pid: int, exe: str | None, name: str | None) ->
         "is_python": bool(version) or by_name,
         "python_version": version,
         "free_threaded": free,
+    }
+
+
+FOCUS_CHOICES = ("all", "cpu", "memory", "io")
+DIAGNOSE_STALL_RATE_HZ = 10.0
+
+
+def _stall_digest(st: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The stall numbers diagnose_process scored, without per-thread rows."""
+    if st is None:
+        return None
+    pr = st["process"]
+    keys = (
+        "major_faults_per_s",
+        "minor_faults_per_s",
+        "system_share",
+        "category_share",
+        "category_share_of_active",
+        "memory_stall_share_of_active",
+        "memory_stall_no_progress_seconds_per_s",
+        "no_progress_seconds_by_category",
+        "memory",
+        "delay_accounting",
+    )
+    return {
+        **{k: pr.get(k) for k in keys},
+        "longest_no_progress_intervals": pr["longest_no_progress_intervals"][:3],
+        "frozen_or_stopped": st["frozen_or_stopped"],
+        "note": "watch_process_stalls gives per-thread rows, more intervals and example stacks",
     }
 
 
@@ -246,11 +289,15 @@ def register(server: MCPServer, config: Config) -> None:
         description=(
             "One pass over every process: the top processes for each metric (outliers by "
             "metric: CPU, RSS and its growth, threads, context switches, run-queue wait, "
-            "iowait, open fds and fd limit use, read/write bytes, uptime, cgroup throttling), "
-            "and factual conditions with raw values: threads in disk wait for the whole "
-            "window, zombies by parent, fd use above a stated share of RLIMIT_NOFILE, RSS that "
-            "grew on every sample, cgroups throttled in the window, OOM-kill counters. Use it "
-            "when you do not yet know which process to look at. Read-only; no allowlist needed."
+            "iowait, open fds and fd limit use, read/write bytes, uptime, cgroup throttling, "
+            "major faults), and factual conditions with raw values: threads in disk wait for "
+            "the whole window, zombies by parent, fd use above a stated share of "
+            "RLIMIT_NOFILE, RSS that grew on every sample, cgroups throttled in the window, "
+            "major faults above a stated rate for the whole window, cgroups with memory "
+            "pressure 'full' in the window, threads in D in a memory-management wait (with "
+            "other D threads as candidates for watch_process_stalls), frozen cgroups and "
+            "stopped processes, OOM-kill counters. Use it when you do not yet know which "
+            "process to look at. Read-only; no allowlist needed."
         ),
     )
     async def scan_processes(
@@ -261,6 +308,13 @@ def register(server: MCPServer, config: Config) -> None:
         fd_threshold_pct: Annotated[
             float, Field(description="Report fd use above this % of the soft limit.")
         ] = srch.DEFAULT_FD_THRESHOLD_PCT,
+        major_fault_threshold_per_s: Annotated[
+            float,
+            Field(
+                description="Report processes with at least this many major faults per "
+                "second in every interval of the window."
+            ),
+        ] = srch.DEFAULT_MAJOR_FAULT_THRESHOLD_PER_S,
         include_kernel_threads: bool = False,
     ) -> dict[str, Any]:
         async def body() -> dict[str, Any]:
@@ -272,6 +326,7 @@ def register(server: MCPServer, config: Config) -> None:
                 fd_threshold_pct=fd_threshold_pct,
                 include_kernel_threads=include_kernel_threads,
                 cgroup_root=d.cgroup_root,
+                major_fault_threshold_per_s=major_fault_threshold_per_s,
             )
 
         return await _guard(body)
@@ -389,52 +444,174 @@ def register(server: MCPServer, config: Config) -> None:
     @server.tool(
         annotations=read_only,
         description=(
+            "Sample every thread of one process at a fixed rate over a window (default 5 s at "
+            "20 Hz) to see whether it keeps leaving its hot path for the kernel: per thread, the "
+            "share of samples in each state and kernel wait category (page_fault_io, "
+            "direct_reclaim, memcg_high_throttle, dirty_throttle, compaction, oom, futex, poll, "
+            "nanosleep, ipc_wait, block_io, stopped_or_frozen, running, other), major and minor "
+            "faults per second, and the longest intervals in which its CPU time did not advance "
+            "while it was not voluntarily idle, each with its dominant category and an example "
+            "kernel stack. Per process: fault totals, RSS and swap, delay accounting when "
+            "enabled, and whether the process is frozen by a cgroup freezer or stopped. "
+            "environment: the memory cgroup (usage against memory.max/memory.high, "
+            "memory.events and memory.stat deltas, memory.pressure over the window) and host "
+            "memory PSI and /proc/vmstat reclaim and refault counters. Use it when a process "
+            "hangs or is intermittently slow; then diagnose_process. Kernel stacks need root; "
+            "without them categories come from wchan."
+        ),
+    )
+    async def watch_process_stalls(
+        pid: PidArg,
+        window_s: Annotated[
+            float,
+            Field(
+                description=f"Seconds to sample (default {stalls.DEFAULT_STALL_WINDOW:g}; capped "
+                "at the server's --max-window)."
+            ),
+        ] = stalls.DEFAULT_STALL_WINDOW,
+        rate_hz: Annotated[
+            float,
+            Field(
+                description=f"Samples per second per thread (default {stalls.DEFAULT_RATE_HZ:g}; "
+                "capped at the server's --max-stall-rate, default 100)."
+            ),
+        ] = stalls.DEFAULT_RATE_HZ,
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            check_pid(config, pid)
+            if rate_hz <= 0:
+                raise DiagnosticsRefused("invalid_argument", "rate_hz must be positive")
+            return await stalls.watch(
+                d.proc_root,
+                pid,
+                _window(config, window_s),
+                rate_hz,
+                host=d.host_context,
+                cgroup_root=d.cgroup_root,
+                rate_cap_hz=d.max_stall_rate_hz,
+            )
+
+        return await _guard(body)
+
+    async def diagnose(pid: int, window_s: float, focus: str) -> dict[str, Any]:
+        if focus not in FOCUS_CHOICES:
+            raise DiagnosticsRefused(
+                "invalid_argument", f"focus must be one of {', '.join(FOCUS_CHOICES)}"
+            )
+        ident = check_pid(config, pid)
+        w = _window(config, window_s)
+        got: dict[str, Any] = {}
+
+        async def run_measure() -> None:
+            got["m"] = await measure(pid, w, hw=True)
+
+        async def run_stalls() -> None:
+            try:
+                got["stalls"] = await stalls.watch(
+                    d.proc_root,
+                    pid,
+                    w,
+                    min(DIAGNOSE_STALL_RATE_HZ, d.max_stall_rate_hz),
+                    host=d.host_context,
+                    cgroup_root=d.cgroup_root,
+                    rate_cap_hz=d.max_stall_rate_hz,
+                )
+            except ProcessGone as e:
+                got["stalls_reason"] = str(e)
+
+        # Both sample the same window side by side.
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(run_measure)
+                tg.start_soon(run_stalls)
+        except BaseExceptionGroup as eg:
+            raise eg.exceptions[0] from eg
+        m = got["m"]
+        st = got.get("stalls")
+        view = views.full_view(m)
+        hw = hw_block(m)
+        py = python_info(d.proc_root, pid, ident.get("exe"), ident.get("name"))
+        signals, reasons = dg.extract_signals(view, hw, py, st, got.get("stalls_reason"))
+        ranked = dg.evaluate(signals, reasons)
+        facts = dg.fact_checks(signals, reasons)
+        if focus != "all":
+            ranked = [h for h in ranked if h["id"] in dg.FOCUS[focus]]
+        caveats = [
+            "Scores compare these numbers with fixed thresholds from one window; they "
+            "rank how well each explanation fits, they do not prove one.",
+            "Several explanations can hold at once, and an unmeasured signal "
+            "(listed under unknown) can change the ranking.",
+        ]
+        if signals.get("deliberately_frozen"):
+            caveats.insert(0, facts[0]["consequence"])
+        return {
+            "pid": pid,
+            "comm": view["comm"],
+            "focus": focus,
+            "measurement": {
+                **view["measurement"],
+                "stall_sampling": st["measurement"] if st else None,
+            },
+            "python": py,
+            "fact_checks": facts,
+            "hypotheses": ranked,
+            "signals": signals,
+            "signal_unavailable_reasons": reasons,
+            "thresholds": dg.threshold_table(),
+            "caveats": caveats,
+            "process": {k: view[k] for k in ("cpu", "context_switches", "scheduler")},
+            "memory_stalls": _stall_digest(st),
+            "environment": {
+                **view["environment"],
+                "cgroup_memory": st["environment"]["cgroup_memory"] if st else None,
+                "host_memory": st["environment"]["host"] if st else None,
+            },
+            "hw": hw,
+        }
+
+    @server.tool(
+        annotations=read_only,
+        description=(
             "Measure one process and its environment over a window (process_cpu plus hardware "
-            "counters) and score competing explanations for its CPU use, CPU wait or slowness: "
+            "counters, and per-thread stall sampling as in watch_process_stalls at 10 Hz) and "
+            "score competing explanations for its CPU use, CPU wait, slowness or stalls: "
             "run-queue contention, cache or memory-bound contention, CFS throttling, lock "
-            "contention, spin-waiting or compute, GIL convoy, steal, memory pressure, I/O "
+            "contention, spin-waiting or compute, GIL convoy, steal, memory thrashing, I/O "
             "pressure. Each has evidence for, evidence against (raw value, threshold, weight) "
-            "and unknown signals, and next measurements to tell them apart. The ranking says "
-            "how well each fits these numbers; it does not establish a cause, and several can "
+            "and unknown signals, and next measurements to tell them apart. A fact check "
+            "first reports whether the process is deliberately frozen (cgroup freezer) or "
+            "stopped (signal, ptrace); if so the explanations are moot. focus lists only the "
+            "cpu, memory or io explanations (all are still measured). The ranking says how "
+            "well each fits these numbers; it does not establish a cause, and several can "
             "apply at once."
+        ),
+    )
+    async def diagnose_process(
+        pid: PidArg,
+        window_s: WindowArg = DEFAULT_WINDOW,
+        focus: Annotated[
+            str, Field(description=f"One of: {', '.join(FOCUS_CHOICES)}. Default all.")
+        ] = "all",
+    ) -> dict[str, Any]:
+        return await _guard(lambda: diagnose(pid, window_s, focus))
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Same as diagnose_process(pid, window_s, focus='all'); kept under its earlier "
+            "name. Scores explanations for a process's CPU use, CPU wait, slowness or "
+            "stalls, after checking whether it is deliberately frozen or stopped."
         ),
     )
     async def diagnose_process_cpu(
         pid: PidArg, window_s: WindowArg = DEFAULT_WINDOW
     ) -> dict[str, Any]:
-        async def body() -> dict[str, Any]:
-            ident = check_pid(config, pid)
-            m = await measure(pid, window_s, hw=True)
-            view = views.full_view(m)
-            hw = hw_block(m)
-            py = python_info(d.proc_root, pid, ident.get("exe"), ident.get("name"))
-            signals, reasons = dg.extract_signals(view, hw, py)
-            return {
-                "pid": pid,
-                "comm": view["comm"],
-                "measurement": view["measurement"],
-                "python": py,
-                "hypotheses": dg.evaluate(signals, reasons),
-                "signals": signals,
-                "signal_unavailable_reasons": reasons,
-                "thresholds": dg.threshold_table(),
-                "caveats": [
-                    "Scores compare these numbers with fixed thresholds from one window; they "
-                    "rank how well each explanation fits, they do not prove one.",
-                    "Several explanations can hold at once, and an unmeasured signal "
-                    "(listed under unknown) can change the ranking.",
-                ],
-                "process": {k: view[k] for k in ("cpu", "context_switches", "scheduler")},
-                "environment": view["environment"],
-                "hw": hw,
-            }
-
-        return await _guard(body)
+        return await _guard(lambda: diagnose(pid, window_s, "all"))
 
     @server.resource(
         "heapspy://process-workflow",
         name="process-workflow",
-        description="How to find and diagnose a process's CPU behaviour with these tools.",
+        description="How to find and diagnose a process's CPU use and stalls with these tools.",
         mime_type="text/markdown",
     )
     def process_workflow() -> str:

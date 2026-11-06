@@ -129,3 +129,13 @@ def test_main_parses_diagnostics_flags(fake_bin: Path) -> None:
     args = build_parser().parse_args(["--max-window", "3", "--no-host-context"])
     d = diagnostics_from_args(args)
     assert d.max_window_s == 3.0 and d.host_context is False
+    assert d.max_stall_rate_hz == 100.0
+    args = build_parser().parse_args(["--max-stall-rate", "40"])
+    assert diagnostics_from_args(args).max_stall_rate_hz == 40.0
+
+
+def test_stall_rate_cap_bounds() -> None:
+    env = {"HEAPSPY_MCP_MAX_STALL_RATE": "25"}
+    assert DiagnosticsConfig.from_sources(env=env).max_stall_rate_hz == 25.0
+    with pytest.raises(ConfigError, match="max-stall-rate"):
+        DiagnosticsConfig.from_sources(max_stall_rate=5000, env={})

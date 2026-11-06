@@ -22,8 +22,9 @@ of RSS falls outside the graph.
 
 The server also has process diagnostics for any process, not only Python: find
 or scan processes by measured metrics, then measure one process's CPU,
-scheduler behaviour and environment (cgroup, host) over a window, and weigh
-competing explanations for its CPU use or slowness. See
+scheduler behaviour and environment (cgroup, host) over a window, sample its
+threads for memory stalls (page-fault I/O, reclaim, `memory.high` throttling),
+and weigh competing explanations for its CPU use, slowness or stalls. See
 [Process diagnostics](#process-diagnostics).
 
 The same server also has CPU tools backed by [py-spy](https://github.com/benfred/py-spy):
@@ -85,6 +86,7 @@ Flags take precedence over environment variables.
 | `--no-host-context` | `HEAPSPY_MCP_NO_HOST_CONTEXT=1` | off | Leave host-wide load, steal and PSI out of the process tools' `environment` block. |
 | `--proc-root DIR` | `HEAPSPY_MCP_PROC_ROOT` | `/proc` | procfs to read. |
 | `--cgroup-root DIR` | `HEAPSPY_MCP_CGROUP_ROOT` | from `/proc/self/mountinfo` | A cgroup v2 mount to read instead, for example the host's cgroupfs mounted into a container. |
+| `--max-stall-rate HZ` | `HEAPSPY_MCP_MAX_STALL_RATE` | 100 | Cap on the per-thread sampling rate of `watch_process_stalls` (1 to 1000). |
 
 | `--py-spy-bin PATH` | `PY_SPY_BIN` | `py-spy` on `PATH`, else next to the server's Python | py-spy executable for the CPU tools. A configured path that is not executable stops the server at startup. If none is found the CPU tools return `py_spy_not_found`. |
 | `--cpu-max-duration SECONDS` | `HEAPSPY_MCP_CPU_MAX_DURATION` | 30 | Longest profile a CPU tool records (1 to 3600). Longer `duration_s` values are clamped, with a note in the result. |
@@ -293,11 +295,13 @@ to. The resource `heapspy://process-workflow` and the prompt
 
 1. Not sure which process? `scan_processes` or `find_processes`.
 2. `process_cpu(pid)` for one process and its environment.
-3. `hw_counters(pid)` for IPC and cache misses, where a PMU exists.
-4. `diagnose_process_cpu(pid)` to weigh explanations against one window of numbers.
-5. `snapshot_process_metrics` before and after a change, then
+3. Process hangs or is intermittently slow? `watch_process_stalls(pid)`, then
+   `diagnose_process(pid)`.
+4. `hw_counters(pid)` for IPC and cache misses, where a PMU exists.
+5. `diagnose_process(pid)` to weigh explanations against one window of numbers.
+6. `snapshot_process_metrics` before and after a change, then
    `compare_process_snapshots`.
-6. For Python processes, the heap tools above.
+7. For Python processes, the heap tools above.
 
 Conventions:
 
@@ -310,8 +314,10 @@ Conventions:
 - Lists are capped: 200 rows for `find_processes`, 20 per metric and 20 per
   condition for `scan_processes`, 20 threads per top list, 64 CPUs, 9 cgroup
   levels. Sampling reads at most 1024 threads per process in `process_cpu`,
-  64 per process and 20000 in total in a scan, and 128 threads in
-  `hw_counters`; the result says when it truncated.
+  64 per process and 20000 in total in a scan, 128 threads in `hw_counters`,
+  and 64 threads in `watch_process_stalls` (20 thread rows, 10 intervals per
+  process, 3 per thread, 8 frames per example stack); the result says when it
+  truncated.
 
 ### Process search
 
@@ -330,6 +336,7 @@ the server can see, filtered, and sorted by one metric:
 | `read_bytes_per_s`, `write_bytes_per_s` | `/proc/<pid>/io` (storage-layer bytes) |
 | `uptime_s` | start time against `/proc/uptime` |
 | `cfs_throttled_ratio` | `nr_throttled / nr_periods` of the process's cgroup in the window |
+| `major_faults_per_s` | `majflt` delta from `/proc/<pid>/stat` |
 
 Filters, all optional: `name` (glob on the name or the executable's file
 name), `cmdline` (substring), `cmdline_regex`, `user` (name or uid), `pids`,
@@ -340,24 +347,50 @@ with the rate metrics `null`. Each row has `pid`, `ppid`, `comm`, `exe`,
 redacted `cmdline`, `user`, `state`, `cgroup`, `kubernetes` (pod UID, QoS
 class, container id) and `metrics`.
 
-`scan_processes(window_s=2, limit_per_metric=5, fd_threshold_pct=80)` makes
-one pass over every process and returns `outliers_by_metric` (the top N for
-each metric above) and `conditions`, each with its definition and raw values:
+`scan_processes(window_s=2, limit_per_metric=5, fd_threshold_pct=80,
+major_fault_threshold_per_s=100)` makes one pass over every process and returns
+`outliers_by_metric` (the top N for each metric above) and `conditions`, each
+with its definition and raw values:
 
 - `disk_wait_whole_window`: threads in state `D` in all 5 samples of the window.
 - `zombies_by_parent`: processes in state `Z`, grouped by parent.
 - `fd_usage_above_threshold`: open fds above `fd_threshold_pct` of the soft `RLIMIT_NOFILE`.
 - `rss_grew_every_sample`: RSS strictly increased between each of the 5 samples.
 - `cgroups_throttled_in_window`: cgroups of scanned processes whose `nr_throttled` rose.
-- `oom_kill_counters`: cgroups whose v2 `memory.events` `oom_kill` is above 0.
+- `major_faults_whole_window`: major faults at or above
+  `major_fault_threshold_per_s` in each of the 4 intervals between the samples.
+- `cgroup_memory_pressure_full`: cgroup v2 directories of scanned processes
+  whose `memory.pressure` `full` total rose in the window, with `full` and
+  `some` as a share of the window. The root cgroup's row covers the whole host
+  and is listed last. On a host without a v2 hierarchy this is empty with a
+  note (cgroup v1 `memory.pressure_level` is an eventfd notification and cannot
+  be read).
+- `disk_wait_in_memory_management`: threads in `D` at the end of the window
+  whose kernel stack (as root) or `wchan` is in a memory-management category
+  (`page_fault_io`, `direct_reclaim`, `memcg_high_throttle`, `dirty_throttle`,
+  `compaction`, `oom`). Other `D` threads are listed as `d_state_candidates`
+  for `watch_process_stalls`, including a page or folio wait seen only through
+  `wchan`, which may be a fault or a `read(2)`. At most 64 threads are inspected.
+- `frozen_or_stopped`: cgroups frozen by the freezer (v2 `cgroup.events`
+  `frozen`, v1 `freezer.state` `FROZEN` or `FREEZING`) and processes in state
+  `T` or `t`. These are held on purpose; a v1-frozen task sits in `D` in
+  `__refrigerator` and is not listed as a memory wait.
+- `oom_kill_counters`: memory cgroups whose `oom_kill` counter is above 0 (v2
+  `memory.events`, v1 `memory.oom_control`).
 
 Both read a bounded set of files per process at the start and end of the
-window, plus `statm` (and thread states for processes that had threads in `D`)
-at three points inside it. Processes that exit mid-scan or cannot be read are
-skipped and counted in `skipped`; they never cause an error. Each result has a
-`cost` block with the time spent reading `/proc`. Measured on a 4-core VM with
-about 1000 processes: 0.29 to 0.34 s of CPU and wall time per call, outside the
-window's sleeps.
+window, plus `/proc/<pid>/stat` (RSS and the major-fault count; and thread
+states for processes that had threads in `D`) at three points inside it, and
+once per distinct cgroup `cpu.stat`, `memory.events` (or v1
+`memory.oom_control` and `memory.failcnt`), `memory.pressure` and the freezer
+state. Processes that exit mid-scan or cannot be read are skipped and counted
+in `skipped`; they never cause an error. Each result has a `cost` block with
+the time spent reading `/proc` and cgroup files, the number of distinct
+cgroups read, the number of `D` threads inspected, and the list of files read.
+Measured on a 4-core VM with about 1000 processes (1000 idle `sleep`
+processes added), outside the window's sleeps: 0.29 to 0.32 s of CPU and
+wall time per call before the memory conditions were added, 0.30 to 0.31 s
+after, with 6 distinct cgroups read.
 
 ### `process_cpu(pid, window_s=2, top_threads=5)`
 
@@ -446,10 +479,124 @@ The comparison gives each metric `before`, `after`, `change` and
 above 1 means CPU grew faster than work between the windows: the pattern to
 look for when a feedback loop is suspected.
 
-### `diagnose_process_cpu(pid, window_s=2)`
+### `watch_process_stalls(pid, window_s=5, rate_hz=20)`
 
-Measures the process, its environment and its hardware counters in one window
-and scores these explanations for its CPU use, CPU wait or slowness:
+For a process that hangs or is intermittently slow. A process that keeps
+taking page faults, or waits in reclaim, swap-in or `memory.high` throttling,
+keeps leaving its hot path for the kernel; it looks hung or slow while its own
+code is fine. This tool samples every thread at a fixed rate (`rate_hz`,
+capped by `--max-stall-rate`, default 100; `window_s` capped by
+`--max-window`) and reads, per sample:
+
+- the state letter, `minflt`, `majflt` and `utime + stime` from
+  `/proc/<pid>/task/<tid>/stat`;
+- `/proc/<tid>/wchan`;
+- the kernel stack from `/proc/<pid>/task/<tid>/stack` (root only; otherwise
+  `measurement.stack_source` is `wchan` and `unavailable.kernel_stacks` says
+  why).
+
+Each sample gets one wait category (below). Per thread the result has the
+share of samples in each state and category, major and minor faults per
+second, CPU seconds, and its longest no-progress intervals. A no-progress
+interval is a run of consecutive samples in which the thread's
+`utime + stime` (in clock ticks) did not advance and the thread was not
+voluntarily idle (`futex`, `poll`, `nanosleep`, `ipc_wait`). Each interval has
+its duration, start offset, dominant category, counts by category and state,
+the major faults taken in it, an example kernel stack (8 frames) and `wchan`,
+and whether it began before or was still open at the end of the window.
+
+Per process (`process`): fault totals and rates, CPU split and
+`system_share`, `category_share` over all thread samples and
+`category_share_of_active` (excluding voluntary idle),
+`memory_stall_share_of_active` (share of non-idle samples in
+`page_fault_io`, `direct_reclaim`, `memcg_high_throttle` or `compaction`),
+`no_progress_seconds_by_category`, `memory_stall_no_progress_seconds_per_s`,
+the 10 longest intervals across threads, the frames that matched each
+category, unclassified stacks (10, innermost frames kept), and `memory`:
+`VmRSS`, `VmHWM`, `RssAnon`, `RssFile`, `VmSwap` from `status` and `Rss`,
+`Pss`, `Swap`, `SwapPss` from `smaps_rollup`.
+
+`process.delay_accounting`: when delay accounting is on, the per-second
+deltas of `thrashing_delay`, `swapin_delay`, `freepages_delay` (direct
+reclaim), `blkio_delay`, `compact_delay` and `cpu_delay`, summed over the
+process's threads, from the taskstats generic-netlink interface (needs
+`CAP_NET_ADMIN`). When `kernel.task_delayacct=0` they are `null` and the reason
+says how to enable it: `sysctl kernel.task_delayacct=1` or the `delayacct`
+boot option. The server never changes the sysctl and has no option to.
+
+`environment.cgroup_memory`: the memory cgroup. On cgroup v2: `memory.current`
+against `memory.max` and `memory.high` (`usage_to_max_ratio`,
+`usage_to_high_ratio`, and each ancestor with a limit), `memory.events`
+deltas (`low`, `high`, `max`, `oom`, `oom_kill`, `oom_group_kill`),
+`memory.stat` deltas and rates (`workingset_refault_anon` and `_file`,
+`pgmajfault`, `pgfault`, `pgscan`, `pgsteal`, `pgscan_direct`,
+`pgscan_kswapd`), `refaults_per_s`, and `memory.pressure` `some` and `full`
+with `avg10_pct`, `avg60_pct` and `window_pct`. On a hybrid host where the
+memory controller is on cgroup v1: `memory.usage_in_bytes` against the
+tighter of `memory.limit_in_bytes` and `hierarchical_memory_limit`,
+`memory.failcnt` as the `max` event count, `oom_kill` and `under_oom` from
+`memory.oom_control`, the hierarchical (`total_`) `memory.stat` counters, and
+`memory.pressure` from the process's v2 directory (PSI follows the v2
+hierarchy). Values v1 does not have (`memory.high`, the `oom` event, `pgscan`,
+`pgsteal`) are `null` with a reason; `memory.pressure_level` is an eventfd
+notification and cannot be read. `environment.host`: `/proc/pressure/memory`
+over the window, `/proc/vmstat` deltas and rates (`pgmajfault`,
+`workingset_refault_*`, `allocstall_*` summed as `allocstall_total`,
+`pgscan_direct`, `pgscan_kswapd`, `pgsteal_direct`, `pswpin`, `pswpout`,
+`compact_stall`, `oom_kill`), and `meminfo` (`MemAvailable`, `SwapTotal`,
+`SwapFree`), with a note when no swap is configured.
+
+#### Wait categories
+
+`CATEGORIES` in `src/heapspy_mcp/system/wait_categories.py` is the one table
+that maps kernel frames to categories. It is checked in order and the first
+category with a matching frame wins, so memory-management waits are found
+even when the innermost frame is a generic sleep. Names are matched without
+offsets and compiler suffixes (`.isra.0`), exactly or by prefix.
+
+| Category | Meaning | Frames (examples) |
+|---|---|---|
+| `stopped_or_frozen` | stopped by a signal or ptrace (state `T`/`t`), or frozen by the cgroup freezer | `__refrigerator`, `do_freezer_trap`, `do_signal_stop`, `ptrace_stop`; `get_signal` as the innermost frame (v2 freeze) |
+| `oom` | inside the OOM killer, or waiting for an OOM kill in its cgroup | `out_of_memory`, `mem_cgroup_out_of_memory`, `mem_cgroup_oom_synchronize` |
+| `memcg_high_throttle` | over `memory.high`: reclaiming and then sleeping on return to user space | `mem_cgroup_handle_over_high` |
+| `compaction` | compacting memory for a high-order allocation, or kcompactd | `compact_zone`, `try_to_compact_pages`, `__alloc_pages_direct_compact`, `kcompactd` |
+| `direct_reclaim` | an allocation or a cgroup charge reclaims memory itself, or is throttled while others reclaim | `try_to_free_pages`, `try_to_free_mem_cgroup_pages`, `shrink_*`, `__alloc_pages_slowpath`, `try_charge_memcg`, `reclaim_throttle` |
+| `dirty_throttle` | a writer paused until writeback catches up | `balance_dirty_pages` |
+| `page_fault_io` | a page fault waits for the page to be read in: a file page (often a refault) or a swap-in | `do_swap_page`, `swap_readpage`; `folio_wait_bit_common`, `__folio_lock`, `wait_on_page_bit`, `io_schedule` when a fault frame (`filemap_fault`, `handle_mm_fault`, `exc_page_fault`, ...) is on the stack |
+| `futex` | a mutex, condition variable, semaphore or the Python GIL | `futex_*`, `do_futex` |
+| `poll` | poll, select, epoll or io_uring waits | `do_epoll_wait`, `ep_poll`, `do_select`, `do_sys_poll` |
+| `nanosleep` | a timed sleep | `hrtimer_nanosleep`, `do_nanosleep` |
+| `ipc_wait` | input from a socket, pipe or terminal, a child to exit, or a signal | `unix_stream_read_generic`, `anon_pipe_read`, `do_wait`, `sk_wait_data` |
+| `block_io` | block I/O outside a page fault: `read(2)` of an uncached page, fsync, writeback, journal | `submit_bio_wait`, `jbd2_*`, `blk_mq_*`, page and folio waits without a fault frame |
+| `running` | state `R`, or an empty stack with `wchan` 0 (it woke up between the reads); no wait site is known for a task on a CPU | |
+| `other` | not in the table; the innermost frames are kept in `unclassified_stacks` | e.g. a fault waiting on `mmap_lock` (`rwsem_down_read_slowpath`) |
+| `unavailable` | neither the stack nor `wchan` could be read | |
+
+`futex`, `poll`, `nanosleep` and `ipc_wait` are voluntary idle and do not
+count towards no-progress intervals. Without stacks (not root), a page or
+folio wait seen through `wchan` counts as `page_fault_io` when the thread's
+major-fault count rose since its previous sample, and as `block_io`
+otherwise.
+
+#### Frozen vs thrashing
+
+A process frozen by the cgroup freezer, or stopped by `SIGSTOP` or a
+debugger, also makes no progress, and a v1-frozen task is in state `D`. The
+result reports this separately in `frozen_or_stopped`: the freezer state of
+its cgroups (v2 `cgroup.events` `frozen` and `cgroup.freeze`, v1
+`freezer.state`, `self_freezing`, `parent_freezing`), the share of samples in
+state `T`/`t` and in `stopped_or_frozen`, and an `assessment`:
+`frozen_by_cgroup_freezer`, `stopped_by_signal_or_ptrace`,
+`held_in_freezer_or_signal_stop`, `partly_stopped_or_frozen` or
+`not_frozen_or_stopped`. The no-progress intervals of such a process have the
+dominant category `stopped_or_frozen`, not a memory one.
+
+### `diagnose_process(pid, window_s=2, focus="all")` and `diagnose_process_cpu(pid, window_s=2)`
+
+Measures the process, its environment and its hardware counters in one
+window and, side by side in the same window, samples its threads as
+`watch_process_stalls` does at 10 Hz. It then checks one fact and scores
+these explanations for its CPU use, CPU wait, slowness or stalls:
 
 | id | What it describes |
 |---|---|
@@ -460,8 +607,37 @@ and scores these explanations for its CPU use, CPU wait or slowness:
 | `spin_waiting_or_compute` | on CPU, few switches, normal IPC; counters cannot separate the two |
 | `gil_convoy` | several Python threads, CPU near one core, frequent hand-offs |
 | `steal` | the hypervisor runs other guests on this VM's CPUs |
-| `memory_pressure` | memory stalls (PSI) and major faults |
-| `io_pressure` | I/O stalls (PSI), iowait, threads in disk wait |
+| `memory_thrashing` | threads keep waiting for memory: refaults, swap-in, reclaim, `memory.high` throttling, compaction |
+| `io_pressure` | I/O stalls (PSI), iowait, threads in block I/O outside page faults |
+
+`memory_thrashing` replaces the earlier `memory_pressure`, which read only
+memory PSI and the major-fault rate. It reads those (major faults at
+100/s or more, PSI `full` at 1% or more, or `some` at 5% or more) plus
+workingset refaults (100 pages/s or more, from the cgroup's `memory.stat`, or
+the host's `/proc/vmstat` without one), the share of non-idle thread samples
+in `page_fault_io`, `direct_reclaim`, `memcg_high_throttle` or `compaction`
+(0.5 or more scores high, 0.1 some), and no-progress time in those waits
+(0.2 s/s or more). Evidence against is the absence of each: under 5 major
+faults/s, under 10 refaults/s, PSI `some` under 0.5%, and under 1% of
+non-idle samples in a memory wait. Keeping both hypotheses would have counted
+the same PSI and fault evidence twice. With per-thread categories,
+`io_pressure`'s disk-wait share counts only `block_io` samples, since `D`
+samples in page faults are memory waits. Refault and `memory.stat` counters
+cover every process in the cgroup; the wait share is the process's own.
+
+`fact_checks` comes first. `deliberately_frozen` is true when the process's
+cgroup is frozen or at least 90% of thread samples were stopped or frozen.
+Then the result says that the explanations are moot until the process is
+thawed or continued, every hypothesis carries `moot_because`, and
+`memory_thrashing` has evidence against.
+
+`focus` (`all`, `cpu`, `memory`, `io`) limits which explanations are listed;
+all are measured. `diagnose_process_cpu` is the same tool with
+`focus="all"`, kept under its earlier name. Besides the hypotheses the result
+has `signals`, `memory_stalls` (the stall numbers that were scored, the 3
+longest no-progress intervals, `frozen_or_stopped`), and
+`environment.cgroup_memory` and `environment.host_memory` as in
+`watch_process_stalls`.
 
 Each hypothesis has `evidence_for` and `evidence_against` (signal, raw value,
 threshold name and value, unit, weight), `unknown` (signals that could not be
@@ -492,6 +668,14 @@ All thresholds are in one table, `THRESHOLDS` in
 | IPC, LLC MPKI | `ipc`, `llc_mpki` | memory or shared-cache bound vs compute or spin |
 | Wait sites | `wait_sites.share_by_site` | futex vs poll vs block I/O |
 | CPU per unit of work | `cpu_seconds_per_unit_work` | efficiency change vs load change |
+| Major faults | `major_faults_per_s` | pages read from storage on access vs a working set in memory |
+| Workingset refaults | `refaults_per_s`, `stat_per_s.workingset_refault_*` | a working set that does not fit (evicted pages needed again) vs first-time reads |
+| Memory wait share | `memory_stall_share_of_active`, `category_share` | threads held in page-fault I/O, reclaim, `memory.high` throttling or compaction vs running, locks or block I/O |
+| No-progress intervals | `longest_no_progress_intervals`, `no_progress_seconds_by_category` | a thread that stops for seconds in one wait vs one that keeps running |
+| Memory PSI `full` | `pressure.full.window_pct` | every task in the cgroup stalled on memory at once vs some tasks |
+| `memory.events` `high`, `max` | `events_in_window` | throttling at `memory.high` or reclaim at `memory.max` vs no limit pressure |
+| System share of CPU | `system_share` | time in the kernel (reclaim, faults) vs user code |
+| Freezer and `T` state | `frozen_or_stopped`, `fact_checks` | a process held on purpose vs one that is stalled |
 
 ### Safety and access
 
@@ -500,12 +684,18 @@ All of these tools are read-only.
 - `find_processes` and `scan_processes` read the same `/proc` metadata that
   `ps` and `top` show, and are open without the allowlist, so an agent can find
   the process to look at. Command lines are redacted.
-- `process_cpu`, `hw_counters`, `snapshot_process_metrics` and
-  `diagnose_process_cpu` read one process in depth (its threads' wait
-  channels and syscalls, and performance counters attached to it) and follow
-  the same `--allow` list as `capture_snapshot`. An unlisted pid is refused
-  with `diagnostics_refused` and a reason (`allowlist_empty`,
+- `process_cpu`, `hw_counters`, `snapshot_process_metrics`,
+  `watch_process_stalls`, `diagnose_process` and `diagnose_process_cpu` read
+  one process in depth (its threads' wait channels, kernel stacks and
+  syscalls, its taskstats, and performance counters attached to it) and
+  follow the same `--allow` list as `capture_snapshot`. An unlisted pid is
+  refused with `diagnostics_refused` and a reason (`allowlist_empty`,
   `not_allowlisted`, `no_such_process`).
+- The scan's memory conditions read the kernel stack (or `wchan`) only of
+  threads in `D`, at most 64, and report only their wait category and three
+  innermost frames.
+- No tool changes kernel settings. Delay accounting is reported as `null`
+  with how to enable it, never switched on.
 - Host-wide context (load, steal, host PSI) is included by default because it
   is what the process is subject to and it describes no other process. On a
   shared host where that aggregate should not reach an agent, start the server
@@ -534,9 +724,12 @@ to publish.
 | VM without a PMU | Everything except hardware counters, which are `null` with `no PMU exposed (common in VMs)`; `cache_or_memory_bound_contention` is then `insufficient_signals` | IPC, LLC misses |
 
 Kernel features that change what is available, each reported as a reason when
-missing: delay accounting (`kernel.task_delayacct`) for iowait,
-`CONFIG_SCHEDSTATS` for `/proc/schedstat`, `CONFIG_SCHED_DEBUG` for
-`se.nr_migrations`, PSI (`psi=1`) for pressure files.
+missing: delay accounting (`kernel.task_delayacct`) for iowait and the
+stall delays, `CONFIG_TASKSTATS` and `CAP_NET_ADMIN` for the taskstats
+delays, `CONFIG_SCHEDSTATS` for `/proc/schedstat`, `CONFIG_SCHED_DEBUG` for
+`se.nr_migrations`, PSI (`psi=1`) for pressure files, root
+(`CAP_SYS_ADMIN`) and `CONFIG_STACKTRACE` for `/proc/<tid>/stack`, and a v2
+hierarchy (unified or hybrid) for cgroup memory pressure and the v2 freezer.
 
 See [`deploy/kubernetes/daemonset.yaml`](deploy/kubernetes/daemonset.yaml) for
 a node-agent example.
@@ -774,6 +967,48 @@ quota (root only; skipped otherwise), and, for the search tools, a CPU burner,
 a process with growing RSS, one holding thousands of fds, a parent of zombies
 and a lock ping-pong. `uv run pytest -s tests/test_system_live.py` prints the
 numbers each scenario measured.
+
+The memory-stall tools have classifier tests against kernel stacks
+(`tests/fixtures/system/kernel_stacks.txt`: stacks captured on 6.18, and call
+chains of 4.4 to 6.6 for waits the development VM cannot produce, such as
+swap-in and `memory.high` throttling), parser tests for v2 and v1
+`memory.*`, `vmstat`, `smaps_rollup` and freezer files, fake `/proc` trees for
+the sampler, and live tests in `tests/test_stalls_live.py` (root only). They
+create their own cgroups and a 256 MiB temporary file, and remove both on
+every path. `uv run pytest -s tests/test_stalls_live.py` prints the numbers.
+
+The thrash in those tests is file-backed, since the development VM has no
+swap: a process maps the file and reads one byte of each page in a fixed
+random order inside a memory cgroup limited to 64 MiB. Three things were
+needed to make eviction happen. The file's page cache is dropped first with
+`POSIX_FADV_DONTNEED`, or its pages stay charged to the cgroup that wrote
+them and the scanner never faults. The order is random, because a sequential
+scan is served by readahead: most faults then find the page already in cache
+(minor faults), and the major-fault count stays low even while the cgroup
+refaults gigabytes. And to see threads stop for seconds, a cgroup read limit
+on the block device (16 MiB/s) stands in for a slow disk; the VM's disk is
+served from the host's cache at more than 1 GB/s, so without it each refault
+finishes in microseconds and the thread stays on a CPU, mostly in the
+kernel. Results on the development VM (Linux 6.18, 4 cores, cgroup v1 memory
+controller with v2 pressure, 5 s windows):
+
+| Scenario | Major faults/s | Refaults/s (cgroup) | Wait categories | Longest no-progress | `diagnose_process` |
+|---|---|---|---|---|---|
+| (a1) 64 MiB limit | 8700 to 9900 | 250000 | `page_fault_io` 0.50 to 0.62, `running` the rest; `system_share` 0.98; cgroup memory PSI `full` 10 to 17% | none (CPU kept advancing, in the kernel) | `memory_thrashing` first, score 9 |
+| (a2) 64 MiB limit and 16 MiB/s reads | 138 | 500 | `page_fault_io` 1.0, state `D` | 1.6 to 1.9 s, `page_fault_io`, stack `folio_wait_bit_common < filemap_fault < __do_fault < ...`; 0.93 to 0.97 s/s in memory waits | `memory_thrashing` first, score 7; `io_pressure` 1 |
+| (b) same scan, no limit, file cached | 0 | 0 | `running` 1.0 | none | `memory_thrashing` not indicated (-5); `spin_waiting_or_compute` first |
+| (c) CPU-bound loop | 0 | 0 | `running` 1.0 | none | `memory_thrashing` not indicated (-5) |
+| (d1) `SIGSTOP` | 0 | 0 | `stopped_or_frozen` 1.0 | the whole window, `stopped_or_frozen` | `deliberately_frozen` true, all moot, `memory_thrashing` -8 |
+| (d2) v1 freezer `FROZEN`, v2 `cgroup.freeze=1` | 0 | 0 | `stopped_or_frozen` 1.0 (v1: state `D` in `__refrigerator`) | the whole window, `stopped_or_frozen` | `deliberately_frozen` true, `frozen_by_cgroup_freezer` |
+
+With (a1) running, `scan_processes` put it first on `major_faults_per_s`
+(about 9900/s), listed it under `major_faults_whole_window` (lowest interval
+9000/s) and its cgroup under `cgroup_memory_pressure_full` (`full` 11 to
+12% of the window); `find_processes(sort_by="major_faults_per_s")` put it
+first. With (a2), `disk_wait_in_memory_management` listed its thread as
+`page_fault_io` from its stack. A frozen cgroup and a stopped process
+appeared under `frozen_or_stopped`, and the v1-frozen task in `D` was not
+listed as a memory wait.
 
 The CPU tool tests use `tests/fake_pyspy.py` as `py-spy` in the same way. The
 integration tests in `tests/test_cpu_integration.py` run the real py-spy against
