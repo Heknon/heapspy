@@ -3,7 +3,7 @@ use std::io;
 /// Errors from reading or writing a snapshot file.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("I/O error: {0}")]
+    #[error(transparent)]
     Io(#[from] io::Error),
 
     #[error("not a heapspy snapshot (bad magic bytes)")]
