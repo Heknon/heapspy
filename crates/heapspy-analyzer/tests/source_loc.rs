@@ -287,6 +287,60 @@ fn type_query_locations_and_text() {
         .find(|i| i.address.0 == HANDLER)
         .unwrap();
     assert_eq!(h.source_loc, loc("app/h.py", Some(12), true, "function"));
+
+    let text = render::type_query(&r).unwrap();
+    assert!(
+        text.starts_with("app.s.Session (app/s.py:~14): 1 instances"),
+        "{text}"
+    );
+    // No instance of Session has a location of its own: no extra column.
+    assert!(!text.contains("defined at"), "{text}");
+    let text = render::type_query(&f).unwrap();
+    assert!(text.contains("defined at"), "{text}");
+    assert!(text.contains("app/h.py:12"), "{text}");
+}
+
+#[test]
+fn path_text_shows_locations() {
+    let s = heap(false);
+    let r = path_to(&s, HANDLER);
+    let text = render::retaining_path(&r).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.contains("['handler']"))
+        .expect("handler hop");
+    assert!(
+        line.ends_with("builtins.function  (160 B)  app/h.py:12"),
+        "{text}"
+    );
+    assert!(
+        text.starts_with("0x2000 builtins.function  shallow"),
+        "{text}"
+    );
+    // Hops without a location are unchanged.
+    let dict = text.lines().find(|l| l.contains(".__dict__")).unwrap();
+    assert!(dict.ends_with("builtins.dict  (2.2 KiB)"), "{text}");
+    let r = path_to(&s, SESSION);
+    let text = render::retaining_path(&r).unwrap();
+    assert!(
+        text.contains("builtins.type  (1.7 KiB)  app/s.py:~14"),
+        "{text}"
+    );
+}
+
+#[test]
+fn path_target_header_shows_its_type_location() {
+    let s = heap(false);
+    let r = path_to(&s, INSTANCE);
+    assert_eq!(
+        r.targets[0].type_location,
+        loc("app/s.py", Some(14), false, "methods")
+    );
+    let text = render::retaining_path(&r).unwrap();
+    assert!(
+        text.starts_with("0x8000 app.s.Session (app/s.py:~14)  shallow 56 B"),
+        "{text}"
+    );
 }
 
 #[test]
