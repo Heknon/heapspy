@@ -1,0 +1,301 @@
+# Builds and publishes a release. See docs/releasing.md.
+#
+#   - Pushing a tag v* builds everything, publishes heapspy and heapspy-mcp
+#     to PyPI, then creates a GitHub release with the binaries attached.
+#   - Manual dispatch builds everything. With `publish: testpypi` it also
+#     uploads to TestPyPI. It never publishes to PyPI or creates a release.
+#
+# There are no pull_request or branch push triggers on purpose.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Where to upload the built packages"
+        type: choice
+        options:
+          - none
+          - testpypi
+        default: none
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run that may be halfway through publishing.
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: check versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      has_mcp: ${{ steps.mcp.outputs.has_mcp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check tag and package versions
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            python scripts/check-version.py "$REF_NAME"
+          else
+            python scripts/check-version.py
+          fi
+      - name: Look for python/heapspy-mcp
+        id: mcp
+        run: |
+          if [ -f python/heapspy-mcp/pyproject.toml ]; then
+            echo "has_mcp=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_mcp=false" >> "$GITHUB_OUTPUT"
+            echo "python/heapspy-mcp not found; the heapspy-mcp job will be skipped."
+          fi
+
+  wheels:
+    name: wheel (${{ matrix.target }})
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2014"
+            smoke-test: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2014"
+            smoke-test: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+            smoke-test: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: ""
+            smoke-test: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - uses: actions/setup-python@v5
+        if: matrix.smoke-test
+        with:
+          python-version: "3.12"
+      - name: Install the wheel and run heapspy --version
+        if: matrix.smoke-test
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist heapspy
+          heapspy --version
+      - name: Package the binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            name="heapspy-$REF_NAME-$TARGET"
+          else
+            name="heapspy-dev-${GITHUB_SHA::7}-$TARGET"
+          fi
+          bindir="target/$TARGET/release"
+          mkdir -p bin-dist
+          if [ -f "$bindir/heapspy.exe" ]; then
+            7z a -tzip "bin-dist/$name.zip" "./$bindir/heapspy.exe" README.md LICENSE
+          else
+            tar czf "bin-dist/$name.tar.gz" -C "$bindir" heapspy -C "$GITHUB_WORKSPACE" README.md LICENSE
+          fi
+          ls -l bin-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: bin-dist/*
+          if-no-files-found: error
+
+  sdist:
+    name: sdist (heapspy)
+    needs: check-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  mcp:
+    name: sdist and wheel (heapspy-mcp)
+    needs: check-version
+    # Skipped (not failed) on commits that do not contain the package yet.
+    if: needs.check-version.outputs.has_mcp == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: uv build python/heapspy-mcp --out-dir dist-mcp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-dist
+          path: dist-mcp/*
+          if-no-files-found: error
+
+  publish-pypi:
+    name: publish to PyPI
+    needs: [check-version, wheels, sdist, mcp]
+    # `mcp` may be skipped, which would skip this job too without the
+    # explicit result checks. Only tag pushes publish.
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.check-version.result == 'success' &&
+      needs.wheels.result == 'success' &&
+      needs.sdist.result == 'success' &&
+      (needs.mcp.result == 'success' || needs.mcp.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/heapspy/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        if: needs.mcp.result == 'success'
+        with:
+          name: mcp-dist
+          path: dist-mcp
+      - run: ls -l dist dist-mcp 2>/dev/null || ls -l dist
+      - name: Publish heapspy
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Publish heapspy-mcp
+        if: needs.mcp.result == 'success'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-mcp
+
+  publish-testpypi:
+    name: publish to TestPyPI
+    needs: [check-version, wheels, sdist, mcp]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish == 'testpypi' &&
+      needs.check-version.result == 'success' &&
+      needs.wheels.result == 'success' &&
+      needs.sdist.result == 'success' &&
+      (needs.mcp.result == 'success' || needs.mcp.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/heapspy/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        if: needs.mcp.result == 'success'
+        with:
+          name: mcp-dist
+          path: dist-mcp
+      - run: ls -l dist dist-mcp 2>/dev/null || ls -l dist
+      # TestPyPI, like PyPI, never accepts the same file twice. skip-existing
+      # lets a second dispatch of an unchanged version pass.
+      - name: Publish heapspy
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          skip-existing: true
+      - name: Publish heapspy-mcp
+        if: needs.mcp.result == 'success'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist-mcp
+          skip-existing: true
+
+  github-release:
+    name: GitHub release
+    needs: [wheels, publish-pypi]
+    # Runs after PyPI accepted the upload, so a failed publish leaves no
+    # release behind.
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.publish-pypi.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: release
+          merge-multiple: true
+      - name: Write checksums
+        working-directory: release
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

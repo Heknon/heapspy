@@ -13,6 +13,11 @@ pub enum Error {
     #[error("address range {addr:#x}+{len} is not mapped in the image")]
     Unmapped { addr: u64, len: usize },
 
+    /// The target process does not exist (never did, or exited before it
+    /// could be stopped).
+    #[error("no such process: {0}")]
+    NoSuchProcess(String),
+
     /// Permission to read the target was denied (ptrace scope, SeDebugPrivilege, ...).
     #[error("permission denied: {0}")]
     PermissionDenied(String),
@@ -20,6 +25,11 @@ pub enum Error {
     /// The image or a module inside it is malformed (bad ELF/PE/minidump structure).
     #[error("malformed image: {0}")]
     Format(String),
+
+    /// An image file ends before data its own headers describe (a core or
+    /// minidump cut short, e.g. by a size limit or a full disk).
+    #[error("image cut short: {0}")]
+    Truncated(String),
 
     /// No CPython runtime was found in the target.
     #[error("not a CPython process: {0}")]
@@ -29,7 +39,7 @@ pub enum Error {
     #[error("unsupported CPython: {0}")]
     UnsupportedPython(String),
 
-    #[error("I/O error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]

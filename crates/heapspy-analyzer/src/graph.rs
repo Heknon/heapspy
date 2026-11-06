@@ -117,7 +117,14 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     }
     keyed.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
     keyed.dedup_by_key(|k| k.0);
-    // Super-root edges go out in object-index order, which is deterministic.
+    // Super-root edges go out in root-rank order (modules first), then by
+    // label. BFS visits roots in this order, so when an object is equally
+    // close to several roots its shortest path starts at the best-ranked
+    // one: a global is reported under `sys.modules[...]`, not under a frame
+    // local that happens to hold a function whose `__globals__` is the same
+    // module dict. Ordering by object index would make that choice depend on
+    // addresses, which change from one dump to the next.
+    keyed.sort_by(|a, b| (a.1, &a.2, a.0).cmp(&(b.1, &b.2, b.0)));
     let root_nodes: Vec<u32> = keyed.iter().map(|k| k.0).collect();
     let root_entries: Vec<Root> = keyed.into_iter().map(|k| k.3).collect();
 

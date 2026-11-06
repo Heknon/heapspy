@@ -1,7 +1,7 @@
 # JSON report schema, version 1
 
-`heapspy analyze`, `query` and `diff` print a JSON document on stdout when
-given `--json`. This is the machine interface that tooling (including
+`heapspy dump`, `analyze`, `query` and `diff` print a JSON document on
+stdout when given `--json`. This is the machine interface that tooling (including
 `heapspy-mcp`) binds to. The Rust definitions are in
 `crates/heapspy-analyzer/src/report.rs`. Complete example documents are in
 `docs/examples/`; a test (`crates/heapspy-analyzer/tests/examples.rs`) checks
@@ -10,7 +10,8 @@ that each example matches the structs field for field.
 ## Rules
 
 - Every document has `"schema_version": 1` and a `"kind"`:
-  `"analyze"`, `"type_query"`, `"retaining_path"`, `"diff"` or `"error"`.
+  `"dump"`, `"analyze"`, `"type_query"`, `"retaining_path"`, `"diff"` or
+  `"error"`.
 - Within version 1, fields are only added, never removed or redefined.
   Consumers must ignore fields they do not know. A breaking change means
   `schema_version: 2`.
@@ -55,12 +56,18 @@ Also used for `before` and `after` in a diff.
 | `source.kind` | string | `"pid"`, `"core"` or `"minidump"` |
 | `source.ref` | string | the PID as text, or the core / minidump path as given to `dump` |
 | `contents_captured` | bool | the snapshot holds string contents and ordinary dict keys |
-| `truncated` | bool | the dump did not finish; all numbers are lower bounds |
+| `truncated` | bool | the dump did not finish, or the memory image was incomplete (e.g. a core file cut short); all numbers are lower bounds |
 
 ### Path hop (PathHop)
 
 A retaining path is an array of hops, **root first**: `path[0]` is the root
 object and the last hop is the object the path is about.
+
+Paths are shortest paths. When an object is equally close to several roots,
+the path starts at the best-ranked root: `module_dict` first, then
+`frame_local`, `thread_locals`, `interp`, `other`, ties broken by root label.
+So a module global is reported under `sys.modules[...]` even when a running
+frame also reaches it through a function's `__globals__`.
 
 | field | type | meaning |
 |---|---|---|
@@ -111,8 +118,45 @@ Codes defined so far:
 | `missing_roots` | some root addresses are not in the snapshot |
 | `identity_approximate` | always on diff |
 | `unreachable_target` | a retaining-path target has no path from any root |
+| `image_incomplete` | dump: `image.missing_bytes` is non-zero |
+| `read_errors` | dump: `read_errors` is non-zero |
+
+`truncated_snapshot` is also used by dump, when `truncated` is true.
 
 New codes may be added in version 1.
+
+## `dump`
+
+`heapspy dump (--pid PID | --core PATH | --minidump PATH) -o OUT --json`.
+Example: `docs/examples/dump.json`.
+
+Printed after the snapshot has been written. The one-line summary on stderr
+is printed with or without `--json`, in this format (the suffix only when
+the snapshot is truncated):
+
+```text
+wrote OUT: N objects, N edges, N roots, N bytes (truncated)
+```
+
+| field | type | meaning |
+|---|---|---|
+| `schema_version` | 1 | |
+| `kind` | `"dump"` | |
+| `path` | string | the snapshot file written, as given with `-o` |
+| `source.kind` | string | `"pid"`, `"core"` or `"minidump"` |
+| `source.ref` | string | the PID as text, or the core / minidump path as given |
+| `python_version` | string | CPython version found in the target, `sys.version` style |
+| `contents_captured` | bool | `--capture-contents` was given |
+| `objects` | integer | objects written |
+| `edges` | integer | references written |
+| `types` | integer | distinct type records written |
+| `roots` | integer | root entries written |
+| `bytes_written` | integer | size of the snapshot file |
+| `read_errors` | integer | reads of target memory that failed; the objects involved are marked partial in the snapshot |
+| `truncated` | bool | the snapshot is marked truncated (the walk did not finish, or the image is incomplete); same as `snapshot.truncated` in the other reports |
+| `image.missing_bytes` | integer | bytes of memory the image's headers describe but the file does not contain (a core cut short); 0 when complete or not known |
+| `pause_ms` | float, nullable | how long a live target was stopped, in milliseconds; `null` for cores and minidumps, and on Windows, where the pause is inside the minidump write and not measured |
+| `notes` | array of Note | |
 
 ## `analyze`
 
@@ -169,8 +213,9 @@ Retainer (`top_retainers[]`):
 Which objects are listed:
 
 1. Namespaces are never listed: module objects, frame objects, type objects,
-   and the `__dict__` each of them dominates. The variables inside them are
-   listed instead.
+   and the `__dict__` of each, also when something else references that
+   dict (a function's `__globals__` is its module's `__dict__`). The
+   variables inside them are listed instead.
 2. A chain of wrappers that only restate their contents is reported once, at
    the object where the memory accumulates. Starting at an object A, follow
    A's largest dominated child while it still retains at least 90% of A's
@@ -328,8 +373,11 @@ labels so that it can be found again in another dump:
   `sys.modules['app'].__dict__['PENDING']...[<index>]`.
 - An object that is not a root but is dominated only by the super-root
   (several roots reach it and none of them owns it, e.g. a list imported
-  into two modules) has no owning site. Its site is `...` followed by the
-  label of the edge it was first reached through, e.g. `...['SHARED']`.
+  into two modules, or a module `__dict__` that is also the `__globals__` of
+  a function a running frame holds) has no owning site. Its site is its
+  shortest path (the `path` that `analyze` reports for it), rendered as a
+  root path with indices generalised, e.g.
+  `sys.modules['app.a'].__dict__['SHARED']`.
 - List and tuple indices are generalised to `[<index>]`, since positions
   shift as a container changes.
 - Only the first 6 levels of the dominator tree get sites (level 1 is the
@@ -364,6 +412,15 @@ status 1. Example: `docs/examples/error.json`.
 | `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`) |
 | `not_found` | the requested address or type is not in the snapshot |
 | `invalid_snapshot` | the file is not a snapshot, is truncated or corrupt, or has an unsupported format version |
-| `io` | the file could not be read |
-| `permission_denied` | reading the target process was refused |
-| `internal` | anything else |
+| `io` | a file could not be read or written (missing core file, unreadable snapshot, full disk) |
+| `permission_denied` | reading the target process was refused: ptrace `EPERM` on Linux (needs root or `CAP_SYS_PTRACE`, see `kernel.yama.ptrace_scope`), access denied on Windows (needs `SeDebugPrivilege` or the same user) |
+| `no_such_process` | dump: no process has that PID, or it exited before it could be stopped |
+| `not_python` | dump: no CPython runtime in the target (no module exports `_PyRuntime`, or it could not be read) |
+| `unsupported_python` | dump: CPython was found, but its version or build is refused (outside 3.12 to 3.14, free-threaded, or debug) |
+| `invalid_image` | dump: the core or minidump is not one heapspy reads (not an ELF core or minidump, corrupt, 32-bit, big-endian, another CPU), or memory the runtime points to is not in the image |
+| `truncated_image` | dump: the image file ends before data its own headers describe (cut short by a size limit or a full disk), and the dump could not go on. A core cut only inside memory segments can still give a snapshot, marked `truncated`. A minidump cut inside data that only a stream refers to (a module or thread name) is reported as `invalid_image` |
+| `unsupported` | dump: the request cannot be done here (dumping heapspy itself, a live process on a platform without a live backend, a target that keeps creating threads while it is being stopped) |
+| `internal` | a bug in heapspy |
+
+The codes are stable; `error.message` is for people and may change. New
+codes may be added in version 1, so treat an unknown code like `internal`.

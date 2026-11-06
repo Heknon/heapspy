@@ -216,7 +216,7 @@ impl<'s> Analysis<'s> {
 
     /// Nodes on the BFS path to `v`, root object first, with the edge used to
     /// enter each. Empty if `v` is unreachable or the super-root.
-    fn bfs_chain(&self, v: u32) -> Vec<(u32, u32)> {
+    pub(crate) fn bfs_chain(&self, v: u32) -> Vec<(u32, u32)> {
         let mut chain = Vec::new();
         let mut x = v;
         while x != self.root() && self.via[x as usize] != NONE {
@@ -325,9 +325,15 @@ impl<'s> Analysis<'s> {
     }
 
     /// Namespace objects: modules, frames and type objects, and the
-    /// `__dict__` each of them dominates. They hold program variables rather
-    /// than data, so they are never listed as top retainers themselves; the
-    /// variables inside them are.
+    /// `__dict__` of each. They hold program variables rather than data, so
+    /// they are never listed as top retainers themselves; the variables
+    /// inside them are.
+    ///
+    /// The `__dict__` counts whether or not its owner dominates it. A module's
+    /// dict is also reachable as `__globals__` of every function defined in
+    /// the module, so as soon as a running frame or thread holds one of those
+    /// functions, the dict's immediate dominator is the super-root, not the
+    /// module. It is still the module's namespace.
     fn namespaces(&self) -> Result<Vec<bool>> {
         let n = self.g.n;
         let mut ns = vec![false; n as usize + 1];
@@ -343,7 +349,7 @@ impl<'s> Analysis<'s> {
             let r = self.g.csr.range(i);
             for e in r.clone() {
                 let t = self.g.csr.targets[e];
-                if t == NONE || self.idom[t as usize] != i {
+                if t == NONE {
                     continue;
                 }
                 if let EdgeLabel::Attr(s) = self.snap.edge(e as u64).label {

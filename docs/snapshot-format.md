@@ -77,7 +77,7 @@ Header `flags`:
 | bit | name | meaning |
 |---:|---|---|
 | 0 | `CONTENTS_CAPTURED` | str/bytes contents and ordinary dict keys were captured (`--capture-contents`) |
-| 1 | `TRUNCATED` | the walk stopped early or hit read errors; the graph is incomplete |
+| 1 | `TRUNCATED` | the walk stopped early or hit read errors, or the memory image is missing data its own headers describe (a cut core); the graph is incomplete |
 | 2 | `PY_FREE_THREADED` | target is a free-threaded (`Py_GIL_DISABLED`) build |
 | 3 | `PY_DEBUG_BUILD` | target is a `Py_DEBUG` build |
 
@@ -390,6 +390,7 @@ Free-form key/value pairs. Keys in use:
 |---|---|
 | `heapspy.version` | version of the heapspy that wrote the file |
 | `process.rss_bytes` | process RSS in bytes, decimal |
+| `image.missing_bytes` | bytes of memory the image's headers describe but the file lacks (only written when non-zero), decimal |
 
 ## Validation on open
 

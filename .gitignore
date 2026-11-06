@@ -4,3 +4,4 @@
 !docs/examples/*.hpy
 core.*
 *.dmp
+dist/

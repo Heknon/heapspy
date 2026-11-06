@@ -1,0 +1,89 @@
+# heapspy-mcp as a node agent: one pod per node that can see every process on it.
+#
+# Run the server where it can see the processes you want to diagnose:
+#   - on a host: run heapspy-mcp directly (stdio, or streamable-http on 127.0.0.1);
+#   - as a sidecar: add the container to the pod with `shareProcessNamespace: true`
+#     and SYS_PTRACE; it sees the pod's other containers only;
+#   - as a node agent: this DaemonSet, with hostPID.
+#
+# Access control: the streamable-http endpoint has no authentication. This example
+# binds it to 127.0.0.1 inside the pod, so only `kubectl port-forward` (which needs
+# RBAC on pods/portforward) reaches it. If you bind 0.0.0.0 instead, put an
+# authenticating proxy in front and a NetworkPolicy that admits only that proxy.
+#
+# The image is a placeholder: any image with Python 3.10+ and `pip install heapspy-mcp`
+# (plus the heapspy binary for the heap tools).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: heapspy-mcp
+  namespace: heapspy
+  labels:
+    app.kubernetes.io/name: heapspy-mcp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: heapspy-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: heapspy-mcp
+    spec:
+      hostPID: true # see every process on the node; /proc then lists host pids
+      automountServiceAccountToken: false # the server does not call the Kubernetes API
+      containers:
+        - name: heapspy-mcp
+          image: registry.example.com/heapspy-mcp:0.1.0
+          args:
+            - --transport=streamable-http
+            - --host=127.0.0.1
+            - --port=8000
+            # Per-pid tools (process_cpu, hw_counters, diagnose_process_cpu, heap capture)
+            # only accept processes on this list. find/scan work without it.
+            - --allow=gunicorn*,celery*
+            # The container's cgroup namespace hides other pods' cgroups; read the
+            # host's cgroup v2 mount from the read-only volume below instead. (On a
+            # cgroup v1 node, drop this flag and mount the host cgroupfs at
+            # /sys/fs/cgroup.)
+            - --cgroup-root=/host/sys/fs/cgroup
+            - --snapshot-dir=/tmp/heapspy-snapshots
+          ports:
+            - name: mcp
+              containerPort: 8000
+              protocol: TCP
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add:
+                # Read other processes' /proc/<pid>/{io,syscall,wchan,fd} and attach
+                # heap capture.
+                - SYS_PTRACE
+                # perf_event_open on other processes (Linux 5.8+). On older kernels
+                # PERFMON does not exist and SYS_ADMIN is needed instead, or lower
+                # kernel.perf_event_paranoid on the node.
+                - PERFMON
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+              # No CPU limit: a throttled diagnostics agent distorts its own windows.
+          volumeMounts:
+            - name: host-cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # hostPID already gives the host's /proc; only the cgroupfs needs mounting.
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: tmp
+          emptyDir: {}
+      tolerations:
+        - operator: Exists # run on every node, including tainted ones

@@ -1,0 +1,153 @@
+# End-to-end tests: heapspy against real CPython processes with known leaks.
+# Runs on request only. See CONTRIBUTING.md and tests/e2e/README.md.
+#
+#   - Label a PR `ci:e2e` to run the Linux and Windows matrices.
+#   - Tag pushes (v*) and manual dispatch run both.
+#   - Manual dispatch can also smoke-test heapspy-mcp from another ref.
+name: E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      mcp_ref:
+        description: "Branch, tag or SHA containing python/heapspy-mcp to smoke-test (empty: skip)"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: e2e (ubuntu, Python ${{ matrix.python }})
+    # On a `labeled` event, only react to the label this workflow cares
+    # about, so adding unrelated labels does not start a run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (contains(github.event.pull_request.labels.*.name, 'ci:e2e') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci:e2e'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      PY_VERSION: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/e2e/uv.lock
+      - name: Allow ptrace and install gdb (for gcore)
+        # Ubuntu runners default to kernel.yama.ptrace_scope=1, which only
+        # lets a process trace its own descendants.
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Install Python ${{ matrix.python }} (python-build-standalone)
+        run: uv python install "$PY_VERSION"
+      - name: Build heapspy
+        run: cargo build --release --locked -p heapspy
+      - name: Check out heapspy-mcp
+        if: github.event_name == 'workflow_dispatch' && inputs.mcp_ref != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.mcp_ref }}
+          path: mcp-src
+          sparse-checkout: python/heapspy-mcp
+      - name: Run the e2e suite
+        env:
+          HEAPSPY_BIN: ${{ github.workspace }}/target/release/heapspy
+          HEAPSPY_E2E_REPORT: ${{ runner.temp }}/e2e-timings.json
+          MCP_DIR: ${{ github.workspace }}/mcp-src/python/heapspy-mcp
+        run: |
+          py="$(uv python find --python-preference only-managed "$PY_VERSION")"
+          export HEAPSPY_E2E_PYTHONS="py$PY_VERSION=$py"
+          if [ -d "$MCP_DIR" ]; then export HEAPSPY_MCP_DIR="$MCP_DIR"; fi
+          uv run --locked --project tests/e2e pytest tests/e2e -v
+      - name: Upload timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-timings-linux-${{ matrix.python }}
+          path: ${{ runner.temp }}/e2e-timings.json
+          if-no-files-found: ignore
+
+  windows:
+    name: e2e (windows, Python ${{ matrix.python }})
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (contains(github.event.pull_request.labels.*.name, 'ci:e2e') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci:e2e'))
+    # GitHub's Windows runners run as an administrator, so heapspy and
+    # procdump can enable SeDebugPrivilege.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      PY_VERSION: ${{ matrix.python }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/e2e/uv.lock
+      - name: Download procdump (Sysinternals)
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "procdump"
+          Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Procdump.zip" -OutFile "$dir.zip"
+          Expand-Archive -Path "$dir.zip" -DestinationPath $dir -Force
+          "HEAPSPY_PROCDUMP=$(Join-Path $dir 'procdump64.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install Python ${{ matrix.python }} (python-build-standalone)
+        run: uv python install $env:PY_VERSION
+      - name: Build heapspy
+        run: cargo build --release --locked -p heapspy
+      - name: Run the e2e suite
+        env:
+          HEAPSPY_BIN: ${{ github.workspace }}\target\release\heapspy.exe
+          HEAPSPY_E2E_REPORT: ${{ runner.temp }}\e2e-timings.json
+        run: |
+          $py = uv python find --python-preference only-managed $env:PY_VERSION
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:HEAPSPY_E2E_PYTHONS = "py$($env:PY_VERSION)=$py"
+          uv run --locked --project tests/e2e pytest tests/e2e -v
+      - name: Upload timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-timings-windows-${{ matrix.python }}
+          path: ${{ runner.temp }}\e2e-timings.json
+          if-no-files-found: ignore

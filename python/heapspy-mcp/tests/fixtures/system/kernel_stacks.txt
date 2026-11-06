@@ -1,0 +1,293 @@
+## /proc/<tid>/stack samples, one per "### <expected category> <state> <source>" header.
+## "captured 6.18" samples were read on the development VM (Linux 6.18, x86_64).
+## "chain <version>" samples are the call chain of that kernel version's source for that
+## wait, written in /proc/<tid>/stack format, for waits that cannot be produced on that VM
+## (no swap, no memory.high on a v1 memory controller).
+### page_fault_io D captured 6.18: mmap scan of a file in a memory cgroup below its size
+[<0>] folio_wait_bit_common+0x110/0x310
+[<0>] filemap_fault+0x739/0x1650
+[<0>] __do_fault+0x34/0xd0
+[<0>] do_fault+0x319/0x660
+[<0>] __handle_mm_fault+0x7fc/0xf20
+[<0>] handle_mm_fault+0xd0/0x310
+[<0>] do_user_addr_fault+0x21a/0x690
+[<0>] exc_page_fault+0x6a/0x150
+[<0>] asm_exc_page_fault+0x26/0x30
+### page_fault_io D chain 5.4: file-backed fault waiting on the page lock
+[<0>] wait_on_page_bit_common+0x10e/0x320
+[<0>] filemap_fault+0x5f4/0x8f0
+[<0>] ext4_filemap_fault+0x31/0x50
+[<0>] __do_fault+0x3c/0x130
+[<0>] do_fault+0x24b/0x640
+[<0>] __handle_mm_fault+0x4a7/0x7a0
+[<0>] handle_mm_fault+0xca/0x200
+[<0>] do_user_addr_fault+0x1f9/0x450
+[<0>] page_fault+0x34/0x40
+### page_fault_io D chain 4.4: with kernel addresses shown
+[<ffffffff8118a6b5>] io_schedule+0x16/0x40
+[<ffffffff8118d2d1>] __lock_page_or_retry+0x91/0xe0
+[<ffffffff8118f4cf>] filemap_fault+0x40f/0x6c0
+[<ffffffff811bc5e8>] __do_fault+0x48/0xe0
+[<ffffffff811c03ca>] handle_mm_fault+0xeca/0x1810
+[<ffffffff8106ab28>] __do_page_fault+0x1a8/0x430
+[<ffffffff8106ade2>] do_page_fault+0x22/0x30
+[<ffffffff81822c18>] page_fault+0x28/0x30
+### page_fault_io D chain 6.6: anonymous page swap-in
+[<0>] folio_wait_bit_common+0x13d/0x350
+[<0>] do_swap_page+0x8e1/0xd10
+[<0>] __handle_mm_fault+0x7c2/0xf30
+[<0>] handle_mm_fault+0x17f/0x360
+[<0>] do_user_addr_fault+0x1ee/0x6a0
+[<0>] exc_page_fault+0x7e/0x180
+[<0>] asm_exc_page_fault+0x26/0x30
+### page_fault_io D chain 5.15: swap read issued from the fault
+[<0>] io_schedule+0x46/0x70
+[<0>] swap_readpage+0x1b6/0x3a0
+[<0>] do_swap_page+0x5a1/0x8d0
+[<0>] __handle_mm_fault+0x8f8/0x1520
+[<0>] handle_mm_fault+0xd8/0x2c0
+[<0>] do_user_addr_fault+0x1c9/0x670
+[<0>] exc_page_fault+0x77/0x170
+[<0>] asm_exc_page_fault+0x27/0x30
+### direct_reclaim D chain 6.6: global direct reclaim from an anonymous fault
+[<0>] shrink_folio_list+0x6d5/0xd60
+[<0>] shrink_inactive_list+0x16d/0x3f0
+[<0>] shrink_lruvec+0x2c5/0x470
+[<0>] shrink_node+0x2b8/0x7c0
+[<0>] do_try_to_free_pages+0xd0/0x570
+[<0>] try_to_free_pages+0xe8/0x210
+[<0>] __alloc_pages_slowpath.constprop.0+0x3c1/0xe20
+[<0>] __alloc_pages+0x326/0x350
+[<0>] vma_alloc_folio+0x6b/0x380
+[<0>] do_anonymous_page+0x77/0x3f0
+[<0>] __handle_mm_fault+0x8e3/0xf30
+[<0>] handle_mm_fault+0x17f/0x360
+[<0>] do_user_addr_fault+0x1ee/0x6a0
+[<0>] exc_page_fault+0x7e/0x180
+[<0>] asm_exc_page_fault+0x26/0x30
+### direct_reclaim D chain 6.6: cgroup charge reclaim inside a file fault
+[<0>] shrink_folio_list+0x6d5/0xd60
+[<0>] shrink_lruvec+0x2c5/0x470
+[<0>] shrink_node+0x2b8/0x7c0
+[<0>] do_try_to_free_pages+0xd0/0x570
+[<0>] try_to_free_mem_cgroup_pages+0x107/0x230
+[<0>] try_charge_memcg+0x1aa/0x6c0
+[<0>] __mem_cgroup_charge+0x44/0xa0
+[<0>] filemap_add_folio+0x3d/0xc0
+[<0>] page_cache_ra_unbounded+0xd3/0x1a0
+[<0>] filemap_fault+0x4d4/0xb20
+[<0>] __do_fault+0x39/0x120
+[<0>] do_fault+0x2c4/0x480
+[<0>] __handle_mm_fault+0x7c2/0xf30
+[<0>] handle_mm_fault+0x17f/0x360
+[<0>] do_user_addr_fault+0x1ee/0x6a0
+[<0>] exc_page_fault+0x7e/0x180
+[<0>] asm_exc_page_fault+0x26/0x30
+### direct_reclaim D chain 6.1: throttled while kswapd and others reclaim
+[<0>] reclaim_throttle+0xd4/0x1d0
+[<0>] do_try_to_free_pages+0x2a5/0x570
+[<0>] try_to_free_pages+0xe8/0x1f0
+[<0>] __alloc_pages_slowpath.constprop.0+0x3b8/0xd10
+[<0>] __alloc_pages+0x30c/0x330
+[<0>] folio_alloc+0x1b/0x50
+[<0>] __filemap_get_folio+0x14b/0x370
+[<0>] filemap_fault+0x155/0xac0
+[<0>] __do_fault+0x38/0x140
+[<0>] do_fault+0x241/0x420
+[<0>] __handle_mm_fault+0x67f/0xd40
+[<0>] handle_mm_fault+0xdb/0x2d0
+[<0>] do_user_addr_fault+0x19c/0x570
+[<0>] exc_page_fault+0x70/0x170
+[<0>] asm_exc_page_fault+0x22/0x30
+### direct_reclaim D chain 5.4: shrink_page_list naming
+[<0>] shrink_page_list+0x5a3/0xd40
+[<0>] shrink_inactive_list+0x1d2/0x3c0
+[<0>] shrink_node_memcg+0x205/0x770
+[<0>] shrink_node+0xd6/0x480
+[<0>] do_try_to_free_pages+0xc8/0x380
+[<0>] try_to_free_pages+0xee/0x1d0
+[<0>] __alloc_pages_slowpath+0x417/0xe50
+[<0>] __alloc_pages_nodemask+0x2cd/0x320
+[<0>] alloc_pages_vma+0x88/0x210
+[<0>] __handle_mm_fault+0xa4c/0x1290
+[<0>] handle_mm_fault+0xca/0x200
+[<0>] do_user_addr_fault+0x1f9/0x450
+[<0>] page_fault+0x34/0x40
+### memcg_high_throttle S chain 6.6: penalty sleep over memory.high on return to user
+[<0>] mem_cgroup_handle_over_high+0x1f2/0x2a0
+[<0>] irqentry_exit_to_user_mode+0x132/0x1a0
+[<0>] asm_exc_page_fault+0x26/0x30
+### memcg_high_throttle D chain 6.6: reclaiming the overage before the sleep
+[<0>] shrink_folio_list+0x6d5/0xd60
+[<0>] shrink_lruvec+0x2c5/0x470
+[<0>] shrink_node+0x2b8/0x7c0
+[<0>] do_try_to_free_pages+0xd0/0x570
+[<0>] try_to_free_mem_cgroup_pages+0x107/0x230
+[<0>] reclaim_high.constprop.0+0xbf/0x110
+[<0>] mem_cgroup_handle_over_high+0x9b/0x2a0
+[<0>] syscall_exit_to_user_mode+0x150/0x220
+[<0>] do_syscall_64+0x6d/0x90
+[<0>] entry_SYSCALL_64_after_hwframe+0x6e/0xd8
+### dirty_throttle S chain 6.6: buffered write paused in balance_dirty_pages
+[<0>] balance_dirty_pages+0x3a2/0xce0
+[<0>] balance_dirty_pages_ratelimited_flags+0x2a2/0x380
+[<0>] generic_perform_write+0x168/0x260
+[<0>] ext4_buffered_write_iter+0x6c/0x140
+[<0>] vfs_write+0x23a/0x400
+[<0>] ksys_write+0x6b/0xf0
+[<0>] do_syscall_64+0x5d/0x90
+[<0>] entry_SYSCALL_64_after_hwframe+0x6e/0xd8
+### compaction D chain 6.6: direct compaction for a transparent huge page
+[<0>] migrate_pages_batch+0x5b4/0xb40
+[<0>] migrate_pages+0x2d0/0x790
+[<0>] compact_zone+0x2ba/0x9d0
+[<0>] compact_zone_order+0xa5/0x100
+[<0>] try_to_compact_pages+0xcf/0x2b0
+[<0>] __alloc_pages_direct_compact+0x8d/0x2a0
+[<0>] __alloc_pages_slowpath.constprop.0+0x1c3/0xe20
+[<0>] __alloc_pages+0x326/0x350
+[<0>] vma_alloc_folio+0x6b/0x380
+[<0>] do_huge_pmd_anonymous_page+0xb4/0x5f0
+[<0>] __handle_mm_fault+0x6e4/0xf30
+[<0>] handle_mm_fault+0x17f/0x360
+[<0>] do_user_addr_fault+0x1ee/0x6a0
+[<0>] exc_page_fault+0x7e/0x180
+[<0>] asm_exc_page_fault+0x26/0x30
+### compaction S chain 6.6: the kcompactd thread
+[<0>] kcompactd+0x2e5/0x3b0
+[<0>] kthread+0xe8/0x120
+[<0>] ret_from_fork+0x34/0x50
+[<0>] ret_from_fork_asm+0x1b/0x30
+### oom D chain 6.6: the cgroup OOM killer from a charge
+[<0>] out_of_memory+0x10e/0x530
+[<0>] mem_cgroup_out_of_memory+0x13c/0x150
+[<0>] try_charge_memcg+0x5d4/0x6c0
+[<0>] __mem_cgroup_charge+0x44/0xa0
+[<0>] do_anonymous_page+0x111/0x3f0
+[<0>] __handle_mm_fault+0x8e3/0xf30
+[<0>] handle_mm_fault+0x17f/0x360
+[<0>] do_user_addr_fault+0x1ee/0x6a0
+[<0>] exc_page_fault+0x7e/0x180
+[<0>] asm_exc_page_fault+0x26/0x30
+### oom S chain 5.4: waiting for an OOM victim in its cgroup
+[<0>] mem_cgroup_oom_synchronize+0x2fe/0x340
+[<0>] pagefault_out_of_memory+0x25/0x80
+[<0>] mm_fault_error+0x72/0x150
+[<0>] do_user_addr_fault+0x3dd/0x450
+[<0>] page_fault+0x34/0x40
+### futex S captured 6.18: threading.Lock.acquire
+[<0>] futex_do_wait+0x46/0x90
+[<0>] __futex_wait+0x8a/0x100
+[<0>] futex_wait+0x67/0x120
+[<0>] do_futex+0xfd/0x250
+[<0>] __x64_sys_futex+0x112/0x210
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### futex S chain 5.4: futex_wait_queue_me naming
+[<0>] futex_wait_queue_me+0xc4/0x120
+[<0>] futex_wait+0x10a/0x250
+[<0>] do_futex+0x325/0x500
+[<0>] __x64_sys_futex+0x13f/0x170
+[<0>] do_syscall_64+0x57/0x190
+[<0>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+### poll S captured 6.18: select.select
+[<0>] poll_schedule_timeout.constprop.0+0x37/0x90
+[<0>] do_select+0x63a/0x930
+[<0>] core_sys_select+0x275/0x4a0
+[<0>] do_pselect.constprop.0+0xc5/0x180
+[<0>] __x64_sys_pselect6+0x63/0xa0
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### poll S captured 6.18: select.epoll.poll
+[<0>] do_epoll_wait+0x548/0x5a0
+[<0>] __x64_sys_epoll_wait+0x5a/0x120
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### poll S chain 5.4: ep_poll naming
+[<0>] ep_poll+0x403/0x460
+[<0>] do_epoll_wait+0xb0/0xd0
+[<0>] __x64_sys_epoll_wait+0x1a/0x20
+[<0>] do_syscall_64+0x57/0x190
+[<0>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+### nanosleep S captured 6.18: time.sleep
+[<0>] hrtimer_nanosleep+0x74/0xf0
+[<0>] common_nsleep_timens+0x3d/0xa0
+[<0>] __x64_sys_clock_nanosleep+0xce/0x140
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### nanosleep S chain 5.4: do_nanosleep naming
+[<0>] do_nanosleep+0x89/0x170
+[<0>] hrtimer_nanosleep+0xd6/0x1b0
+[<0>] __x64_sys_nanosleep+0x96/0xd0
+[<0>] do_syscall_64+0x57/0x190
+[<0>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+### ipc_wait S captured 6.18: socket recv on a socketpair
+[<0>] unix_stream_read_generic+0x6de/0xc90
+[<0>] unix_stream_recvmsg+0x8b/0xa0
+[<0>] sock_recvmsg+0xb2/0xc0
+[<0>] __sys_recvfrom+0xb8/0x150
+[<0>] __x64_sys_recvfrom+0x20/0x40
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### ipc_wait S captured 6.18: os.read on an empty pipe
+[<0>] anon_pipe_read+0x366/0x410
+[<0>] vfs_read+0x32c/0x360
+[<0>] ksys_read+0xba/0xe0
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### ipc_wait S captured 6.18: waitpid on a child
+[<0>] do_wait+0x53/0x120
+[<0>] kernel_wait4+0x9c/0x140
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### block_io D captured 6.18: fsync on ext4
+[<0>] submit_bio_wait+0x74/0xc0
+[<0>] blkdev_issue_flush+0x33/0x60
+[<0>] ext4_sync_file+0x242/0x2d0
+[<0>] do_fsync+0x3b/0xa0
+[<0>] __x64_sys_fsync+0xf/0x20
+[<0>] do_syscall_64+0x71/0x280
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+### block_io D chain 6.6: read(2) of an uncached page, no fault on the stack
+[<0>] folio_wait_bit_common+0x13d/0x350
+[<0>] filemap_get_pages+0x5f0/0x660
+[<0>] filemap_read+0xe3/0x350
+[<0>] vfs_read+0x1f9/0x350
+[<0>] ksys_read+0x6b/0xf0
+[<0>] do_syscall_64+0x5d/0x90
+[<0>] entry_SYSCALL_64_after_hwframe+0x6e/0xd8
+### block_io D chain 5.4: journal commit wait in fsync
+[<0>] jbd2_log_wait_commit+0xac/0x120
+[<0>] ext4_sync_file+0x30f/0x3d0
+[<0>] do_fsync+0x38/0x70
+[<0>] __x64_sys_fsync+0x10/0x20
+[<0>] do_syscall_64+0x57/0x190
+[<0>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+### stopped_or_frozen D captured 6.18: cgroup v1 freezer, FROZEN
+[<0>] __refrigerator+0xac/0xd0
+[<0>] get_signal+0x5c0/0x840
+[<0>] arch_do_signal_or_restart+0x26/0x250
+[<0>] irqentry_exit_to_user_mode+0x12e/0x1a0
+[<0>] asm_sysvec_reschedule_ipi+0x16/0x20
+### stopped_or_frozen S captured 6.18: cgroup v2 cgroup.freeze=1
+[<0>] get_signal+0x38e/0x840
+[<0>] arch_do_signal_or_restart+0x26/0x250
+[<0>] irqentry_exit_to_user_mode+0x12e/0x1a0
+[<0>] asm_sysvec_reschedule_ipi+0x16/0x20
+### stopped_or_frozen T captured 6.18: SIGSTOP
+[<0>] do_signal_stop+0x16f/0x210
+[<0>] get_signal+0x22d/0x840
+[<0>] arch_do_signal_or_restart+0x26/0x250
+[<0>] irqentry_exit_to_user_mode+0x12e/0x1a0
+[<0>] asm_sysvec_reschedule_ipi+0x16/0x20
+### running R captured 6.18: preempted in user space
+[<0>] irqentry_exit_to_user_mode+0x110/0x1a0
+[<0>] asm_sysvec_reschedule_ipi+0x16/0x20
+### running R captured 6.18: on a CPU (the kernel gives no stack)
+### other D chain 6.6: page fault waiting for mmap_lock (not I/O)
+[<0>] rwsem_down_read_slowpath+0x29a/0x4f0
+[<0>] down_read+0x48/0xb0
+[<0>] lock_mm_and_find_vma+0x86/0x160
+[<0>] do_user_addr_fault+0x1b9/0x6a0
+[<0>] exc_page_fault+0x7e/0x180
+[<0>] asm_exc_page_fault+0x26/0x30

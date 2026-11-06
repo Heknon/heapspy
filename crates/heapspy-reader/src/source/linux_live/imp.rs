@@ -219,10 +219,7 @@ fn kib_field(line: &str, key: &str) -> Option<u64> {
 impl Inner {
     pub(super) fn attach(pid: u32) -> Result<Inner> {
         if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no process with pid {pid}"),
-            )));
+            return Err(Error::NoSuchProcess(format!("no process with pid {pid}")));
         }
         if pid == std::process::id() {
             return Err(Error::Unsupported("heapspy cannot dump itself".into()));
@@ -271,9 +268,8 @@ impl Inner {
             }
         }
         if tracees.tids.is_empty() {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("pid {pid} has no threads left to stop"),
+            return Err(Error::NoSuchProcess(format!(
+                "pid {pid} has no threads left to stop"
             )));
         }
         guard.0 = Some(tracees);
@@ -637,8 +633,14 @@ mod tests {
 
     #[test]
     fn attach_to_missing_pid_fails_cleanly() {
-        assert!(Inner::attach(u32::MAX - 7).is_err());
-        assert!(Inner::attach(std::process::id()).is_err());
+        assert!(matches!(
+            Inner::attach(u32::MAX - 7),
+            Err(Error::NoSuchProcess(_))
+        ));
+        assert!(matches!(
+            Inner::attach(std::process::id()),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     /// Attach to a child we spawn, read its memory, and resume it. Needs
