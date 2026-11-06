@@ -276,18 +276,42 @@ With `allocations` (a path to a `.hpya` profile), it passes
 gives `app.cache.CACHE`, and an `app.session.Session` instance followed by
 `.payload` gives `app.session.Session.payload`.
 
+Source locations recorded in the snapshot (from a heapspy whose reports have
+them; see "Source locations" in `docs/json-schema.md`) are passed through:
+
+- `type_location` and `type_location_reason` on each top retainer and
+  histogram row: where the object's type is defined. A location is `location`
+  (`file:line`, `file:~line` for a class, which is located near its first
+  method; the class statement is at or before that line), `file`, `line`,
+  `exact` and `via`. The reason says why it is `null`, e.g.
+  `type_not_in_snapshot` for C types such as `builtins.dict`.
+- `source_locations` on each path: at most 5 locations, the target's type
+  first (`of: "type"`), then functions, classes, code objects and modules on
+  the path from the target back to the root (`of: "hop"`, with the hop's
+  `type`, `address` and `edge`).
+
+`file` is the path the target process recorded, which can be outside the
+repository or on another machine. To read the code, pass the type's name to
+`map_to_source` with the snapshot.
+
+With a heapspy without these fields, the summaries are as before: no
+`type_location` and no `source_locations` keys.
+
 ### `retaining_path(snapshot, address? | type?, max_paths=3, max_targets=3)`
 
 With `address`, runs `heapspy query --retaining-path`. With `type`, runs
 `heapspy query --type` and then traces the `max_targets` largest instances.
-Each target has `reachable` and up to `max_paths` paths, each with `rendered`,
-`hops` (root first), `direct_holder` and `source_hints`.
+Each target has `reachable`, `type_location` and up to `max_paths` paths,
+each with `rendered`, `hops` (root first; a hop with a recorded location has
+`source_loc`), `direct_holder`, `source_hints` and `source_locations`.
 
 ### `type_detail(snapshot, type, top=10, allocations?)`
 
-Runs `heapspy query --type`. Returns `matched_types`, `instances`, shallow and
-retained totals, `top_instances` with their paths, `holders` (referrer type and
-generalised edge, with a count) and `notes`. With `allocations`, each instance
+Runs `heapspy query --type`. Returns `matched_types`, `type_locations` (the
+`type_location` of each matched type), `instances`, shallow and
+retained totals, `top_instances` with their paths (and `source_loc` for an
+instance that is itself a function, class or module), `holders` (referrer type
+and generalised edge, with a count) and `notes`. With `allocations`, each instance
 gets `allocated_at` as in `heap_summary` (`top_stack_rank` is always `null`
 here), and the result gets `allocations` with the notes and caveats.
 
@@ -297,7 +321,7 @@ Runs `heapspy diff`. Returns `identity_approximate` (always true) and
 `identity_note`, `totals`, `by_type` and `by_site` growth rows, and `notes`.
 Objects are matched by type and retaining site, not by address.
 
-### `map_to_source(qualname, repo_path)`
+### `map_to_source(qualname, repo_path, snapshot?)`
 
 Resolves a dotted name to candidates with `file`, `line`, `end_line`,
 `location` (`file:line`), `kind` (`module`, `class`, `function`, `assignment`,
@@ -320,8 +344,29 @@ lines.
   `heuristic: true` and `main_resolution` (a note, files scanned, whether the
   scan limit was reached). Compare with the process's command line from
   `list_python_processes`.
-- Snapshots record the file and first line of each code object (`source_loc`),
-  but no heapspy JSON report exposes them yet, so they are not used here.
+- With `snapshot` (a handle or `.hpy` path), the server first runs
+  `heapspy query --locate NAME`. For a type, function or module the snapshot
+  has a location for, the recorded file is mapped to a file inside
+  `repo_path`: the path itself when it is absolute and inside the repository,
+  then the path relative to the repository root, then a unique path-suffix
+  match (`/srv/build/app/cache.py` finds `app/cache.py` when exactly one file
+  ends that way). The result then has `heuristic: false` and `via:
+  "snapshot"`, and each candidate has `matched_by` (`exact_path`,
+  `repo_relative`, `suffix`) and `recorded` (the file, line, `exact` and `via`
+  from the snapshot). The line is that of the definition found around the
+  recorded line, so a class (recorded at its first method) is shown from its
+  `class` statement. If the file no longer defines the name there, the
+  candidate has `source_mismatch: true` and an excerpt at the recorded line.
+  This settles `__main__` names, which are otherwise heuristic.
+- The repository rules apply to recorded files as well: a recorded path
+  outside `repo_path`, or one that leaves it through a symlink, is never
+  opened.
+- When the snapshot has no usable location, the name is resolved from the
+  repository's files as below, and the result has `snapshot_lookup`:
+  `status` (`not_in_snapshot`, `not_in_repo` with the `recorded` locations
+  and why each was not used, or `no_location` with the snapshot's
+  `reasons`) and a `note`. With a heapspy without `--locate`, the result is
+  the same as without `snapshot`.
 - Names are found as classes, functions, methods, nested classes,
   module-level and class-level assignments (including those inside `if` and
   `try` blocks), imports, and `self.X = ...` assignments in methods.

@@ -2,7 +2,8 @@
 
 Read-only and confined to one repository directory: every file that is
 opened must resolve (after following symlinks) to a path inside the
-repository root.
+repository root. That includes files named by a snapshot's recorded
+locations: a recorded path outside the repository is never opened.
 """
 
 from __future__ import annotations
@@ -12,10 +13,12 @@ import os
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
 MAX_CANDIDATES = 10
+MAX_SUFFIX_SCAN = 20000
+MAX_RECORDED = 5
 MAX_EXCERPT_LINES = 8
 MAX_LINE = 200
 MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -364,9 +367,236 @@ def _excerpt(lines: list[str], node: ast.AST) -> tuple[int, int, str]:
     return start, getattr(node, "end_lineno", None) or end, "\n".join(body)
 
 
-def map_to_source(qualname: str, repo_path: str) -> dict[str, Any]:
+def check_arguments(qualname: str, repo_path: str) -> None:
+    """Raise :class:`SourceMapError` for an unusable qualname or repository,
+    before anything else (such as a heapspy call) is run with them."""
+    _check_qualname(qualname)
+    _check_repo(repo_path)
+
+
+# -- exact resolution from a snapshot's recorded location --------------------------
+
+
+def _recorded_path(recorded: str) -> PurePath:
+    """The recorded filename as a path of the platform that wrote it."""
+    if re.match(r"^[A-Za-z]:[\\/]", recorded) or ("\\" in recorded and "/" not in recorded):
+        return PureWindowsPath(recorded)
+    return PurePosixPath(recorded)
+
+
+def _suffix_match(root: Path, parts: tuple[str, ...]) -> tuple[Path | None, int]:
+    """The repository file whose path ends with the most trailing components of
+    ``parts`` (the file name at least), if exactly one has that many.
+
+    Returns ``(file, 0)`` on a unique match, else ``(None, n)`` with ``n`` the
+    number of files tied for the best match. Only names are compared; no file
+    is opened. At most ``MAX_SUFFIX_SCAN`` files are looked at.
+    """
+    if not parts:
+        return None, 0
+    name = parts[-1]
+    best: list[Path] = []
+    best_len = 0
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
+        seen += len(filenames)
+        if name in filenames:
+            rel = (Path(dirpath) / name).relative_to(root).parts
+            n = 0
+            while n < min(len(rel), len(parts)) and rel[-1 - n] == parts[-1 - n]:
+                n += 1
+            if n > best_len:
+                best, best_len = [Path(dirpath) / name], n
+            elif n == best_len:
+                best.append(Path(dirpath) / name)
+        if seen >= MAX_SUFFIX_SCAN:
+            break
+    if len(best) != 1:
+        return None, len(best)
+    return _inside(root, best[0]), 0
+
+
+def _find_recorded(root: Path, recorded: str) -> tuple[Path | None, str]:
+    """Map a recorded filename to a file inside ``root``.
+
+    Tried in order: the path itself when it is absolute and inside the
+    repository, the path relative to the repository root, then a unique
+    suffix match. An absolute path outside the repository is never opened.
+    Returns the file and how it was found, or ``None`` and the reason.
+    """
+    p = _recorded_path(recorded)
+    if p.is_absolute():
+        # Only a path of this platform's kind can name a file here.
+        if isinstance(p, PureWindowsPath) == (os.name == "nt"):
+            real = _inside(root, Path(recorded))
+            if real is not None:
+                return real, "exact_path"
+    elif ".." not in p.parts:
+        real = _inside(root, root.joinpath(*p.parts))
+        if real is not None:
+            return real, "repo_relative"
+    parts = tuple(x for x in p.parts if x not in (p.anchor, ".", ".."))
+    real, tied = _suffix_match(root, parts)
+    if real is not None:
+        return real, "suffix"
+    return None, "ambiguous_suffix" if tied > 1 else "not_in_repo"
+
+
+def _raw_excerpt(path: Path, line: int) -> tuple[int, int, str] | None:
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return None
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if not 1 <= line <= len(lines):
+        return None
+    end = min(len(lines), line + MAX_EXCERPT_LINES - 1)
+    body = []
+    for no in range(line, end + 1):
+        text = lines[no - 1]
+        if len(text) > MAX_LINE:
+            text = text[: MAX_LINE - 3] + "..."
+        body.append(f"{no:>5}  {text}")
+    return line, end, "\n".join(body)
+
+
+def _node_start(node: ast.AST) -> int:
+    decorators = getattr(node, "decorator_list", None) or []
+    return min([getattr(node, "lineno", 1), *(d.lineno for d in decorators)])
+
+
+def _clip(text: Any, limit: int = 400) -> Any:
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _recorded(loc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "file": _clip(loc.get("file")),
+        "line": loc.get("line") if isinstance(loc.get("line"), int) else None,
+        "exact": bool(loc.get("exact")),
+        "via": _clip(loc.get("via"), 40),
+    }
+
+
+def _exact_candidates(
+    root: Path, matches: list[Any]
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    """Candidates for the snapshot's recorded locations that are in the repository,
+    the files read, and the recorded locations that could not be used."""
+    candidates: list[dict[str, Any]] = []
+    searched: list[str] = []
+    unresolved: list[dict[str, Any]] = []
+    seen: set[tuple[Path, int]] = set()
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        loc = m.get("source_loc")
+        if not isinstance(loc, dict) or not isinstance(loc.get("file"), str) or not loc["file"]:
+            continue
+        rec = _recorded(loc)
+        if loc["file"].startswith("<"):
+            unresolved.append({**rec, "reason": "generated_filename"})
+            continue
+        path, how = _find_recorded(root, loc["file"])
+        if path is None:
+            unresolved.append({**rec, "reason": how})
+            continue
+        rel = path.relative_to(root).as_posix()
+        if len(searched) < MAX_SEARCHED and rel not in searched:
+            searched.append(rel)
+        rest = [p for p in str(m.get("qualname") or "").split(".") if p]
+        line = rec["line"]
+        node, kind = None, None
+        lines: list[str] = []
+        parsed = _parse(path)
+        if parsed is not None:
+            tree, lines = parsed
+            hits, _ = _resolve_in_module(tree, rest)
+            for hit, hit_kind in hits:
+                start = 1 if isinstance(hit, ast.Module) else _node_start(hit)
+                end = getattr(hit, "end_lineno", None) or start
+                if line is None or start <= line <= end:
+                    node, kind = hit, hit_kind
+                    break
+        cand: dict[str, Any] = {
+            "file": rel,
+            "kind": kind or m.get("kind"),
+            "module": m.get("module"),
+            "qualname": m.get("qualname"),
+            "via": "snapshot",
+            "matched_by": how,
+            "recorded": rec,
+        }
+        if node is not None:
+            start, end, text = _excerpt(lines, node)
+        else:
+            # The file does not define the name around the recorded line: it
+            # may have changed since the snapshot. Show the recorded line.
+            raw = _raw_excerpt(path, line) if line is not None else None
+            start, end, text = raw if raw is not None else (line or 1, line or 1, "")
+            cand["source_mismatch"] = True
+        if (path, start) in seen or len(candidates) >= MAX_CANDIDATES:
+            continue
+        seen.add((path, start))
+        cand.update(line=start, end_line=end, location=f"{rel}:{start}", excerpt=text)
+        candidates.append(cand)
+    return candidates, searched, unresolved
+
+
+def map_to_source(
+    qualname: str, repo_path: str, located: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Resolve ``qualname`` inside ``repo_path``.
+
+    ``located`` is what the snapshot says about the name: ``{"matches": [...]}``
+    from ``heapspy query --locate``, with an empty list when the snapshot has
+    no object of that name. When a recorded location maps to a file in the
+    repository, the result is exact (``heuristic: false``, ``via:
+    "snapshot"``). Otherwise, and when ``located`` is ``None`` (no snapshot
+    given, or a heapspy without ``--locate``), the name is resolved from the
+    repository's files as before.
+    """
     parts = _check_qualname(qualname)
     root = _check_repo(repo_path)
+    lookup: dict[str, Any] | None = None
+    if located is not None:
+        matches = [m for m in located.get("matches") or [] if isinstance(m, dict)]
+        candidates, searched, unresolved = _exact_candidates(root, matches)
+        if candidates:
+            return {
+                "qualname": qualname,
+                "repo_path": str(root),
+                "candidates": candidates,
+                "searched_files": searched,
+                "heuristic": False,
+                "via": "snapshot",
+            }
+        if not matches:
+            lookup = {"status": "not_in_snapshot"}
+        elif unresolved:
+            lookup = {"status": "not_in_repo", "recorded": unresolved[:MAX_RECORDED]}
+        else:
+            lookup = {
+                "status": "no_location",
+                "reasons": sorted(
+                    {str(m.get("source_loc_reason")) for m in matches if m.get("source_loc_reason")}
+                ),
+            }
+        lookup["note"] = (
+            "The snapshot gave no location inside the repository for this name, so it "
+            "was resolved from the repository's files."
+        )
+    result = _heuristic(qualname, parts, root)
+    if lookup is not None:
+        result["snapshot_lookup"] = lookup
+    return result
+
+
+def _heuristic(qualname: str, parts: list[str], root: Path) -> dict[str, Any]:
     searched: list[str] = []
     candidates: list[dict[str, Any]] = []
     partial: dict[str, Any] | None = None

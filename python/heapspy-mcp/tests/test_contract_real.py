@@ -13,6 +13,10 @@ What runs depends on what the binary has (checked with --help):
   with ``allocations_unsupported``. A heapspy with ``analyze --allocations`` but no
   join (feature/alloc-format alone) still checks the profile, so a corrupt one is
   ``invalid_allocations`` there.
+- ``query --locate`` (source locations in reports): type_detail has
+  ``type_locations`` and ``map_to_source`` with the snapshot resolves the
+  victim's class exactly. Without it, ``map_to_source`` with a snapshot must
+  give the same result as without one.
 
 The live tests start ``/usr/bin/python3.12`` (``HEAPSPY_MCP_REAL_PYTHON``
 overrides it) and ``sleep``, and need ptrace rights on them; they are skipped
@@ -77,6 +81,7 @@ def features() -> dict[str, bool]:
         "allocations_flag": "--allocations" in _help("analyze"),
         "allocations": "--allocations" in _help("analyze")
         and "--allocations" in _help("flamegraph"),
+        "locate": "--locate" in _help("query"),
     }
 
 
@@ -209,6 +214,35 @@ async def test_capture_live_python(call, real_bin, features, victim, snapshot_di
     assert src["heuristic"] is True
     assert src["candidates"][0]["location"] == "contract_victim.py:6"
     assert src["candidates"][0]["kind"] == "instance_attribute"
+
+    # With the snapshot, the class resolves from its recorded location.
+    args = {"qualname": "__main__.ContractHolder", "repo_path": str(repo)}
+    err, plain = await call("map_to_source", args)
+    assert not err, plain
+    err, exact = await call("map_to_source", {**args, "snapshot": handle}, heapspy_bin=real_bin)
+    assert not err, exact
+    if features["locate"]:
+        script = str(repo / "contract_victim.py")
+        assert detail["type_locations"][0]["type_location"] == {
+            "location": f"{script}:~5",
+            "file": script,
+            "line": 5,
+            "exact": False,
+            "via": "methods",
+        }
+        assert exact["heuristic"] is False and exact["via"] == "snapshot"
+        c = exact["candidates"][0]
+        assert (c["location"], c["kind"], c["matched_by"]) == (
+            "contract_victim.py:4",
+            "class",
+            "exact_path",
+        )
+        hist = {r["type"]: r for r in summary["type_histogram"]}
+        if "__main__.ContractHolder" in hist:
+            assert hist["__main__.ContractHolder"]["type_location"]["file"] == script
+    else:
+        assert "type_locations" not in detail
+        assert exact == plain
 
     if features["allocations"]:
         # A profile from another pid: nothing links, the stacks are still listed.

@@ -18,6 +18,15 @@ pub fn run(args: QueryArgs) -> anyhow::Result<()> {
         max_paths: args.max_paths,
     };
 
+    if let Some(name) = &args.locate {
+        let report = heapspy_analyzer::locate(&snap, &path, name, &opts)?;
+        return if args.json {
+            print_json(&report)
+        } else {
+            print!("{}", render::locate(&report)?);
+            Ok(())
+        };
+    }
     let target = match (args.type_name, addr, args.retaining_path_type) {
         (Some(t), None, None) => {
             let report = heapspy_analyzer::query_type(&snap, &path, &t, &opts)?;

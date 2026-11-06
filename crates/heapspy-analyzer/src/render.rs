@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 
 use crate::report::{
-    AnalyzeReport, DiffReport, Note, PathHop, RetainingPathReport, TypeQueryReport,
+    AnalyzeReport, DiffReport, LocateReport, Note, PathHop, RetainingPathReport, TypeQueryReport,
 };
 use crate::{root_path_string, Result};
 
@@ -188,7 +188,10 @@ fn path_lines(out: &mut String, p: &[PathHop], indent: &str) {
                 (None, Some(e)) => format!("  {e}"),
                 (None, None) => "  ?".to_string(),
             };
-            let right = format!("{}  ({})", h.type_name, format_bytes(h.shallow_bytes));
+            let mut right = format!("{}  ({})", h.type_name, format_bytes(h.shallow_bytes));
+            if let Some(l) = &h.source_loc {
+                let _ = write!(right, "  {}", l.display());
+            }
             (left, right)
         })
         .collect();
@@ -202,36 +205,65 @@ fn path_lines(out: &mut String, p: &[PathHop], indent: &str) {
 /// `heapspy query --type` text output.
 pub fn type_query(r: &TypeQueryReport) -> Result<String> {
     let mut out = String::new();
+    // `module.Type (file:line)` for each matched type with a location.
+    let names: Vec<String> = r
+        .matched_types
+        .iter()
+        .map(|t| {
+            let at = r
+                .matched_type_locations
+                .iter()
+                .find(|l| &l.type_name == t)
+                .and_then(|l| l.type_location.as_ref());
+            match at {
+                Some(l) => format!("{t} ({})", l.display()),
+                None => t.clone(),
+            }
+        })
+        .collect();
     let _ = writeln!(
         out,
         "{}: {} instances, {} shallow, {} retained",
-        r.matched_types.join(", "),
+        names.join(", "),
         r.instances,
         format_bytes(r.shallow_bytes),
         format_bytes(r.retained_bytes)
     );
     out.push_str("\nLargest instances\n\n");
+    // Instances that are functions, classes, modules or code objects get a
+    // column with their own location.
+    let located = r.top_instances.iter().any(|i| i.source_loc.is_some());
     let rows: Vec<Vec<String>> = r
         .top_instances
         .iter()
         .map(|i| {
-            vec![
+            let mut row = vec![
                 format_bytes(i.retained_bytes),
                 format_bytes(i.shallow_bytes),
                 i.length.map_or("-".to_string(), |l| l.to_string()),
                 i.address.to_string(),
+            ];
+            if located {
+                row.push(
+                    i.source_loc
+                        .as_ref()
+                        .map_or("-".to_string(), |l| l.display()),
+                );
+            }
+            row.push(
                 i.path
                     .as_deref()
                     .map_or("(unreachable)".to_string(), root_path_string),
-            ]
+            );
+            row
         })
         .collect();
-    table(
-        &mut out,
-        &["retained", "shallow", "len", "address", "root path"],
-        &rows,
-        &[0, 1, 2],
-    );
+    let mut header = vec!["retained", "shallow", "len", "address"];
+    if located {
+        header.push("defined at");
+    }
+    header.push("root path");
+    table(&mut out, &header, &rows, &[0, 1, 2]);
     out.push_str("\nHeld by\n\n");
     if r.holders.is_empty() {
         out.push_str("  (no references from other objects)\n");
@@ -254,9 +286,13 @@ pub fn retaining_path(r: &RetainingPathReport) -> Result<String> {
         if k > 0 {
             out.push('\n');
         }
+        let at = t
+            .type_location
+            .as_ref()
+            .map_or(String::new(), |l| format!(" ({})", l.display()));
         let _ = writeln!(
             out,
-            "{} {}  shallow {}, retained {}",
+            "{} {}{at}  shallow {}, retained {}",
             t.address,
             t.type_name,
             format_bytes(t.shallow_bytes),
@@ -271,6 +307,27 @@ pub fn retaining_path(r: &RetainingPathReport) -> Result<String> {
             path_lines(&mut out, p, "  ");
         }
     }
+    notes(&mut out, &r.notes);
+    Ok(out)
+}
+
+/// `heapspy query --locate` text output.
+pub fn locate(r: &LocateReport) -> Result<String> {
+    let mut out = String::new();
+    let rows: Vec<Vec<String>> = r
+        .matches
+        .iter()
+        .map(|m| {
+            let at = match (&m.source_loc, &m.source_loc_reason) {
+                (Some(l), _) => l.display(),
+                (None, Some(reason)) => format!("unknown ({reason})"),
+                (None, None) => "unknown".to_string(),
+            };
+            vec![m.kind.clone(), m.address.to_string(), at]
+        })
+        .collect();
+    let _ = writeln!(out, "{}\n", r.query);
+    table(&mut out, &["kind", "address", "defined at"], &rows, &[]);
     notes(&mut out, &r.notes);
     Ok(out)
 }

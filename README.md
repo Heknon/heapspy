@@ -77,7 +77,15 @@ heapspy query app.hpy --type app.session.Session
 
 # The labelled chain of references keeping one object alive
 heapspy query app.hpy --retaining-path 0x7f3a2c41b0d0
+
+# Where a type, function or module is defined, as recorded in the snapshot
+heapspy query app.hpy --locate app.session.Session
 ```
+
+Reports include source locations where the snapshot has them: functions
+and code objects at `co_filename:co_firstlineno`, classes near the first
+line of their methods (`app/session.py:~14`). See
+[docs/json-schema.md](docs/json-schema.md#source-locations).
 
 A retaining path reads root-first, one labelled hop per line:
 

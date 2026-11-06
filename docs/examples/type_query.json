@@ -15,6 +15,18 @@
   },
   "query": "app.session.Session",
   "matched_types": ["app.session.Session"],
+  "matched_type_locations": [
+    {
+      "type": "app.session.Session",
+      "type_location": {
+        "file": "app/session.py",
+        "line": 14,
+        "exact": false,
+        "via": "methods"
+      },
+      "type_location_reason": null
+    }
+  ],
   "instances": 400000,
   "shallow_bytes": 22400000,
   "retained_bytes": 434490368,
@@ -32,7 +44,9 @@
           "shallow_bytes": 72,
           "edge": null,
           "root_label": "sys.modules['app.cache']",
-          "root_kind": "module_dict"
+          "root_kind": "module_dict",
+          "source_loc": null,
+          "source_loc_reason": "contents_not_captured"
         },
         {
           "address": "0x7f3a2d0001a0",
@@ -40,7 +54,9 @@
           "shallow_bytes": 4696,
           "edge": ".__dict__",
           "root_label": null,
-          "root_kind": null
+          "root_kind": null,
+          "source_loc": null,
+          "source_loc_reason": null
         },
         {
           "address": "0x7f3a2c41b0d0",
@@ -48,7 +64,9 @@
           "shallow_bytes": 38692864,
           "edge": "['CACHE']",
           "root_label": null,
-          "root_kind": null
+          "root_kind": null,
+          "source_loc": null,
+          "source_loc_reason": null
         },
         {
           "address": "0x7f3a1e002a10",
@@ -56,9 +74,13 @@
           "shallow_bytes": 56,
           "edge": "[<str len=9>]",
           "root_label": null,
-          "root_kind": null
+          "root_kind": null,
+          "source_loc": null,
+          "source_loc_reason": null
         }
-      ]
+      ],
+      "source_loc": null,
+      "source_loc_reason": null
     }
   ],
   "holders": [

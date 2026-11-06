@@ -47,7 +47,9 @@
           "shallow_bytes": 72,
           "edge": null,
           "root_label": "sys.modules['app.cache']",
-          "root_kind": "module_dict"
+          "root_kind": "module_dict",
+          "source_loc": null,
+          "source_loc_reason": "contents_not_captured"
         },
         {
           "address": "0x7f3a2d0001a0",
@@ -55,7 +57,9 @@
           "shallow_bytes": 4696,
           "edge": ".__dict__",
           "root_label": null,
-          "root_kind": null
+          "root_kind": null,
+          "source_loc": null,
+          "source_loc_reason": null
         },
         {
           "address": "0x7f3a2c41b0d0",
@@ -63,9 +67,13 @@
           "shallow_bytes": 38692864,
           "edge": "['CACHE']",
           "root_label": null,
-          "root_kind": null
+          "root_kind": null,
+          "source_loc": null,
+          "source_loc_reason": null
         }
-      ]
+      ],
+      "type_location": null,
+      "type_location_reason": "type_not_in_snapshot"
     },
     {
       "rank": 2,
@@ -82,9 +90,13 @@
           "shallow_bytes": 12288,
           "edge": null,
           "root_label": "frame worker:run local 'pending'",
-          "root_kind": "frame_local"
+          "root_kind": "frame_local",
+          "source_loc": null,
+          "source_loc_reason": null
         }
-      ]
+      ],
+      "type_location": null,
+      "type_location_reason": "type_not_in_snapshot"
     }
   ],
   "type_histogram": [
@@ -92,13 +104,22 @@
       "type": "builtins.bytes",
       "count": 400021,
       "shallow_bytes": 412090368,
-      "retained_bytes": 412090368
+      "retained_bytes": 412090368,
+      "type_location": null,
+      "type_location_reason": "type_not_in_snapshot"
     },
     {
       "type": "app.session.Session",
       "count": 400000,
       "shallow_bytes": 22400000,
-      "retained_bytes": 434490368
+      "retained_bytes": 434490368,
+      "type_location": {
+        "file": "app/session.py",
+        "line": 14,
+        "exact": false,
+        "via": "methods"
+      },
+      "type_location_reason": null
     }
   ],
   "notes": [

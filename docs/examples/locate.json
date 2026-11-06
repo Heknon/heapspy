@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "kind": "locate",
+  "snapshot": {
+    "path": "app.hpy",
+    "format_version": 1,
+    "python_version": "3.12.4",
+    "os": "linux",
+    "arch": "x86_64",
+    "pointer_size": 8,
+    "captured_at": 1762430400,
+    "source": { "kind": "pid", "ref": "1234" },
+    "contents_captured": false,
+    "truncated": false
+  },
+  "query": "app.session.Session.__init__",
+  "matches": [
+    {
+      "kind": "function",
+      "name": "app.session.Session.__init__",
+      "module": "app.session",
+      "qualname": "Session.__init__",
+      "address": "0x7f3a2d114a60",
+      "source_loc": {
+        "file": "app/session.py",
+        "line": 21,
+        "exact": true,
+        "via": "function"
+      },
+      "source_loc_reason": null
+    }
+  ],
+  "notes": [
+    {
+      "code": "keys_redacted",
+      "message": "Dict keys are shown as type and length because the snapshot was taken without --capture-contents."
+    }
+  ]
+}

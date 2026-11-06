@@ -14,7 +14,8 @@ Environment:
                            hangs), dump_truncated, dump_no_json (exit 0, no
                            document), dump_usage (usage error naming --json in its
                            Usage line), old_binary (a heapspy without dump --json,
-                           --allocations or flamegraph);
+                           --allocations, flamegraph, query --locate or the source
+                           location fields in its reports);
                            with --allocations also alloc_not_linked (a profile from
                            another pid) and alloc_not_joined (a heapspy that checks
                            the profile but has no join: null allocations, note
@@ -22,6 +23,9 @@ Environment:
                            a profile path containing "corrupt" fails with
                            invalid_allocations, a missing one with io
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
+    FAKE_HEAPSPY_LOCATE    JSON object mapping a name to the ``matches`` that
+                           ``query --locate NAME`` prints; a name not in it (and not the
+                           example's) is not_found
 """
 
 from __future__ import annotations
@@ -102,6 +106,27 @@ def big_analyze() -> dict:
     ]
     doc["notes"] = [{"code": "x", "message": "m" * 5000}] * 100
     return doc
+
+
+LOCATION_FIELDS = (
+    "source_loc",
+    "source_loc_reason",
+    "type_location",
+    "type_location_reason",
+    "matched_type_locations",
+)
+
+
+def strip_locations(value: object) -> None:
+    """Remove the source location fields, as a heapspy from before them prints."""
+    if isinstance(value, dict):
+        for key in LOCATION_FIELDS:
+            value.pop(key, None)
+        for v in value.values():
+            strip_locations(v)
+    elif isinstance(value, list):
+        for v in value:
+            strip_locations(v)
 
 
 def usage_error(flag: str, usage: str) -> None:
@@ -348,6 +373,20 @@ def main() -> None:
             ]
             doc["matched_types"] = [f"app.m{i}.Session" for i in range(300)]
             doc["holders"] = [doc["holders"][0]] * 20
+    elif cmd == "query" and opt(args, "locate") is not None:
+        name = opt(args, "locate")
+        if MODE == "old_binary":
+            usage_error("--locate", "heapspy query <SNAP> <--type <T>|--retaining-path <ADDR>>")
+        doc = load("locate")
+        doc["snapshot"]["path"] = args[1]
+        table = os.environ.get("FAKE_HEAPSPY_LOCATE")
+        matches = json.loads(table).get(name) if table else None
+        if matches is None and name == doc["query"]:
+            matches = doc["matches"]
+        if not matches:
+            fail("not_found", f"no type, function or module named {name!r} in the snapshot")
+        doc["query"] = name
+        doc["matches"] = matches
     elif cmd == "query" and opt(args, "retaining-path") is not None:
         addr = opt(args, "retaining-path")
         if addr == "0xdead":
@@ -368,6 +407,8 @@ def main() -> None:
     else:
         sys.exit(2)
 
+    if MODE == "old_binary":
+        strip_locations(doc)
     if MODE == "bad_schema":
         doc["schema_version"] = 2
     if MODE == "wrong_kind":

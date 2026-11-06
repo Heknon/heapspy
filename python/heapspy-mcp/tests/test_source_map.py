@@ -312,3 +312,188 @@ async def test_through_server(call, repo: Path) -> None:
     assert out["candidates"][0]["location"] == "app/cache.py:4"
     err, out = await call("map_to_source", {"qualname": "../x", "repo_path": str(repo)})
     assert err and out["error"]["code"] == "invalid_argument"
+
+
+# -- exact resolution from a snapshot's recorded locations --------------------------
+
+
+def located(*matches: dict) -> dict:
+    return {"matches": list(matches)}
+
+
+def match(kind: str, module: str, qualname: str, file: str, line: int | None, **loc) -> dict:
+    exact = loc.pop("exact", kind != "type")
+    via = loc.pop("via", "methods" if kind == "type" else "function")
+    return {
+        "kind": kind,
+        "name": f"{module}.{qualname}" if qualname else module,
+        "module": module,
+        "qualname": qualname,
+        "address": "0x7f0000001000",
+        "source_loc": {"file": file, "line": line, "exact": exact, "via": via},
+        "source_loc_reason": None,
+    }
+
+
+@pytest.fixture
+def reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Every file map_to_source parses or excerpts."""
+    import heapspy_mcp.source_map as source_map
+
+    seen: list[Path] = []
+    parse, raw = source_map._parse, source_map._raw_excerpt
+
+    def spy_parse(path: Path):
+        seen.append(path)
+        return parse(path)
+
+    def spy_raw(path: Path, line: int):
+        seen.append(path)
+        return raw(path, line)
+
+    monkeypatch.setattr(source_map, "_parse", spy_parse)
+    monkeypatch.setattr(source_map, "_raw_excerpt", spy_raw)
+    return seen
+
+
+def test_exact_from_relative_recorded_path(repo: Path) -> None:
+    # A class is recorded at its first method's line; the class statement is above.
+    m = match("type", "app.cache", "Session", "app/cache.py", 9)
+    result = map_to_source("app.cache.Session", str(repo), located(m))
+    assert result["heuristic"] is False and result["via"] == "snapshot"
+    c = only(result)
+    assert c["location"] == "app/cache.py:8"
+    assert c["kind"] == "class"
+    assert c["matched_by"] == "repo_relative"
+    assert c["recorded"] == {"file": "app/cache.py", "line": 9, "exact": False, "via": "methods"}
+    assert c["excerpt"].splitlines()[0] == "    8  class Session:"
+    assert "source_mismatch" not in c
+    assert result["searched_files"] == ["app/cache.py"]
+
+
+def test_exact_from_absolute_path_inside_repo(repo: Path) -> None:
+    # A decorated function's co_firstlineno is its first decorator.
+    m = match("function", "app.cache", "Store.get", str(repo / "app" / "cache.py"), 19)
+    c = only(map_to_source("app.cache.Store.get", str(repo), located(m)))
+    assert (c["location"], c["kind"], c["matched_by"]) == (
+        "app/cache.py:19",
+        "function",
+        "exact_path",
+    )
+
+
+def test_absolute_path_outside_repo_is_never_read(
+    repo: Path, tmp_path: Path, reads: list[Path]
+) -> None:
+    outside = write(tmp_path, "outside/secret_mod.py", "class Session:\n    SECRET = 'hunter2'\n")
+    m = match("type", "secret_mod", "Session", str(outside), 2)
+    result = map_to_source("secret_mod.Session", str(repo), located(m))
+    assert result["candidates"] == []
+    assert "heuristic" not in result
+    lookup = result["snapshot_lookup"]
+    assert lookup["status"] == "not_in_repo"
+    assert lookup["recorded"] == [
+        {
+            "file": str(outside),
+            "line": 2,
+            "exact": False,
+            "via": "methods",
+            "reason": "not_in_repo",
+        }
+    ]
+    assert all(p.is_relative_to(repo.resolve()) for p in reads), reads
+    assert "hunter2" not in repr(result)
+
+
+def test_absolute_path_from_another_machine_by_suffix(repo: Path) -> None:
+    m = match("type", "app.cache", "Session", "/srv/build/checkout/app/cache.py", 9)
+    c = only(map_to_source("app.cache.Session", str(repo), located(m)))
+    assert (c["file"], c["matched_by"], c["line"]) == ("app/cache.py", "suffix", 8)
+    # Windows paths too.
+    m = match("type", "app.cache", "Session", r"C:\build\app\cache.py", 9)
+    c = only(map_to_source("app.cache.Session", str(repo), located(m)))
+    assert (c["file"], c["matched_by"]) == ("app/cache.py", "suffix")
+
+
+def test_ambiguous_suffix_falls_back(repo: Path) -> None:
+    write(repo, "lib/models.py", "class Model:\n    pass\n")
+    m = match("type", "svc.models", "Model", "/elsewhere/models.py", 1)
+    result = map_to_source("svc.models.Model", str(repo), located(m))
+    assert result.get("via") != "snapshot"
+    assert result["snapshot_lookup"]["recorded"][0]["reason"] == "ambiguous_suffix"
+    # The fallback still finds src/svc/models.py from the module path.
+    assert only(result)["file"] == "src/svc/models.py"
+
+
+def test_snapshot_disambiguates_two_main_scripts(repo: Path) -> None:
+    script = """
+        class Session:
+            def __init__(self):
+                self.items = []
+
+
+        if __name__ == "__main__":
+            Session()
+        """
+    write(repo, "jobs/a_first.py", script)
+    b = write(repo, "jobs/b_second.py", "import os\n\n" + textwrap.dedent(script).lstrip("\n"))
+    heuristic = map_to_source("__main__.Session", str(repo))
+    # Both scripts rank equally (main guard, definition); app/cache.py also defines Session.
+    files = [c["file"] for c in heuristic["candidates"]]
+    assert files == ["jobs/a_first.py", "jobs/b_second.py", "app/cache.py"]
+    assert heuristic["heuristic"] is True
+    m = match("type", "__main__", "Session", str(b), 4)
+    result = map_to_source("__main__.Session", str(repo), located(m))
+    c = only(result)
+    assert (c["location"], c["kind"]) == ("jobs/b_second.py:3", "class")
+    assert result["heuristic"] is False and "main_resolution" not in result
+
+
+def test_symlink_out_of_repo_is_not_followed(repo: Path, tmp_path: Path, reads: list[Path]) -> None:
+    outside = write(tmp_path, "outside/secret.py", "class Leak:\n    SECRET = 'hunter2'\n")
+    (repo / "app" / "leak.py").symlink_to(outside)
+    for recorded in (str(repo / "app" / "leak.py"), "app/leak.py", "/x/app/leak.py"):
+        m = match("type", "app.leak", "Leak", recorded, 2)
+        result = map_to_source("app.leak.Leak", str(repo), located(m))
+        assert result["candidates"] == []
+        assert result["snapshot_lookup"]["status"] == "not_in_repo"
+    assert all(p.resolve().is_relative_to(repo.resolve()) for p in reads), reads
+
+
+def test_generated_filenames_and_missing_locations_fall_back(repo: Path) -> None:
+    m = match("function", "app.cache", "Session.__init__", "<string>", 1)
+    result = map_to_source("app.cache.Session.__init__", str(repo), located(m))
+    assert result["snapshot_lookup"]["recorded"][0]["reason"] == "generated_filename"
+    # The fallback still finds it from the files.
+    assert only(result)["location"] == "app/cache.py:9"
+
+    no_loc = {**m, "source_loc": None, "source_loc_reason": "no_python_methods"}
+    result = map_to_source("app.cache.Session", str(repo), located(no_loc))
+    assert result["snapshot_lookup"]["status"] == "no_location"
+    assert result["snapshot_lookup"]["reasons"] == ["no_python_methods"]
+
+    result = map_to_source("app.cache.Session", str(repo), located())
+    assert result["snapshot_lookup"]["status"] == "not_in_snapshot"
+    assert only(result)["location"] == "app/cache.py:8"
+
+
+def test_changed_file_is_flagged(repo: Path) -> None:
+    # The snapshot says line 4, where the file now has CACHE, not Session.
+    m = match("type", "app.cache", "Session", "app/cache.py", 4)
+    c = only(map_to_source("app.cache.Session", str(repo), located(m)))
+    assert c["source_mismatch"] is True
+    assert c["location"] == "app/cache.py:4"
+    assert c["excerpt"].splitlines()[0].endswith("CACHE: dict[str, Any] = {}")
+    assert len(c["excerpt"].splitlines()) <= MAX_EXCERPT_LINES
+
+
+def test_module_location(repo: Path) -> None:
+    m = match("module", "app.cache", "", "app/cache.py", None, exact=True, via="module_file")
+    c = only(map_to_source("app.cache", str(repo), located(m)))
+    assert (c["location"], c["kind"]) == ("app/cache.py:1", "module")
+
+
+def test_without_located_result_is_unchanged(repo: Path) -> None:
+    assert map_to_source("__main__.Job", str(repo), None) == map_to_source(
+        "__main__.Job", str(repo)
+    )
