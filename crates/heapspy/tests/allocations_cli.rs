@@ -185,14 +185,29 @@ fn matching_allocations_are_accepted() {
     let out = heapspy(&["analyze", s, "--json", "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let r: AnalyzeReport = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(notes(&r.notes).last(), Some(&"allocations_not_joined"));
-    assert!(!notes(&r.notes).iter().any(|c| c.ends_with("_mismatch")));
+    let codes = notes(&r.notes);
+    assert_eq!(codes.last(), Some(&"allocations_sampled"));
+    assert!(!codes.contains(&"allocations_not_joined"), "{codes:?}");
+    assert!(!codes.contains(&"allocations_not_linked"), "{codes:?}");
+    assert!(!codes.iter().any(|c| c.ends_with("_mismatch")));
     assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+    let a = r.allocations.as_ref().unwrap();
+    assert_eq!(a.path, p);
+    assert_eq!(a.samples, 1);
+    assert_eq!(a.coverage.linked_objects, 1);
+    assert_eq!(a.coverage.exact_linked_bytes, 4096);
+    assert_eq!(a.top_stacks[0].frames[0].location, "app.py:4");
 
-    let out = heapspy(&["query", s, "--type", "dict", "--json", "--allocations", p]);
+    let out = heapspy(&["query", s, "--type", "bytes", "--json", "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let r: TypeQueryReport = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(notes(&r.notes).contains(&"allocations_not_joined"));
+    assert!(notes(&r.notes).contains(&"allocations_sampled"));
+
+    // Without --allocations the fields are null.
+    let out = heapspy(&["analyze", s, "--json"]);
+    let r: AnalyzeReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(r.allocations.is_none());
+    assert!(r.top_retainers.iter().all(|t| t.allocated_at.is_none()));
 
     let out = heapspy(&[
         "query",
@@ -239,6 +254,10 @@ fn mismatched_allocations_warn() {
     let codes = notes(&r.notes);
     assert!(codes.contains(&"allocations_pid_mismatch"), "{codes:?}");
     assert!(codes.contains(&"allocations_python_mismatch"), "{codes:?}");
+    assert!(codes.contains(&"allocations_not_linked"), "{codes:?}");
+    let a = r.allocations.as_ref().unwrap();
+    assert_eq!(a.coverage.linked_objects, 0);
+    assert_eq!(a.top_stacks.len(), 1);
 
     let out = heapspy(&["diff", s, s, "--json", "--allocations", p]);
     let r: DiffReport = serde_json::from_slice(&out.stdout).unwrap();

@@ -11,13 +11,8 @@ pub fn run(args: AnalyzeArgs) -> anyhow::Result<()> {
     let path = display_path(&args.snapshot);
     let report = match &alloc {
         None => heapspy_analyzer::analyze(&snap, &path, &opts)?,
-        Some(a) => allocations::joined_or_plain(
-            a,
-            heapspy_analyzer::allocations::analyze_with_allocations(
-                &snap, &path, &opts, &a.profile,
-            ),
-            || heapspy_analyzer::analyze(&snap, &path, &opts),
-            |r| &mut r.notes,
+        Some(a) => heapspy_analyzer::allocations::analyze_with_allocations(
+            &snap, &path, &opts, &a.profile, &a.path,
         )?,
     };
     if args.json {

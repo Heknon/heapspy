@@ -166,7 +166,7 @@ impl FoldedDiff {
 /// A small multiplicative hasher. Keys are a few integers, and the default
 /// SipHash is the bulk of the label-tree pass on large heaps.
 #[derive(Default)]
-struct Fx(u64);
+pub(crate) struct Fx(u64);
 
 impl Hasher for Fx {
     #[inline]
@@ -197,7 +197,7 @@ impl Hasher for Fx {
     }
 }
 
-type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+pub(crate) type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Key {

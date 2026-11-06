@@ -72,6 +72,7 @@
       "allocated_at": {
         "linked_objects": 60180,
         "linked_bytes": 62914560,
+        "exact_linked_bytes": 0,
         "stacks": [
           {
             "frames": [
@@ -99,6 +100,7 @@
             ],
             "linked_objects": 60180,
             "linked_bytes": 62914560,
+            "exact_linked_bytes": 0,
             "top_stack_rank": 1
           }
         ],
@@ -126,6 +128,7 @@
       "allocated_at": {
         "linked_objects": 1024,
         "linked_bytes": 1048576,
+        "exact_linked_bytes": 1048576,
         "stacks": [
           {
             "frames": [
@@ -146,6 +149,7 @@
             ],
             "linked_objects": 1024,
             "linked_bytes": 1048576,
+            "exact_linked_bytes": 1048576,
             "top_stack_rank": 2
           }
         ],
@@ -175,6 +179,10 @@
     {
       "code": "outside_graph",
       "message": "Python graph accounts for 448.0 MiB of 1.9 GiB RSS. The rest is outside the object graph (native allocations, C extensions, untracked objects)."
+    },
+    {
+      "code": "allocations_sampled",
+      "message": "Allocation stacks cover only allocations made while recording, and only the sampled events (arena, pool, large object); objects allocated before recording started have no stack. Links through arena and pool samples are approximate: they name the most recent growth event that created the memory, not necessarily the call that allocated the object. Links through large-object samples are exact."
     }
   ],
   "allocations": {
@@ -207,7 +215,9 @@
     "coverage": {
       "linked_objects": 61204,
       "linked_bytes": 63963136,
-      "linked_pct": 13.62
+      "linked_pct": 13.62,
+      "exact_linked_objects": 1024,
+      "exact_linked_bytes": 1048576
     },
     "top_stacks": [
       {
@@ -242,6 +252,7 @@
           "large_object"
         ],
         "linked_bytes": 62914560,
+        "exact_linked_bytes": 0,
         "approximate": false
       },
       {
@@ -268,6 +279,7 @@
           "large_object"
         ],
         "linked_bytes": 1048576,
+        "exact_linked_bytes": 1048576,
         "approximate": false
       }
     ]

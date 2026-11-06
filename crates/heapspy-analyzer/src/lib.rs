@@ -201,6 +201,17 @@ fn memory_totals(snap: &Snapshot, graph_bytes: u64) -> Result<MemoryTotals> {
 /// Dominator tree, retained sizes, top retainers, type histogram.
 pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let a = Analysis::new(snap)?;
+    Ok(analyze_with(&a, path, opts)?.0)
+}
+
+/// The analyze report of an analysed snapshot, and the node of each entry
+/// of `top_retainers`, in order.
+pub(crate) fn analyze_with(
+    a: &Analysis,
+    path: &str,
+    opts: &AnalyzeOptions,
+) -> Result<(AnalyzeReport, Vec<u32>)> {
+    let snap = a.snap;
     let reachable_bytes = a.reachable_bytes();
     let reachable_objects = a.reachable_objects();
     let totals = Totals {
@@ -218,7 +229,8 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
     let memory = memory_totals(snap, a.shallow_total)?;
 
     let mut top_retainers = Vec::new();
-    for (i, v) in a.top_retainers(opts.top)?.into_iter().enumerate() {
+    let nodes = a.top_retainers(opts.top)?;
+    for (i, &v) in nodes.iter().enumerate() {
         let o = snap.object(v);
         let bytes = a.retained[v as usize];
         top_retainers.push(Retainer {
@@ -256,7 +268,7 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
         notes.push(notes::missing_roots(a.g.missing_roots));
     }
 
-    Ok(AnalyzeReport {
+    let report = AnalyzeReport {
         schema_version: SchemaVersion,
         kind: AnalyzeKind::Kind,
         snapshot: snapshot_summary(snap, path),
@@ -266,7 +278,8 @@ pub fn analyze(snap: &Snapshot, path: &str, opts: &AnalyzeOptions) -> Result<Ana
         type_histogram,
         notes,
         allocations: None,
-    })
+    };
+    Ok((report, nodes))
 }
 
 /// Instances of one type with sizes and sample holders. Fails with
@@ -277,7 +290,8 @@ pub fn query_type(
     type_name: &str,
     opts: &QueryOptions,
 ) -> Result<TypeQueryReport> {
-    query::query_type(snap, path, type_name, opts)
+    let a = Analysis::new(snap)?;
+    Ok(query::query_type(&a, path, type_name, opts)?.0)
 }
 
 /// Shortest retaining paths for an address or a type's instances. Fails
