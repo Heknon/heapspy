@@ -55,6 +55,7 @@
 //! pass it to `heapspy_reader::cpython::frames::{thread_states,
 //! read_stack, read_code}`.
 
+mod common;
 pub mod error;
 pub mod linux_ebpf;
 pub mod linux_ptrace;

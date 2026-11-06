@@ -14,7 +14,7 @@
 //! - No caching of memory contents (they change); module lists may be cached.
 //! - `release()` does nothing.
 //!
-//! # Implementation notes (status: not implemented)
+//! # Implementation
 //!
 //! - **Linux (M7a).** `process_vm_readv` with a `/proc/<pid>/mem` fallback,
 //!   modules from `/proc/<pid>/maps`, as `heapspy_reader::source::linux_live`
@@ -35,13 +35,25 @@
 
 use heapspy_reader::MemorySource;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// A reader of the running process `pid` that does not stop it. See the
 /// module docs.
 pub fn open(pid: u32) -> Result<Box<dyn MemorySource>> {
-    let _ = pid;
-    Err(Error::Unimplemented(
-        "reading a running process without stopping it (heapspy-record live::open)",
-    ))
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(
+            heapspy_reader::source::linux_live::LiveProcess::open_running(pid)?,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        Ok(Box::new(crate::windows::live::RunningProcess::open(pid)?))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        Err(crate::error::Error::Unsupported(format!(
+            "reading a running process (pid {pid}) needs Linux or Windows"
+        )))
+    }
 }

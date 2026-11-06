@@ -13,5 +13,9 @@ heapspy-reader.workspace = true
 heapspy-snapshot.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+object.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

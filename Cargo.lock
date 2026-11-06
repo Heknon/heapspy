@@ -274,6 +274,8 @@ dependencies = [
  "heapspy-alloc",
  "heapspy-reader",
  "heapspy-snapshot",
+ "libc",
+ "object",
  "tempfile",
  "thiserror",
 ]
