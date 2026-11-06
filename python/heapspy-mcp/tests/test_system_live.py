@@ -5,11 +5,13 @@ The numbers each scenario produced are printed (run with ``-s`` to see them).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -188,13 +190,34 @@ def quota_cgroup() -> Iterator[Path]:
     try:
         yield made[0]
     finally:
+        # Fixtures are torn down in reverse order, so the busy loop placed in
+        # this cgroup is usually still alive here. Move its tasks to the parent
+        # first: rmdir fails on a cgroup that still has tasks.
         for d in reversed(made):
+            _empty_cgroup(d)
             for _ in range(50):
                 try:
                     d.rmdir()
                     break
                 except OSError:
                     time.sleep(0.05)
+            else:
+                warnings.warn(f"could not remove test cgroup {d}", stacklevel=1)
+
+
+def _empty_cgroup(d: Path) -> None:
+    """Move every task in cgroup ``d`` (v1 or v2) to its parent cgroup."""
+    procs = d / "cgroup.procs"
+    if not procs.exists():
+        return
+    for _ in range(20):
+        pids = procs.read_text().split()
+        if not pids:
+            return
+        for pid in pids:
+            with contextlib.suppress(OSError):  # the task may have exited meanwhile
+                (d.parent / "cgroup.procs").write_text(pid)
+        time.sleep(0.05)
 
 
 async def test_d_cfs_throttling(call, procs, quota_cgroup: Path) -> None:
