@@ -4,7 +4,7 @@
 //! `heapspy-alloc` and `docs/alloc-format.md`).
 //!
 //! Design: `docs/allocation-sampling.md`. This crate holds the contract the
-//! recorders are built against; the recorders themselves are stubs.
+//! recorders are built against, and the recorders.
 //!
 //! | piece | where | status |
 //! |---|---|---|
@@ -13,17 +13,16 @@
 //! | [`SampleSink`]: code addresses to code entries, `max_frames` | [`sink`] | done |
 //! | [`record`] / [`record_with`]: header, overhead, file, `--then-dump` | [`session`] | done |
 //! | Python stack offsets and reference readers | `heapspy_reader::cpython::frames` | done |
-//! | non-stopping reader of a running process | [`live`] | stub (M7a, M7b) |
-//! | Linux eBPF recorder | [`linux_ebpf`] | stub (M7a) |
-//! | Linux ptrace fallback | [`linux_ptrace`] | stub (M7a) |
-//! | Windows ETW + debugger recorder | [`windows`] | stub (M7b) |
+//! | non-stopping reader of a running process | [`live`] | done |
+//! | Linux eBPF recorder: arenas, large objects | [`linux_ebpf`] | done |
+//! | Linux ptrace fallback: arenas | [`linux_ptrace`] | done |
+//! | Windows ETW + debugger recorder | [`windows`] | done, untested on Windows |
 //!
 //! # Flow
 //!
 //! 1. [`RecordOptions::validate`], then, on Linux, check that the pid
 //!    exists (`NoSuchProcess` otherwise). Nothing reads the target before
-//!    a recorder's probe succeeds, so with the stub recorders a pid that
-//!    is not CPython also ends with `Unimplemented`.
+//!    a recorder's probe succeeds; probes only check this machine.
 //! 2. [`select`] the recorders for `--mechanism` on this OS and call
 //!    [`Recorder::probe`] on each in order; the first that succeeds runs.
 //!    `Unsupported`, `PermissionDenied` and `Unimplemented` move on to the

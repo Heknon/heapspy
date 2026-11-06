@@ -372,15 +372,17 @@ fn mechanism_selection() {
     }
 }
 
+/// The test process is not CPython: a recorder probes fine, finding the
+/// runtime fails, and nothing is written.
+#[cfg(target_os = "linux")]
 #[test]
-fn record_is_unimplemented_on_this_host() {
+fn record_on_this_process_is_not_python() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("a.hpya");
     let opts = RecordOptions::new(std::process::id(), Duration::from_secs(1), &out);
     let err = record(&opts, &AtomicBool::new(false)).unwrap_err();
-    assert!(matches!(err, Error::Unimplemented(_)), "{err}");
     assert!(
-        err.to_string().starts_with("not implemented yet: "),
+        matches!(err, Error::Reader(heapspy_reader::Error::NotPython(_))),
         "{err}"
     );
     assert!(!out.exists());

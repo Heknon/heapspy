@@ -50,8 +50,12 @@ fn notes(v: &[heapspy_analyzer::report::Note]) -> Vec<&str> {
     v.iter().map(|n| n.code.as_str()).collect()
 }
 
+/// A pid that is not CPython: a recorder probes fine (eBPF, or ptrace
+/// when eBPF is not permitted), then finding the runtime fails before
+/// anything attaches, and nothing is written.
+#[cfg(target_os = "linux")]
 #[test]
-fn record_is_not_implemented_yet() {
+fn record_on_a_non_python_pid_fails() {
     let dir = tempfile::tempdir().unwrap();
     let out_path = dir.path().join("a.hpya");
     let out = heapspy(&[
@@ -65,7 +69,6 @@ fn record_is_not_implemented_yet() {
     ]);
     assert_eq!(out.status.code(), Some(1));
     let e = stderr(&out);
-    assert!(e.contains("not implemented yet"), "{e}");
     assert!(e.contains("cannot record pid"), "{e}");
     assert!(!out_path.exists());
 }
@@ -109,33 +112,18 @@ fn sleeper() -> Child {
     Child(Command::new("sleep").arg("60").spawn().expect("run sleep"))
 }
 
+/// `--json` on a pid that is not CPython reports `not_python` and writes
+/// nothing: the recorders check the target before attaching.
+#[cfg(target_os = "linux")]
 #[test]
-fn record_json_reports_unimplemented() {
-    let pid = std::process::id().to_string();
-    let (status, doc, written) = record_json(&["--pid", &pid, "--duration", "1s"]);
-    assert_eq!(status, Some(1));
-    assert_eq!(error_code(&doc), "unimplemented");
-    let msg = doc["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("cannot record pid"), "{msg}");
-    if cfg!(target_os = "linux") {
-        // `auto` tries eBPF first; its stub's error is the one reported.
-        assert!(msg.contains("eBPF"), "{msg}");
-    }
-    assert!(!written);
-}
-
-/// The stub recorders fail before anything reads the target, so a pid that
-/// is not CPython is not detected yet: the error is `unimplemented`, not
-/// `not_python`. This test pins that order; it changes when a recorder
-/// attaches.
-#[cfg(unix)]
-#[test]
-fn record_json_on_a_non_python_pid_is_unimplemented() {
+fn record_json_on_a_non_python_pid_is_not_python() {
     let child = sleeper();
     let pid = child.0.id().to_string();
     let (status, doc, written) = record_json(&["--pid", &pid, "--duration", "1s"]);
     assert_eq!(status, Some(1));
-    assert_eq!(error_code(&doc), "unimplemented");
+    assert_eq!(error_code(&doc), "not_python", "{doc}");
+    let msg = doc["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("cannot record pid"), "{msg}");
     assert!(!written);
 }
 
