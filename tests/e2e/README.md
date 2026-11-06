@@ -78,7 +78,10 @@ The Windows path has not been run yet; see "Status" below.
 To run the MCP smoke test, check out the branch that has `python/heapspy-mcp`
 somewhere else (for example `git worktree add ../mcp origin/feature/mcp-server`)
 and set `HEAPSPY_MCP_DIR=../mcp/python/heapspy-mcp`. The test runs the tools
-in that project's own environment with `uv run --project`.
+in that project's own environment with `uv run --project`. When that
+heapspy-mcp's `map_to_source` takes a `snapshot`, the test also checks that
+`__main__.CachedResponse` resolves exactly to its `class` line from the
+location the snapshot recorded.
 
 ## Fixtures
 
