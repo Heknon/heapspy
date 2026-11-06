@@ -44,6 +44,8 @@ struct Site {
     label: String,
     bytes: u64,
     objects: u64,
+    /// How many objects share this site.
+    members: u64,
     /// Type of the largest contributor, and its retained bytes.
     type_group: u32,
     type_bytes: u64,
@@ -54,6 +56,7 @@ struct SiteStat {
     type_name: String,
     bytes: u64,
     objects: u64,
+    members: u64,
     parent: Option<String>,
 }
 
@@ -130,6 +133,7 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
                     label: slot.key().1.clone(),
                     bytes: 0,
                     objects: 0,
+                    members: 0,
                     type_group: a.group(v),
                     type_bytes: bytes,
                 });
@@ -140,6 +144,7 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
         let s = &mut sites[id as usize];
         s.bytes += bytes;
         s.objects += a.retained_count[vi] as u64;
+        s.members += 1;
         if bytes > s.type_bytes {
             s.type_group = a.group(v);
             s.type_bytes = bytes;
@@ -155,6 +160,7 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
                 type_name: a.types.names[s.type_group as usize].clone(),
                 bytes: s.bytes,
                 objects: s.objects,
+                members: s.members,
                 parent: (s.parent != NONE).then(|| render_site(&sites, s.parent)),
             },
         );
@@ -227,7 +233,7 @@ pub fn diff(
     keys.sort();
     keys.dedup();
     let empty = SiteStat::default();
-    let mut rows: Vec<(SiteGrowth, Option<String>)> = keys
+    let mut rows: Vec<(SiteGrowth, Option<String>, bool)> = keys
         .into_iter()
         .map(|k| {
             let (bs, as_) = (b.sites.get(k), a.sites.get(k));
@@ -243,18 +249,22 @@ pub fn diff(
                 after_retained_objects: y.objects,
                 delta_retained_objects: delta(x.objects, y.objects),
             };
-            (row, present.parent.clone())
+            let single = x.members.max(y.members) <= 1;
+            (row, present.parent.clone(), single)
         })
-        .filter(|(r, _)| r.delta_retained_bytes != 0 || r.delta_retained_objects != 0)
+        .filter(|(r, _, _)| r.delta_retained_bytes != 0 || r.delta_retained_objects != 0)
         .collect();
 
     // A site whose change is (almost) all in one child site only restates
     // that child: `module`, `module.__dict__` and `['CACHE']` all grow by
     // the same amount, and only `['CACHE']` is worth showing. Same 90% rule
-    // as for top retainers, applied to the deltas.
+    // as for top retainers, applied to the deltas. Only a child site that is
+    // a single object counts: a child that sums many objects (all values of
+    // CACHE under one redacted key) is an aggregate, not a wrapper, and its
+    // parent stays listed.
     let mut child_extreme: HashMap<&str, (i64, i64)> = HashMap::new();
-    for (r, parent) in &rows {
-        if let Some(p) = parent {
+    for (r, parent, single) in &rows {
+        if let (Some(p), true) = (parent, single) {
             let e = child_extreme.entry(p.as_str()).or_default();
             e.0 = e.0.max(r.delta_retained_bytes);
             e.1 = e.1.min(r.delta_retained_bytes);
@@ -262,7 +272,7 @@ pub fn diff(
     }
     let restates: Vec<bool> = rows
         .iter()
-        .map(|(r, _)| {
+        .map(|(r, _, _)| {
             let d = r.delta_retained_bytes as f64;
             let (hi, lo) = child_extreme
                 .get(r.site.as_str())
@@ -276,7 +286,7 @@ pub fn diff(
         .drain(..)
         .zip(restates)
         .filter(|(_, skip)| !skip)
-        .map(|((r, _), _)| r)
+        .map(|((r, _, _), _)| r)
         .collect();
     by_site.sort_by(|x, y| {
         y.delta_retained_bytes

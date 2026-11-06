@@ -99,9 +99,31 @@ fn entries_with_redacted_keys_share_one_site() {
 }
 
 #[test]
-fn a_site_that_restates_its_child_is_not_listed() {
-    // Each session is 56 bytes over a 1000-byte payload, so the session
-    // sites only restate their `.payload` sites.
+fn a_site_that_restates_a_single_child_is_not_listed() {
+    // HOLDER is one object whose growth is all in its `.data` list.
+    let build = |n: u32| {
+        let mut h = Heap::new();
+        let (_, md) = h.module("__main__");
+        let holder = h.obj("app.Holder", 48);
+        h.key(md, holder, "HOLDER");
+        let data = h.obj("builtins.list", 56 + 8 * n as u64);
+        h.attr(holder, data, "data");
+        for i in 0..n {
+            let x = h.obj("builtins.bytes", 500);
+            h.item(data, x, i);
+        }
+        h
+    };
+    let r = run(&build(2), &build(20));
+    let sites: Vec<&str> = r.by_site.iter().map(|s| s.site.as_str()).collect();
+    assert_eq!(
+        sites[0], "sys.modules['__main__'].__dict__['HOLDER'].data",
+        "{sites:?}"
+    );
+    assert!(!sites.contains(&"sys.modules['__main__'].__dict__['HOLDER']"));
+
+    // Aggregated child sites do not hide their parent: each session site
+    // sums many sessions, and so does each `.payload` site under it.
     let (before, _) = unbounded_cache(10, 1000);
     let (after, _) = unbounded_cache(100, 1000);
     let r = diff(
@@ -118,8 +140,8 @@ fn a_site_that_restates_its_child_is_not_listed() {
         .map(|s| s.site.as_str())
         .filter(|s| s.starts_with("sys.modules['app.cache'].__dict__['CACHE'][<str len="))
         .collect();
-    assert_eq!(under.len(), 3, "{under:?}");
-    assert!(under.iter().all(|s| s.ends_with("].payload")), "{under:?}");
+    assert_eq!(under.len(), 6, "{under:?}");
+    assert_eq!(under.iter().filter(|s| s.ends_with("].payload")).count(), 3);
 }
 
 #[test]
