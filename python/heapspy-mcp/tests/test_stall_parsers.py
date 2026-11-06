@@ -80,7 +80,9 @@ def test_wchan_only_classification() -> None:
         "memcg_high_throttle"
     )
     assert wc.classify_wchan(None, "R", False).category == "running"
-    assert wc.classify_wchan(None, "S", False).category == "unavailable"
+    # wchan 0 while the state letter said S: it woke up between the two reads.
+    assert wc.classify_wchan(None, "S", False).category == "running"
+    assert wc.classify_wchan(None, "S", False, readable=False).category == "unavailable"
     assert wc.classify_wchan("anything", "T", False).category == "stopped_or_frozen"
     other = wc.classify_stack(["some_new_driver_wait"], "D")
     assert other.category == "other" and other.frames == ["some_new_driver_wait"]

@@ -22,7 +22,7 @@ from pydantic import Field
 from ..config import DEFAULT_WINDOW, Config
 from ..processes import matches_allowlist, version_from_exe, version_from_maps_text
 from . import diagnose as dg
-from . import perf, views, windows
+from . import perf, stalls, views, windows
 from . import procfs as pf
 from . import search as srch
 from .sampling import ProcessGone, identify
@@ -383,6 +383,58 @@ def register(server: MCPServer, config: Config) -> None:
     ) -> dict[str, Any]:
         async def body() -> dict[str, Any]:
             return windows.compare(store.get(before), store.get(after))
+
+        return await _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Sample every thread of one process at a fixed rate over a window (default 5 s at "
+            "20 Hz) to see whether it keeps leaving its hot path for the kernel: per thread, the "
+            "share of samples in each state and kernel wait category (page_fault_io, "
+            "direct_reclaim, memcg_high_throttle, dirty_throttle, compaction, oom, futex, poll, "
+            "nanosleep, ipc_wait, block_io, stopped_or_frozen, running, other), major and minor "
+            "faults per second, and the longest intervals in which its CPU time did not advance "
+            "while it was not voluntarily idle, each with its dominant category and an example "
+            "kernel stack. Per process: fault totals, RSS and swap, delay accounting when "
+            "enabled, and whether the process is frozen by a cgroup freezer or stopped. "
+            "environment: the memory cgroup (usage against memory.max/memory.high, "
+            "memory.events and memory.stat deltas, memory.pressure over the window) and host "
+            "memory PSI and /proc/vmstat reclaim and refault counters. Use it when a process "
+            "hangs or is intermittently slow; then diagnose_process. Kernel stacks need root; "
+            "without them categories come from wchan."
+        ),
+    )
+    async def watch_process_stalls(
+        pid: PidArg,
+        window_s: Annotated[
+            float,
+            Field(
+                description=f"Seconds to sample (default {stalls.DEFAULT_STALL_WINDOW:g}; capped "
+                "at the server's --max-window)."
+            ),
+        ] = stalls.DEFAULT_STALL_WINDOW,
+        rate_hz: Annotated[
+            float,
+            Field(
+                description=f"Samples per second per thread (default {stalls.DEFAULT_RATE_HZ:g}; "
+                "capped at the server's --max-stall-rate, default 100)."
+            ),
+        ] = stalls.DEFAULT_RATE_HZ,
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            check_pid(config, pid)
+            if rate_hz <= 0:
+                raise DiagnosticsRefused("invalid_argument", "rate_hz must be positive")
+            return await stalls.watch(
+                d.proc_root,
+                pid,
+                _window(config, window_s),
+                rate_hz,
+                host=d.host_context,
+                cgroup_root=d.cgroup_root,
+                rate_cap_hz=d.max_stall_rate_hz,
+            )
 
         return await _guard(body)
 

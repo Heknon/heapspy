@@ -13,7 +13,8 @@ its innermost frames are kept, so new kernel names can be added here.
 Pseudo-categories that do not come from a stack:
 
 - ``running``: state ``R`` with no stack, or only interrupt-return frames (the
-  kernel cannot unwind a task while it runs on a CPU).
+  kernel cannot unwind a task while it runs on a CPU), or an empty stack and a
+  ``wchan`` of ``0`` (the thread woke up between the reads).
 - ``unavailable``: neither the stack nor ``wchan`` could be read.
 """
 
@@ -309,8 +310,8 @@ CATEGORIES: tuple[Category, ...] = (
 BY_NAME = {c.name: c for c in CATEGORIES}
 
 PSEUDO_CATEGORIES = {
-    "running": "on a CPU or runnable (state R); the kernel does not unwind a running task, "
-    "so no wait site is known",
+    "running": "on a CPU or runnable: state R, or an empty stack and a wchan of 0 (it woke "
+    "up while being read); the kernel does not unwind a running task, so no wait site is known",
     "other": "a kernel wait site not in the table; the innermost frames are kept",
     "unavailable": "neither /proc/<tid>/stack nor wchan could be read",
 }
@@ -357,17 +358,21 @@ def classify_stack(frames: list[str], state: str | None = None) -> Classified:
     return Classified("other", None, frames)
 
 
-def classify_wchan(wchan: str | None, state: str | None, faulted: bool) -> Classified:
+def classify_wchan(
+    wchan: str | None, state: str | None, faulted: bool, readable: bool = True
+) -> Classified:
     """Category from ``wchan`` alone (no stack: not root, or stacks disabled).
 
     ``wchan`` is the innermost function, so a page or folio lock wait cannot be told
     apart from a read(2) wait. It counts as ``page_fault_io`` when ``faulted`` (the
     thread's major-fault count rose since the previous sample), else ``block_io``.
+    An empty or ``0`` wchan that was ``readable`` means the thread was on a CPU when
+    it was read (it may have woken up after its state letter was read): ``running``.
     """
     if state in ("T", "t"):
         return Classified("stopped_or_frozen", None, [])
     if not wchan:
-        return Classified("running" if state == "R" else "unavailable", None, [])
+        return Classified("running" if readable else "unavailable", None, [])
     frames = [wchan]
     if wchan in PAGE_WAIT_FRAMES:
         return Classified("page_fault_io" if faulted else "block_io", wchan, frames)
