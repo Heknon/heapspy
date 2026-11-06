@@ -188,7 +188,10 @@ header for GC-tracked objects (CPython's `__sizeof__` plus the pre-header) and
 the out-of-line storage the object owns outright (a list's item array, a
 dict's keys/values tables, a bytearray's buffer). Memory shared between
 objects (such as split-table dict keys shared by instances) is attributed to
-one owner only, the type for split keys.
+one owner only, the type for split keys. A split table's values array is
+counted once: in the materialized `__dict__` if there is one (as
+`getsizeof(dict)` does), otherwise in the instance that holds it (3.12 managed
+values, 3.13+ inline values), which `getsizeof(instance)` leaves out.
 
 Object `flags`:
 
