@@ -1,9 +1,11 @@
 //! `heapspy dump`: memory source -> snapshot file.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use heapspy_snapshot::{SnapshotInfo, SnapshotWriter, SourceInfo, SourceKind, FORMAT_VERSION};
+use heapspy_snapshot::{
+    PythonVersion, SnapshotInfo, SnapshotWriter, SourceInfo, SourceKind, FORMAT_VERSION,
+};
 
 use crate::cpython;
 use crate::error::Result;
@@ -39,16 +41,24 @@ impl Default for DumpOptions {
 }
 
 /// Result of a successful [`dump`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DumpStats {
+    /// CPython version found in the target.
+    pub python: PythonVersion,
     pub objects: u64,
     pub edges: u64,
     pub types: u64,
     pub roots: u64,
     pub bytes_written: u64,
     pub read_errors: u64,
-    /// The snapshot is marked truncated (the walk did not finish).
+    /// The snapshot is marked truncated: the walk did not finish, or the
+    /// image is missing memory its headers describe.
     pub truncated: bool,
+    /// [`MemorySource::missing_bytes`] of the source.
+    pub image_missing_bytes: u64,
+    /// How long a live target was stopped ([`MemorySource::release`]);
+    /// `None` for file sources and backends that do not measure it.
+    pub pause: Option<Duration>,
 }
 
 /// Read the CPython heap from `source` and write a snapshot to `out`.
@@ -98,15 +108,27 @@ pub fn dump(source: &dyn MemorySource, opts: &DumpOptions, out: &Path) -> Result
     }
 
     let walk = cpython::walk(source, &runtime, opts, &mut writer)?;
-    writer.info_mut().truncated = walk.truncated;
+    // Resume a live target before the snapshot is written.
+    let pause = source.release();
+    // An image that is missing part of its own memory (a cut core) can make
+    // the walk skip objects without noticing, so it is never complete.
+    let image_missing_bytes = source.missing_bytes();
+    let truncated = walk.truncated || image_missing_bytes > 0;
+    writer.info_mut().truncated = truncated;
+    if image_missing_bytes > 0 {
+        writer.add_meta("image.missing_bytes", &image_missing_bytes.to_string())?;
+    }
     let w = writer.finish_to_path(out)?;
     Ok(DumpStats {
+        python: runtime.version,
         objects: w.objects,
         edges: w.edges,
         types: w.types,
         roots: w.roots,
         bytes_written: w.bytes_written,
         read_errors: walk.read_errors,
-        truncated: walk.truncated,
+        truncated,
+        image_missing_bytes,
+        pause,
     })
 }

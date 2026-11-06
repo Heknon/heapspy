@@ -4,7 +4,7 @@ Read the object graph of a running Python process from the outside, and find out
 
 py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
 
-> **Status: early development.** The workspace, the snapshot file format and the command-line interface exist; dumping and analysis do not work yet and report "not implemented". This README describes what heapspy is meant to do and how it will be used. Commands below are the planned interface.
+> **Status: early development.** `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query` and `diff` work on them. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). An end-to-end suite ([tests/e2e](tests/e2e/README.md)) checks on Linux that known leaks in real 3.12 to 3.14 processes are found, by `--pid` and from `gcore` cores. Packaging is still planned, and the MCP server is being reviewed separately.
 
 ## What it answers, and what it doesn't
 
@@ -102,10 +102,11 @@ heapspy diff before.hpy after.hpy
 
 ### JSON output
 
-Every analysis command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it.
+Every command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it. `dump --json` reports what was written; a failed command prints an error document with a stable code such as `not_python` or `permission_denied`. See [docs/json-schema.md](docs/json-schema.md).
 
 ```sh
 heapspy analyze app.hpy --json | jq '.top_retainers[0]'
+heapspy dump --pid 1234 -o app.hpy --json | jq '.objects, .pause_ms'
 ```
 
 ## Permissions
@@ -166,17 +167,17 @@ pip install heapspy-mcp   # optional, for agent integration
 
 ## Roadmap
 
-| Milestone | Deliverable |
-|---|---|
-| M1 | Linux core dump reader to snapshot, proven on one `gcore` of a 3.12 process |
-| M2 | Analyzer: dominators, retained sizes, histogram, retaining paths, `--json`, property tests |
-| M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI |
-| M4 | Windows minidump backend |
-| M5 | Windows end-to-end test matrix passing on `windows-latest` |
-| M6 | `heapspy-mcp` |
-| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) |
+| Milestone | Deliverable | Status |
+|---|---|---|
+| M1 | Linux core dump reader to snapshot, proven on one `gcore` of a 3.12 process | done |
+| M2 | Analyzer: dominators, retained sizes, histogram, retaining paths, `--json`, property tests | done |
+| M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI | passes locally; CI job added (`ci:e2e`), not yet run on GitHub |
+| M4 | Windows minidump backend | done |
+| M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
+| M6 | `heapspy-mcp` | in review on a separate branch |
+| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
 
-The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path.
+The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
 
 ## Repository layout
 
@@ -186,6 +187,7 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
 | `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
 | `crates/heapspy` | the `heapspy` command-line tool |
+| `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
 
