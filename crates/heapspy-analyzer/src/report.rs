@@ -83,6 +83,10 @@ kind_marker!(
     /// `"kind": "error"`
     ErrorKind = "error"
 );
+kind_marker!(
+    /// `"kind": "locate"`
+    LocateKind = "locate"
+);
 
 /// A target address, serialized as `"0x..."` lowercase hex.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -154,6 +158,38 @@ pub struct SnapshotSummary {
     pub truncated: bool,
 }
 
+/// Where an object or a type is defined in the target's source, as recorded
+/// in the snapshot (`source_loc`, `type_location`).
+///
+/// `file` is `co_filename` (or a module's `__file__`) exactly as the target
+/// recorded it: relative or absolute depending on how the program was
+/// started and imported.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SourceLocation {
+    pub file: String,
+    /// 1-based line. For a class (`via: "methods"`), the smallest
+    /// `co_firstlineno` of its methods: the class statement is at or before
+    /// it. `null` for a module (`via: "module_file"`).
+    pub line: Option<u32>,
+    /// True when `file` and `line` are the object's own recorded location;
+    /// false when derived (a class located through its methods).
+    pub exact: bool,
+    /// How the location was found: `"code_object"`, `"function"`, `"method"`,
+    /// `"methods"` or `"module_file"`.
+    pub via: String,
+}
+
+impl SourceLocation {
+    /// `file:line`, `file:~line` when not exact, or `file` without a line.
+    pub fn display(&self) -> String {
+        match (self.line, self.exact) {
+            (Some(l), true) => format!("{}:{l}", self.file),
+            (Some(l), false) => format!("{}:~{l}", self.file),
+            (None, _) => self.file.clone(),
+        }
+    }
+}
+
 /// One hop of a retaining path. Paths are listed root first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathHop {
@@ -170,6 +206,15 @@ pub struct PathHop {
     /// Root kind (`"module_dict"`, `"thread_locals"`, `"frame_local"`,
     /// `"interp"`, `"other"`). Only on the first hop.
     pub root_kind: Option<String>,
+    /// Where the object at this hop is defined, for functions, methods,
+    /// code objects, classes and modules; `null` otherwise or when unknown.
+    #[serde(default)]
+    pub source_loc: Option<SourceLocation>,
+    /// Why `source_loc` is `null` for an object of one of those kinds (a
+    /// code from the schema doc, e.g. `"no_python_methods"`); `null` when
+    /// `source_loc` is set or the object is of another kind.
+    #[serde(default)]
+    pub source_loc_reason: Option<String>,
 }
 
 /// A path from a root to an object: `hops[0]` is the root object, the last
@@ -254,6 +299,12 @@ pub struct Retainer {
     pub retained_pct: f64,
     /// Shortest retaining path from a root to this object.
     pub path: RetainingPath,
+    /// Where the object's type (class) is defined.
+    #[serde(default)]
+    pub type_location: Option<SourceLocation>,
+    /// Why `type_location` is `null`.
+    #[serde(default)]
+    pub type_location_reason: Option<String>,
 }
 
 /// One entry of `type_histogram`.
@@ -266,6 +317,12 @@ pub struct TypeRow {
     /// Retained bytes of the set of all instances: the sum of `retained_bytes`
     /// over instances not dominated by another instance of the same type.
     pub retained_bytes: u64,
+    /// Where the type (class) is defined.
+    #[serde(default)]
+    pub type_location: Option<SourceLocation>,
+    /// Why `type_location` is `null`.
+    #[serde(default)]
+    pub type_location_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------- query --type
@@ -281,6 +338,9 @@ pub struct TypeQueryReport {
     /// Full names of the types that matched (an unqualified name can match
     /// several), sorted.
     pub matched_types: Vec<String>,
+    /// Where each matched type is defined, in the order of `matched_types`.
+    #[serde(default)]
+    pub matched_type_locations: Vec<TypeLocation>,
     pub instances: u64,
     pub shallow_bytes: u64,
     /// Retained bytes of the set of instances, as in `TypeRow::retained_bytes`.
@@ -305,6 +365,22 @@ pub struct Instance {
     pub length: Option<u64>,
     /// Shortest retaining path; `null` if the instance is unreachable.
     pub path: Option<RetainingPath>,
+    /// Where the instance itself is defined, when it is a function, method,
+    /// code object, class or module.
+    #[serde(default)]
+    pub source_loc: Option<SourceLocation>,
+    /// Why `source_loc` is `null` for such an instance.
+    #[serde(default)]
+    pub source_loc_reason: Option<String>,
+}
+
+/// One entry of `matched_type_locations`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeLocation {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub type_location: Option<SourceLocation>,
+    pub type_location_reason: Option<String>,
 }
 
 /// One entry of `holders`.
@@ -362,6 +438,45 @@ pub struct PathTarget {
     pub reachable: bool,
     /// Shortest paths first; distinct in their first differing hop.
     pub paths: Vec<RetainingPath>,
+    /// Where the object's type (class) is defined.
+    #[serde(default)]
+    pub type_location: Option<SourceLocation>,
+    /// Why `type_location` is `null`.
+    #[serde(default)]
+    pub type_location_reason: Option<String>,
+}
+
+// ---------------------------------------------------------------- query --locate
+
+/// `heapspy query --locate NAME --json`: where the type, function or module
+/// with that `module.qualname` is defined.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocateReport {
+    pub schema_version: SchemaVersion,
+    pub kind: LocateKind,
+    pub snapshot: SnapshotSummary,
+    /// The name as given on the command line.
+    pub query: String,
+    /// Objects with that name: types first, then functions, then modules.
+    /// Functions with the same location are listed once. At most `--top`.
+    pub matches: Vec<LocateMatch>,
+    pub notes: Vec<Note>,
+}
+
+/// One entry of `matches`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocateMatch {
+    /// `"type"`, `"function"` or `"module"`.
+    pub kind: String,
+    /// The full `module.qualname`; equal to the query.
+    pub name: String,
+    /// The module part of `name` (for a module, `name` itself).
+    pub module: String,
+    /// The part after the module; empty for a module.
+    pub qualname: String,
+    pub address: Address,
+    pub source_loc: Option<SourceLocation>,
+    pub source_loc_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------- diff
