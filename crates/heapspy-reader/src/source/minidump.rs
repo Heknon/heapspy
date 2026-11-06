@@ -50,6 +50,8 @@ use super::{
 };
 use crate::error::{Error, Result};
 
+#[cfg(test)]
+mod core_convert;
 mod parse;
 #[cfg(test)]
 pub(crate) mod synth;
