@@ -1,0 +1,14 @@
+[package]
+name = "heapspy-analyzer"
+description = "Dominators, retained sizes and JSON reports for heapspy snapshots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+heapspy-snapshot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,458 @@
+//! JSON report schema, version 1.
+//!
+//! These types are the stable machine interface of `heapspy ... --json`. Every
+//! field is documented in `docs/json-schema.md`, with an example document per
+//! report in `docs/examples/`. Rules:
+//!
+//! - Every report has `"schema_version": 1` and a `"kind"` string.
+//! - Within schema version 1, fields are only ever *added*. Consumers must
+//!   ignore fields they do not know. Removing or changing the meaning of a
+//!   field requires schema version 2.
+//! - Optional values are always present and `null` when unknown; they are
+//!   never omitted.
+//! - Byte counts and object counts are JSON integers. Addresses are lowercase
+//!   hex strings with a `0x` prefix (`"0x7f3a2c41b0d0"`), because 64-bit
+//!   values do not survive JSON number parsing in every language.
+//! - Percentages are floats in `0.0..=100.0`.
+//! - Arrays are ranked as documented (largest first) and bounded by `--top`.
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// The current schema version.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// `"schema_version": 1`. Deserializing any other value fails.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SchemaVersion;
+
+impl Serialize for SchemaVersion {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(SCHEMA_VERSION)
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaVersion {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = u32::deserialize(d)?;
+        if v == SCHEMA_VERSION {
+            Ok(SchemaVersion)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unsupported schema_version {v}, expected {SCHEMA_VERSION}"
+            )))
+        }
+    }
+}
+
+macro_rules! kind_marker {
+    ($(#[$m:meta])* $name:ident = $lit:literal) => {
+        $(#[$m])*
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum $name {
+            #[default]
+            #[serde(rename = $lit)]
+            Kind,
+        }
+    };
+}
+
+kind_marker!(
+    /// `"kind": "analyze"`
+    AnalyzeKind = "analyze"
+);
+kind_marker!(
+    /// `"kind": "type_query"`
+    TypeQueryKind = "type_query"
+);
+kind_marker!(
+    /// `"kind": "retaining_path"`
+    RetainingPathKind = "retaining_path"
+);
+kind_marker!(
+    /// `"kind": "diff"`
+    DiffKind = "diff"
+);
+kind_marker!(
+    /// `"kind": "error"`
+    ErrorKind = "error"
+);
+
+/// A target address, serialized as `"0x..."` lowercase hex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Address(pub u64);
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
+}
+
+impl FromStr for Address {
+    type Err = String;
+    /// Accepts `0x`-prefixed hex (any case). Plain decimal is rejected to
+    /// avoid ambiguity.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let hex = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .ok_or_else(|| format!("address {s:?} must start with 0x"))?;
+        u64::from_str_radix(hex, 16)
+            .map(Address)
+            .map_err(|e| format!("bad address {s:?}: {e}"))
+    }
+}
+
+impl Serialize for Address {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Where the snapshot came from (`snapshot.source`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRef {
+    /// `"pid"`, `"core"` or `"minidump"`.
+    pub kind: String,
+    /// The PID as text, or the input path as given to `heapspy dump`.
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
+/// Facts about one snapshot file (`snapshot`, or `before` / `after` in a diff).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    /// Path of the snapshot file as given on the command line.
+    pub path: String,
+    pub format_version: u16,
+    /// `sys.version`-style: `"3.12.4"`, `"3.13.0rc1"`.
+    pub python_version: String,
+    /// `"linux"`, `"windows"`, `"macos"`.
+    pub os: String,
+    /// `"x86_64"`, `"aarch64"`.
+    pub arch: String,
+    pub pointer_size: u8,
+    /// Unix seconds when the memory image was taken.
+    pub captured_at: u64,
+    pub source: SourceRef,
+    /// String/bytes contents and ordinary dict keys were captured.
+    pub contents_captured: bool,
+    /// The dump did not finish; the graph is incomplete.
+    pub truncated: bool,
+}
+
+/// One hop of a retaining path. Paths are listed root first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathHop {
+    pub address: Address,
+    /// `module.qualname` of the object at this hop, e.g. `"builtins.dict"`.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub shallow_bytes: u64,
+    /// Rendered label of the edge from the previous hop to this one, e.g.
+    /// `".payload"`, `"['cache']"`, `"[3]"`. `null` on the first hop.
+    pub edge: Option<String>,
+    /// Root description, e.g. `"sys.modules['app.cache']"`. Only on the first hop.
+    pub root_label: Option<String>,
+    /// Root kind (`"module_dict"`, `"thread_locals"`, `"frame_local"`,
+    /// `"interp"`, `"other"`). Only on the first hop.
+    pub root_kind: Option<String>,
+}
+
+/// A path from a root to an object: `hops[0]` is the root object, the last
+/// hop is the object itself.
+pub type RetainingPath = Vec<PathHop>;
+
+/// A non-fatal remark about the analysis (`notes[]`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    /// Stable machine-readable code, e.g. `"untracked_objects"`. See the schema doc.
+    pub code: String,
+    /// Human-readable text. Wording may change between releases.
+    pub message: String,
+}
+
+// ---------------------------------------------------------------- analyze
+
+/// `heapspy analyze --json`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnalyzeReport {
+    pub schema_version: SchemaVersion,
+    pub kind: AnalyzeKind,
+    pub snapshot: SnapshotSummary,
+    pub totals: Totals,
+    pub memory: MemoryTotals,
+    /// Objects with the largest retained size, largest first. At most `--top`.
+    pub top_retainers: Vec<Retainer>,
+    /// Types by retained bytes, largest first. At most `--top`.
+    pub type_histogram: Vec<TypeRow>,
+    pub notes: Vec<Note>,
+}
+
+/// Graph-wide counts (`totals`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Totals {
+    pub objects: u64,
+    pub edges: u64,
+    pub types: u64,
+    pub roots: u64,
+    /// Sum of shallow sizes of all objects in the snapshot.
+    pub shallow_bytes: u64,
+    /// Objects reachable from any root.
+    pub reachable_objects: u64,
+    /// Sum of shallow sizes of reachable objects.
+    pub reachable_bytes: u64,
+    /// Objects not reachable from any root (garbage awaiting collection, or
+    /// objects held only from outside the recorded graph).
+    pub unreachable_objects: u64,
+    pub unreachable_bytes: u64,
+    /// Edges whose target address is not an object in the snapshot.
+    pub dangling_edges: u64,
+}
+
+/// Process memory vs. the Python graph (`memory`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTotals {
+    /// Resident set size of the process, if the source knew it.
+    pub rss_bytes: Option<u64>,
+    /// Bytes accounted for by the object graph (`totals.shallow_bytes`).
+    pub graph_bytes: u64,
+    /// `rss_bytes - graph_bytes`, floored at 0. `null` without `rss_bytes`.
+    pub outside_graph_bytes: Option<u64>,
+    /// `outside_graph_bytes / rss_bytes * 100`. `null` without `rss_bytes`.
+    pub outside_graph_pct: Option<f64>,
+}
+
+/// One entry of `top_retainers`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Retainer {
+    /// 1-based position in the list.
+    pub rank: u32,
+    pub address: Address,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub shallow_bytes: u64,
+    /// Bytes freed if this object were freed: the shallow size of every
+    /// object it dominates, itself included.
+    pub retained_bytes: u64,
+    /// Number of objects it dominates, itself included.
+    pub retained_objects: u64,
+    /// `retained_bytes / totals.reachable_bytes * 100`.
+    pub retained_pct: f64,
+    /// Shortest retaining path from a root to this object.
+    pub path: RetainingPath,
+}
+
+/// One entry of `type_histogram`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeRow {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub count: u64,
+    pub shallow_bytes: u64,
+    /// Retained bytes of the set of all instances: the sum of `retained_bytes`
+    /// over instances not dominated by another instance of the same type.
+    pub retained_bytes: u64,
+}
+
+// ---------------------------------------------------------------- query --type
+
+/// `heapspy query --type T --json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeQueryReport {
+    pub schema_version: SchemaVersion,
+    pub kind: TypeQueryKind,
+    pub snapshot: SnapshotSummary,
+    /// The type name as given on the command line.
+    pub query: String,
+    /// Full names of the types that matched (an unqualified name can match
+    /// several), sorted.
+    pub matched_types: Vec<String>,
+    pub instances: u64,
+    pub shallow_bytes: u64,
+    /// Retained bytes of the set of instances, as in `TypeRow::retained_bytes`.
+    pub retained_bytes: u64,
+    /// Largest instances by retained size, largest first.
+    pub top_instances: Vec<Instance>,
+    /// Who holds the instances: direct referrers grouped by referrer type and
+    /// edge label, by count, largest first.
+    pub holders: Vec<Holder>,
+    pub notes: Vec<Note>,
+}
+
+/// One entry of `top_instances`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instance {
+    pub address: Address,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub shallow_bytes: u64,
+    pub retained_bytes: u64,
+    /// `len()` if recorded.
+    pub length: Option<u64>,
+    /// Shortest retaining path; `null` if the instance is unreachable.
+    pub path: Option<RetainingPath>,
+}
+
+/// One entry of `holders`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holder {
+    /// Type of the referring object.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// Rendered edge label from the referrer to the instance, e.g. `"['user:8812']"`.
+    /// Dict keys and list indices are generalised (`"[<key>]"`, `"[<index>]"`)
+    /// so that one container holding many instances gives one row.
+    pub edge: String,
+    /// Instances held this way.
+    pub count: u64,
+}
+
+// ---------------------------------------------------------------- query --retaining-path
+
+/// `heapspy query --retaining-path ADDR --json` (and the type form).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainingPathReport {
+    pub schema_version: SchemaVersion,
+    pub kind: RetainingPathKind,
+    pub snapshot: SnapshotSummary,
+    pub query: PathQuery,
+    /// One entry for an address query; up to `--top` instances for a type query.
+    pub targets: Vec<PathTarget>,
+    pub notes: Vec<Note>,
+}
+
+/// What was asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathQuery {
+    pub by: PathQueryBy,
+    /// The address (`"0x..."`) or type name as given.
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathQueryBy {
+    Address,
+    Type,
+}
+
+/// One object and the paths that keep it alive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathTarget {
+    pub address: Address,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub shallow_bytes: u64,
+    pub retained_bytes: u64,
+    /// False if no root reaches the object; `paths` is then empty.
+    pub reachable: bool,
+    /// Shortest paths first; distinct in their first differing hop.
+    pub paths: Vec<RetainingPath>,
+}
+
+// ---------------------------------------------------------------- diff
+
+/// `heapspy diff BEFORE AFTER --json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffReport {
+    pub schema_version: SchemaVersion,
+    pub kind: DiffKind,
+    /// Always `true`: objects are matched by type and retaining site, not by
+    /// identity, because addresses change between dumps.
+    pub identity_approximate: bool,
+    pub before: SnapshotSummary,
+    pub after: SnapshotSummary,
+    pub totals: DiffTotals,
+    /// Types sorted by `delta_bytes`, largest growth first.
+    pub by_type: Vec<TypeGrowth>,
+    /// Retaining sites sorted by `delta_retained_bytes`, largest growth first.
+    pub by_site: Vec<SiteGrowth>,
+    pub notes: Vec<Note>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffTotals {
+    pub before: DiffSide,
+    pub after: DiffSide,
+    pub delta_objects: i64,
+    pub delta_shallow_bytes: i64,
+    pub delta_reachable_bytes: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffSide {
+    pub objects: u64,
+    pub shallow_bytes: u64,
+    pub reachable_bytes: u64,
+}
+
+/// One entry of `by_type`. Counts and shallow bytes of all instances.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeGrowth {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub before_count: u64,
+    pub after_count: u64,
+    pub delta_count: i64,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub delta_bytes: i64,
+}
+
+/// One entry of `by_site`: an object identified by its rendered root path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteGrowth {
+    /// The rendered retaining path, e.g. `"sys.modules['app.cache'].__dict__['CACHE']"`.
+    /// This string is the match key between the two snapshots.
+    pub site: String,
+    /// Type of the object at the site in the `after` snapshot (or `before` if gone).
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub before_retained_bytes: u64,
+    pub after_retained_bytes: u64,
+    pub delta_retained_bytes: i64,
+    pub before_retained_objects: u64,
+    pub after_retained_objects: u64,
+    pub delta_retained_objects: i64,
+}
+
+// ---------------------------------------------------------------- error
+
+/// Printed to stdout by any `--json` command that fails, before exiting non-zero.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorReport {
+    pub schema_version: SchemaVersion,
+    pub kind: ErrorKind,
+    pub error: ErrorBody,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    /// One of `"unimplemented"`, `"invalid_argument"`, `"not_found"`,
+    /// `"invalid_snapshot"`, `"io"`, `"permission_denied"`, `"internal"`.
+    pub code: String,
+    pub message: String,
+}
+
+impl ErrorReport {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            schema_version: SchemaVersion,
+            kind: ErrorKind::Kind,
+            error: ErrorBody {
+                code: code.into(),
+                message: message.into(),
+            },
+        }
+    }
+}

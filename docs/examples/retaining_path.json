@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "kind": "retaining_path",
+  "snapshot": {
+    "path": "app.hpy",
+    "format_version": 1,
+    "python_version": "3.12.4",
+    "os": "linux",
+    "arch": "x86_64",
+    "pointer_size": 8,
+    "captured_at": 1762430400,
+    "source": { "kind": "pid", "ref": "1234" },
+    "contents_captured": true,
+    "truncated": false
+  },
+  "query": { "by": "address", "value": "0x7f3a1e104000" },
+  "targets": [
+    {
+      "address": "0x7f3a1e104000",
+      "type": "builtins.bytes",
+      "shallow_bytes": 1048609,
+      "retained_bytes": 1048609,
+      "reachable": true,
+      "paths": [
+        [
+          {
+            "address": "0x7f3a2d000040",
+            "type": "builtins.module",
+            "shallow_bytes": 72,
+            "edge": null,
+            "root_label": "sys.modules['app.cache']",
+            "root_kind": "module_dict"
+          },
+          {
+            "address": "0x7f3a2d0001a0",
+            "type": "builtins.dict",
+            "shallow_bytes": 4696,
+            "edge": ".__dict__",
+            "root_label": null,
+            "root_kind": null
+          },
+          {
+            "address": "0x7f3a2c41b0d0",
+            "type": "builtins.dict",
+            "shallow_bytes": 38692864,
+            "edge": "['CACHE']",
+            "root_label": null,
+            "root_kind": null
+          },
+          {
+            "address": "0x7f3a1e002a10",
+            "type": "app.session.Session",
+            "shallow_bytes": 56,
+            "edge": "['user:8812']",
+            "root_label": null,
+            "root_kind": null
+          },
+          {
+            "address": "0x7f3a1e104000",
+            "type": "builtins.bytes",
+            "shallow_bytes": 1048609,
+            "edge": ".payload",
+            "root_label": null,
+            "root_kind": null
+          }
+        ]
+      ]
+    }
+  ],
+  "notes": []
+}

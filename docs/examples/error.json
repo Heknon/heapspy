@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "kind": "error",
+  "error": {
+    "code": "not_found",
+    "message": "no object at address 0x7f3a2c41b0d8 in app.hpy"
+  }
+}
