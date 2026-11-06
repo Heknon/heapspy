@@ -10,7 +10,7 @@ py-spy reads a process's stacks without touching it. heapspy does the same for t
 
 heapspy answers **"what is retained, and by whom?"** For a leak, that is usually the question that matters: the reference holding the memory is the thing you delete to fix it, and that reference is sitting in the heap right now. Eclipse MAT finds JVM leaks the same way, from heap dumps with no allocation stacks.
 
-heapspy cannot answer **"where was this allocated?"** for memory that already exists. That history is only recorded if a tracer was running at allocation time. If you need allocation call chains, use tracemalloc or memray from process start. For CPU and allocation churn, use py-spy alongside heapspy.
+heapspy cannot answer **"where was this allocated?"** for memory that already exists. That history is only recorded if a tracer was running at allocation time. A planned `heapspy record` command (M7) will sample allocations with their Python stacks from outside the process, for a bounded window. It uses eBPF on Linux, and ETW plus debugger breakpoints on Windows, and only sees allocations made while it runs. See [docs/allocation-sampling.md](docs/allocation-sampling.md). For full allocation history from process start, use tracemalloc or memray. For CPU, use py-spy alongside heapspy.
 
 ## How it works
 
@@ -175,6 +175,7 @@ pip install heapspy-mcp   # optional, for agent integration
 | M4 | Windows minidump backend | done |
 | M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
 | M6 | `heapspy-mcp` | in review on a separate branch |
+| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
 
