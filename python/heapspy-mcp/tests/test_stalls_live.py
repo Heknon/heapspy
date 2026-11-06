@@ -233,6 +233,26 @@ def allow(p: subprocess.Popen[bytes]) -> dict[str, Any]:
     return {"allow": [f"pid:{p.pid}"]}
 
 
+def hyp(dx: dict[str, Any], hid: str) -> dict[str, Any]:
+    return next(h for h in dx["hypotheses"] if h["id"] == hid)
+
+
+async def diagnose(call, p: subprocess.Popen[bytes], name: str) -> dict[str, Any]:
+    err, dx = await call("diagnose_process", {"pid": p.pid, "window_s": 3}, **allow(p))
+    assert not err, dx
+    report(f"{name}.ranking", [(h["id"], h["score"], h["assessment"]) for h in dx["hypotheses"]])
+    mem = hyp(dx, "memory_thrashing")
+    report(
+        f"{name}.memory_thrashing",
+        {
+            "for": [(e["signal"], e["value"]) for e in mem["evidence_for"]],
+            "against": [(e["signal"], e["value"]) for e in mem["evidence_against"]],
+            "unknown": [u["signal"] for u in mem["unknown"]],
+        },
+    )
+    return dx
+
+
 async def test_a1_thrashing_on_a_fast_disk(call, data_file: Path) -> None:
     drop_cache(data_file)
     with cgroups(f"heapspy-a1-{os.getpid()}", mem_limit=LIMIT) as dirs:
@@ -252,6 +272,9 @@ async def test_a1_thrashing_on_a_fast_disk(call, data_file: Path) -> None:
                 > 0.3
             )
             assert n["frozen_or_stopped"] == "not_frozen_or_stopped"
+            dx = await diagnose(call, p, "a1")
+            assert dx["hypotheses"][0]["id"] == "memory_thrashing"
+            assert dx["fact_checks"][0]["value"] is False
 
 
 async def test_a2_thrashing_that_stops_progress(call, data_file: Path) -> None:
@@ -272,6 +295,8 @@ async def test_a2_thrashing_that_stops_progress(call, data_file: Path) -> None:
             assert n["longest_interval_s"] > 0.5
             assert n["longest_interval_category"] in ("page_fault_io", "direct_reclaim")
             assert n["memory_stall_no_progress_seconds_per_s"] > 0.5
+            dx = await diagnose(call, p, "a2")
+            assert dx["hypotheses"][0]["id"] == "memory_thrashing"
 
 
 async def test_b_same_scan_without_a_limit(call, data_file: Path) -> None:
@@ -288,6 +313,8 @@ async def test_b_same_scan_without_a_limit(call, data_file: Path) -> None:
         assert n["major_faults_per_s"] < 5
         assert (n["memory_stall_share_of_active"] or 0) < 0.05
         assert n["longest_interval_category"] not in ("page_fault_io", "direct_reclaim")
+        dx = await diagnose(call, p, "b")
+        assert hyp(dx, "memory_thrashing")["assessment"] == "not_indicated"
 
 
 async def test_c_cpu_bound(call) -> None:
@@ -301,6 +328,9 @@ async def test_c_cpu_bound(call) -> None:
         assert (n["memory_stall_share_of_active"] or 0) < 0.05
         assert n["category_share"].get("running", 0) > 0.9
         assert n["memory_stall_no_progress_seconds_per_s"] == 0
+        dx = await diagnose(call, p, "c")
+        assert dx["fact_checks"][0]["value"] is False
+        assert hyp(dx, "memory_thrashing")["assessment"] == "not_indicated"
 
 
 async def test_d1_sigstopped(call) -> None:
@@ -316,6 +346,10 @@ async def test_d1_sigstopped(call) -> None:
         assert n["category_share"] == {"stopped_or_frozen": 1.0}
         assert n["longest_interval_category"] == "stopped_or_frozen"
         assert (n["memory_stall_share_of_active"] or 0) == 0
+        dx = await diagnose(call, p, "d1")
+        assert dx["fact_checks"][0]["value"] is True
+        assert all(h["moot_because"] == "deliberately_frozen" for h in dx["hypotheses"])
+        assert hyp(dx, "memory_thrashing")["assessment"] == "not_indicated"
 
 
 @pytest.mark.parametrize("kind", ["v1_freezer", "v2_freeze"])
@@ -340,6 +374,9 @@ async def test_d2_frozen_cgroup(call, kind: str) -> None:
             assert out["frozen_or_stopped"]["cgroup_frozen"] is True
             assert n["category_share"] == {"stopped_or_frozen": 1.0}
             assert (n["memory_stall_share_of_active"] or 0) == 0
+            dx = await diagnose(call, p, f"d2.{kind}")
+            assert dx["fact_checks"][0]["value"] is True
+            assert hyp(dx, "memory_thrashing")["assessment"] == "not_indicated"
 
 
 def _pids(rows: list[dict[str, Any]]) -> set[int]:

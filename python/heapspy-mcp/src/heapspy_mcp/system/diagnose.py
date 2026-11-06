@@ -1,4 +1,4 @@
-"""Weigh competing explanations for a process's CPU use, CPU wait or slowness.
+"""Weigh competing explanations for a process's CPU use, CPU wait, slowness or stalls.
 
 Each hypothesis is scored from the measurements of one window. Every
 judgement lists the raw value, the threshold it was compared with, and its
@@ -7,6 +7,17 @@ contributes nothing. The output is a ranking of how well each explanation
 fits these numbers; it is not a finding, and several can hold at once.
 
 All thresholds are in :data:`THRESHOLDS`, in one place, for review.
+
+``memory_thrashing`` replaced the earlier ``memory_pressure`` hypothesis. That
+one read only memory PSI and the major-fault rate; ``memory_thrashing`` reads
+the same signals and adds workingset refaults and the share of the threads'
+sampled time spent in page-fault I/O, reclaim, ``memory.high`` throttling or
+compaction (from ``watch_process_stalls``). Keeping both would have counted
+the same PSI and fault evidence twice.
+
+``deliberately_frozen`` is a fact check, not a hypothesis: when the process is
+in a frozen cgroup or stopped by a signal, every explanation is moot and the
+result says so.
 """
 
 from __future__ import annotations
@@ -58,6 +69,30 @@ THRESHOLDS: dict[str, tuple[float, str, str]] = {
     "psi_memory_some_window_pct_low": (0.5, "%", "negligible memory stall"),
     "major_faults_per_s_high": (100.0, "1/s", "frequent reads of pages from storage"),
     "major_faults_per_s_low": (5.0, "1/s", "few major faults"),
+    "refaults_per_s_high": (
+        100.0,
+        "pages/s",
+        "pages evicted earlier are read back often: the working set does not fit",
+    ),
+    "refaults_per_s_low": (10.0, "pages/s", "evicted pages are rarely needed again"),
+    "memory_stall_share_high": (
+        0.50,
+        "ratio",
+        "half of the non-idle thread samples are in page-fault I/O, reclaim, memory.high "
+        "throttling or compaction",
+    ),
+    "memory_stall_share_some": (0.10, "ratio", "a tenth of non-idle thread samples"),
+    "memory_stall_share_low": (0.01, "ratio", "almost no non-idle sample in a memory wait"),
+    "memory_stall_no_progress_high": (
+        0.20,
+        "s/s",
+        "threads spent a fifth of the window with no CPU progress in a memory wait",
+    ),
+    "frozen_share": (
+        0.90,
+        "ratio",
+        "nine in ten thread samples were stopped or frozen: the process is held on purpose",
+    ),
     "psi_io_some_window_pct_high": (10.0, "%", "tasks stalled on I/O 10% of the window"),
     "psi_io_some_window_pct_low": (1.0, "%", "negligible I/O stall"),
     "iowait_seconds_per_s_high": (0.10, "s/s", "threads waited on block I/O 10% of the time"),
@@ -140,8 +175,18 @@ def _get(d: dict[str, Any] | None, *path: str) -> Any:
     return cur
 
 
-def extract_signals(view: dict[str, Any], hw: dict[str, Any] | None, python: dict[str, Any]):
-    """The flat set of numbers the hypotheses read, with a reason for each missing one."""
+def extract_signals(
+    view: dict[str, Any],
+    hw: dict[str, Any] | None,
+    python: dict[str, Any],
+    stalls: dict[str, Any] | None = None,
+    stalls_reason: str | None = None,
+):
+    """The flat set of numbers the hypotheses read, with a reason for each missing one.
+
+    ``stalls`` is a ``watch_process_stalls`` result over the same window, or None
+    (with ``stalls_reason``) when it was not taken.
+    """
     env = view.get("environment") or {}
     host = env.get("host")
     cgv = env.get("cgroup") or {}
@@ -248,6 +293,7 @@ def extract_signals(view: dict[str, Any], hw: dict[str, Any] | None, python: dic
         "is_python": python.get("is_python"),
         "python_free_threaded": python.get("free_threaded"),
     }
+    _stall_signals(s, reasons, stalls, stalls_reason)
     if hw is not None:
         s["ipc"] = hw.get("ipc")
         s["llc_mpki"] = hw.get("llc_mpki")
@@ -257,6 +303,67 @@ def extract_signals(view: dict[str, Any], hw: dict[str, Any] | None, python: dic
     else:
         reasons["ipc"] = reasons["llc_mpki"] = "hardware counters not collected"
     return s, reasons
+
+
+def _stall_signals(
+    s: dict[str, Any],
+    reasons: dict[str, str],
+    stalls: dict[str, Any] | None,
+    stalls_reason: str | None,
+) -> None:
+    keys = (
+        "refaults_per_s",
+        "memory_stall_share_of_active",
+        "memory_stall_no_progress_seconds_per_s",
+        "block_io_wait_share",
+        "stopped_or_frozen_share",
+        "cgroup_frozen",
+        "system_share",
+    )
+    if stalls is None:
+        for k in keys:
+            s[k] = None
+            reasons[k] = stalls_reason or "per-thread stall sampling was not run"
+        s["refaults_source"] = None
+        s["deliberately_frozen"] = None
+        reasons["deliberately_frozen"] = stalls_reason or "not measured"
+        return
+    pr = stalls.get("process") or {}
+    env = stalls.get("environment") or {}
+    cgm = env.get("cgroup_memory") or {}
+    host = env.get("host") or {}
+    if cgm.get("refaults_per_s") is not None:
+        s["refaults_per_s"], s["refaults_source"] = cgm["refaults_per_s"], "cgroup memory.stat"
+    elif host.get("refaults_per_s") is not None:
+        s["refaults_per_s"], s["refaults_source"] = host["refaults_per_s"], "host /proc/vmstat"
+    else:
+        s["refaults_per_s"], s["refaults_source"] = None, None
+        reasons["refaults_per_s"] = cgm.get("reason") or "no workingset_refault counters"
+    s["memory_stall_share_of_active"] = pr.get("memory_stall_share_of_active")
+    if s["memory_stall_share_of_active"] is None:
+        reasons["memory_stall_share_of_active"] = "every sampled thread was voluntarily idle"
+    s["memory_stall_no_progress_seconds_per_s"] = pr.get("memory_stall_no_progress_seconds_per_s")
+    shares = pr.get("category_share") or {}
+    s["block_io_wait_share"] = shares.get("block_io", 0.0) if shares else None
+    s["stopped_or_frozen_share"] = shares.get("stopped_or_frozen", 0.0) if shares else None
+    s["system_share"] = pr.get("system_share")
+    fz = stalls.get("frozen_or_stopped") or {}
+    s["cgroup_frozen"] = fz.get("cgroup_frozen")
+    share = s["stopped_or_frozen_share"]
+    if s["cgroup_frozen"] or (share is not None and share >= T("frozen_share")):
+        s["deliberately_frozen"] = True
+    elif s["cgroup_frozen"] is None and share is None:
+        s["deliberately_frozen"] = None
+        reasons["deliberately_frozen"] = "no freezer state and no thread samples"
+    else:
+        s["deliberately_frozen"] = False
+    s["frozen_or_stopped_assessment"] = fz.get("assessment")
+    # With per-thread categories, disk wait counts only block I/O outside page faults:
+    # D-state samples in page-fault I/O or reclaim are memory waits, scored under
+    # memory_thrashing.
+    if s["block_io_wait_share"] is not None:
+        s["disk_wait_share"] = s["block_io_wait_share"]
+        s["disk_wait_share_source"] = "watch_process_stalls block_io category"
 
 
 def _ge(h: Hyp, side: str, s: dict, key: str, thr: str, w: int, note: str = "") -> bool:
@@ -539,22 +646,66 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
     hyps.append(h)
 
     h = Hyp(
-        "memory_pressure",
-        "Tasks stall on memory (reclaim, swap-in, refaults)",
+        "memory_thrashing",
+        "Threads keep leaving their work to wait for memory: page faults that read evicted "
+        "pages back (refaults, swap-in), direct reclaim, memory.high throttling or compaction",
         [],
         [],
         [],
         [
-            "Read memory.events and memory.stat of the cgroup; check for swap and reclaim",
+            "watch_process_stalls(pid) for the threads' wait categories, the longest "
+            "no-progress intervals and example kernel stacks",
+            "Compare the cgroup's usage with memory.max / memory.high and its working set; "
+            "raise the limit (or memory.high) on one instance and compare refaults and "
+            "major faults",
             "For Python, heap_summary shows what is retained",
         ],
+        caveat="Refault and memory.stat counters cover every process in the cgroup (or the "
+        "host when no cgroup counters exist); the per-thread wait share is this process's own.",
     )
-    _ge(h, "for", s, "psi_memory_some_window_pct", "psi_memory_some_window_pct_high", 2)
-    _ge(h, "for", s, "psi_memory_full_window_pct", "psi_memory_full_window_pct_high", 1)
-    _ge(h, "for", s, "major_faults_per_s", "major_faults_per_s_high", 1)
-    _lt(h, "against", s, "psi_memory_some_window_pct", "psi_memory_some_window_pct_low", 2)
+    if s.get("deliberately_frozen"):
+        h.add(
+            "against",
+            "stopped_or_frozen_share",
+            s.get("stopped_or_frozen_share"),
+            "frozen_share",
+            3,
+            "the process is frozen or stopped; its lack of progress is not a memory stall",
+        )
+    _ge(h, "for", s, "major_faults_per_s", "major_faults_per_s_high", 2)
+    _ge(
+        h,
+        "for",
+        s,
+        "refaults_per_s",
+        "refaults_per_s_high",
+        2,
+        f"source: {s.get('refaults_source')}",
+    )
+    if not _ge(h, "for", s, "psi_memory_full_window_pct", "psi_memory_full_window_pct_high", 2):
+        _ge(h, "for", s, "psi_memory_some_window_pct", "psi_memory_some_window_pct_high", 1)
+    if not _ge(h, "for", s, "memory_stall_share_of_active", "memory_stall_share_high", 3):
+        _ge(h, "for", s, "memory_stall_share_of_active", "memory_stall_share_some", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "memory_stall_no_progress_seconds_per_s",
+        "memory_stall_no_progress_high",
+        1,
+    )
     _lt(h, "against", s, "major_faults_per_s", "major_faults_per_s_low", 1)
-    _need(h, s, reasons, "psi_memory_some_window_pct")
+    _lt(h, "against", s, "refaults_per_s", "refaults_per_s_low", 1)
+    _lt(h, "against", s, "psi_memory_some_window_pct", "psi_memory_some_window_pct_low", 1)
+    _lt(h, "against", s, "memory_stall_share_of_active", "memory_stall_share_low", 2)
+    _need(
+        h,
+        s,
+        reasons,
+        "refaults_per_s",
+        "memory_stall_share_of_active",
+        "psi_memory_some_window_pct",
+    )
     hyps.append(h)
 
     h = Hyp(
@@ -570,14 +721,27 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
     )
     _ge(h, "for", s, "psi_io_some_window_pct", "psi_io_some_window_pct_high", 2)
     _ge(h, "for", s, "iowait_seconds_per_s", "iowait_seconds_per_s_high", 2)
-    _ge(h, "for", s, "disk_wait_share", "disk_wait_share_high", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "disk_wait_share",
+        "disk_wait_share_high",
+        1,
+        s.get("disk_wait_share_source", ""),
+    )
     _lt(h, "against", s, "psi_io_some_window_pct", "psi_io_some_window_pct_low", 1)
     if s.get("disk_wait_share") is not None and s["disk_wait_share"] == 0:
         h.against.append(
             {
                 "signal": "disk_wait_share",
                 "value": 0,
-                "note": "no thread was sampled in D state or a block-I/O wait",
+                "note": "no thread was sampled in a block-I/O wait"
+                + (
+                    " outside page faults (those count under memory_thrashing)"
+                    if s.get("disk_wait_share_source")
+                    else " or in D state"
+                ),
                 "weight": 1,
             }
         )
@@ -589,7 +753,53 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
     results.sort(key=lambda x: (-x["score"], order[x["assessment"]], len(x["unknown"])))
     for i, x in enumerate(results, 1):
         x["rank"] = i
+        x["focus"] = [f for f, ids in FOCUS.items() if x["id"] in ids]
+        if s.get("deliberately_frozen"):
+            x["moot_because"] = "deliberately_frozen"
     return results
+
+
+# Which hypotheses each diagnose_process focus lists ("all" lists every one).
+FOCUS: dict[str, frozenset[str]] = {
+    "cpu": frozenset(
+        {
+            "runqueue_contention",
+            "cache_or_memory_bound_contention",
+            "cfs_throttling",
+            "lock_contention",
+            "spin_waiting_or_compute",
+            "gil_convoy",
+            "steal",
+        }
+    ),
+    "memory": frozenset({"memory_thrashing", "cache_or_memory_bound_contention"}),
+    "io": frozenset({"io_pressure"}),
+}
+
+
+def fact_checks(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]:
+    """Facts that change how every hypothesis reads, checked before the ranking."""
+    value = s.get("deliberately_frozen")
+    check: dict[str, Any] = {
+        "id": "deliberately_frozen",
+        "question": "Is the process frozen by a cgroup freezer, or stopped by a signal or ptrace?",
+        "value": value,
+        "evidence": {
+            "cgroup_frozen": s.get("cgroup_frozen"),
+            "stopped_or_frozen_share": s.get("stopped_or_frozen_share"),
+            "assessment": s.get("frozen_or_stopped_assessment"),
+            "threshold_name": "frozen_share",
+            "threshold": T("frozen_share"),
+        },
+    }
+    if value:
+        check["consequence"] = (
+            "the process is held on purpose and makes no progress whatever else is measured; "
+            "the explanations below are moot until it is thawed or continued"
+        )
+    elif value is None:
+        check["reason"] = reasons.get("deliberately_frozen", "not measured")
+    return [check]
 
 
 def threshold_table() -> list[dict[str, Any]]:

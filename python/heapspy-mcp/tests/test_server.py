@@ -22,6 +22,7 @@ EXPECTED_TOOLS = {
     "snapshot_process_metrics",
     "compare_process_snapshots",
     "diagnose_process_cpu",
+    "diagnose_process",
     "watch_process_stalls",
     # CPU tools (py-spy)
     "cpu_stacks",

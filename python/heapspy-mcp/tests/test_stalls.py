@@ -248,3 +248,23 @@ def test_scan_memory_conditions_from_a_crafted_state(tmp_path: Path) -> None:
     assert fz["frozen_cgroups"][0]["cgroup_v2"] == "/frozen"
     assert fz["stopped_processes"] == [{"pid": 12, "comm": "stopped", "state": "T"}]
     assert facts["oom_kill_counters"]["rows"][0]["oom_kill_in_window"] == 2
+
+
+async def test_diagnose_process_focus_and_alias(call, child_python) -> None:
+    allow = {"allow": [f"pid:{child_python.pid}"]}
+    args = {"pid": child_python.pid, "window_s": 0.3}
+    err, out = await call("diagnose_process", {**args, "focus": "memory"}, **allow)
+    assert not err, out
+    assert {h["id"] for h in out["hypotheses"]} == {
+        "memory_thrashing",
+        "cache_or_memory_bound_contention",
+    }
+    assert out["fact_checks"][0]["id"] == "deliberately_frozen"
+    assert out["fact_checks"][0]["value"] is False
+    assert out["memory_stalls"]["frozen_or_stopped"]["assessment"] == "not_frozen_or_stopped"
+    assert out["measurement"]["stall_sampling"]["rate_hz"] == 10.0
+    err, alias = await call("diagnose_process_cpu", args, **allow)
+    assert not err, alias
+    assert alias["focus"] == "all" and len(alias["hypotheses"]) == 9
+    err, bad = await call("diagnose_process", {**args, "focus": "disk"}, **allow)
+    assert err and bad["error"]["reason"] == "invalid_argument"
