@@ -125,13 +125,11 @@ fn diff(
     }
     let (b, a) = (d.before_reachable_bytes, d.after_reachable_bytes);
     let subtitle = format!(
-        "{}: {} -> {} retained ({}); red grew, blue shrank, width is after{}. \
-         Frames are matched by path, not identity: approximate",
-        python(&after),
+        "{} -> {} retained ({}). Red grew, blue shrank. \
+         Matched by path, not identity: approximate",
         format_bytes(b),
         format_bytes(a),
         format_delta_bytes(a as i64 - b as i64),
-        cutoff_text(d.min_bytes)
     );
     let lines: Vec<String> = d
         .lines
@@ -139,5 +137,13 @@ fn diff(
         .map(|l| format!("{} {} {}", l.stack, l.before, l.after))
         .collect();
     let mut o = svg_options(args.title.as_deref(), format!("{TITLE} (diff)"), subtitle);
+    // The subtitle has no room for these; they go in the SVG's notes.
+    o.notes = format!(
+        "{}. Width is the after snapshot. {} before, {} after{}",
+        o.notes,
+        python(&before),
+        python(&after),
+        cutoff_text(d.min_bytes)
+    );
     render(&mut o, &lines, out)
 }

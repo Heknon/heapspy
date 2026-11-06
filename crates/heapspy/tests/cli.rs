@@ -275,7 +275,8 @@ fn flamegraph_diff() {
     let svg = std::fs::read_to_string(&svg_path).unwrap();
     assert!(svg.contains("heapspy retention flame graph (diff)"));
     assert!(svg.contains("approximate"));
-    assert!(svg.contains("red grew, blue shrank"));
+    assert!(svg.contains("Red grew, blue shrank"));
+    assert!(svg.contains("Width is the after snapshot"));
 }
 
 #[test]
