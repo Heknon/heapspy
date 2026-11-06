@@ -29,11 +29,6 @@ pub struct ObjectGraph {
 }
 
 impl ObjectGraph {
-    #[inline]
-    pub fn super_root(&self) -> u32 {
-        self.n
-    }
-
     /// The root entry for a super-root edge.
     pub fn root_entry(&self, e: u32) -> Option<&Root> {
         e.checked_sub(self.snapshot_edges)

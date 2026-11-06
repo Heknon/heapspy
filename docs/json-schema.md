@@ -166,9 +166,23 @@ Retainer (`top_retainers[]`):
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
 
-The list skips objects that are dominated by an object already listed with
-the same retained size (a chain of single-owner wrappers is reported once, at
-its top).
+Which objects are listed:
+
+1. Namespaces are never listed: module objects, frame objects, type objects,
+   and the `__dict__` each of them dominates. The variables inside them are
+   listed instead.
+2. A chain of wrappers that only restate their contents is reported once, at
+   the object where the memory accumulates. Starting at an object A, follow
+   A's largest dominated child while it still retains at least 90% of A's
+   `retained_bytes`, for at most 8 steps; only the last object of the chain
+   is listed. So `module -> __dict__ -> CACHE` lists `CACHE`, and
+   `function -> closure cell -> large object` lists the large object. The
+   `path` still shows the wrappers. The 90% is measured against the top of
+   the chain, so a long linked list is reported near its head, not at its
+   tail.
+3. Entries are ranked by `retained_bytes` (ties by address), and an object
+   dominated by an entry already listed is skipped. The entries are therefore
+   disjoint: their retained sets do not overlap.
 
 TypeRow (`type_histogram[]`):
 
@@ -178,6 +192,13 @@ TypeRow (`type_histogram[]`):
 | `count` | integer | instances |
 | `shallow_bytes` | integer | sum of instance shallow sizes |
 | `retained_bytes` | integer | retained size of the set of instances: sum of `retained_bytes` over instances not dominated by another instance of the same type |
+
+The `retained_bytes` rule means nested instances are not counted twice: for
+a dict of dicts, only the outer dict's retained size counts, since it already
+includes the inner ones. The result equals the total shallow size of every
+object dominated by at least one instance. Unreachable instances count in
+`count` and `shallow_bytes` but retain nothing. Types are grouped by display
+name, so two type objects with the same `module.qualname` are one row.
 
 ## `type_query`
 

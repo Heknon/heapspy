@@ -23,6 +23,7 @@ pub struct Csr {
 
 impl Csr {
     /// Build from an adjacency list. For tests and small graphs.
+    #[cfg(test)]
     pub fn from_adjacency(adj: &[Vec<u32>]) -> Csr {
         let mut offsets = Vec::with_capacity(adj.len() + 1);
         let mut targets = Vec::new();
