@@ -412,3 +412,256 @@ def limited_ancestors(loc: CgroupLocation) -> list[Path]:
             break
         d = d.parent
     return found[: MAX_ANCESTORS + 1]
+
+
+# --- memory controller ----------------------------------------------------------
+
+# A v1 limit at or above this is "no limit" (the kernel reports PAGE_COUNTER_MAX pages).
+V1_UNLIMITED = 1 << 62
+
+# memory.stat counters reported as deltas. v1 names them with a total_ prefix for the
+# hierarchical value; v1 before 5.9 has a single workingset_refault.
+MEMORY_STAT_KEYS = (
+    "workingset_refault_anon",
+    "workingset_refault_file",
+    "workingset_refault",
+    "pgmajfault",
+    "pgfault",
+    "pgscan",
+    "pgsteal",
+    "pgscan_direct",
+    "pgscan_kswapd",
+)
+MEMORY_STAT_LEVELS = ("anon", "file", "swap", "rss", "cache")
+MEMORY_EVENT_KEYS = ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
+
+
+@dataclass
+class MemoryLocation:
+    """Where a process's memory controller files are.
+
+    ``pressure_dir`` is the process's v2 directory: PSI follows the v2 hierarchy
+    even when the memory controller is bound to v1 (hybrid hosts).
+    """
+
+    version: str  # "v2" or "v1"
+    path: str
+    dir: Path
+    root: Path
+    pressure_dir: Path | None
+    notes: list[str] = field(default_factory=list)
+
+
+def locate_memory(pid_cgroup: PidCgroups, mounts: CgroupMounts) -> MemoryLocation | None:
+    notes: list[str] = []
+    v2_dir = None
+    if mounts.v2 is not None and pid_cgroup.v2_path is not None:
+        v2_dir, note = _join(mounts.v2, mounts.v2_root, pid_cgroup.v2_path)
+        if note:
+            notes.append(note)
+    if "memory" in mounts.v1 and "memory" in pid_cgroup.v1_paths:
+        d, note = _join(
+            mounts.v1["memory"], mounts.v1_roots.get("memory", "/"), pid_cgroup.v1_paths["memory"]
+        )
+        if note and note not in notes:
+            notes.append(note)
+        notes.append(
+            "the memory controller is on a cgroup v1 hierarchy; usage, limit and memory.stat "
+            "come from cgroup v1 files, pressure from the v2 directory"
+        )
+        return MemoryLocation(
+            "v1", pid_cgroup.v1_paths["memory"], d, mounts.v1["memory"], v2_dir, notes
+        )
+    if v2_dir is None or mounts.v2 is None:
+        return None
+    return MemoryLocation("v2", pid_cgroup.v2_path or "/", v2_dir, mounts.v2, v2_dir, notes)
+
+
+def parse_memory_value(text: str | None) -> int | None:
+    """``memory.max``-style value: ``max`` (or a huge v1 limit) is None."""
+    if text is None:
+        return None
+    value = text.strip()
+    if not value.isdigit():
+        return None
+    n = int(value)
+    return None if n >= V1_UNLIMITED else n
+
+
+def _int_file(path: Path) -> int | None:
+    text = read_text(path)
+    return int(text.strip()) if text and text.strip().isdigit() else None
+
+
+def _v1_stat(raw: dict[str, int]) -> dict[str, int]:
+    """Hierarchical (``total_``) values where v1 has them, under the v2 names."""
+    out: dict[str, int] = {}
+    for key in (*MEMORY_STAT_KEYS, *MEMORY_STAT_LEVELS, "hierarchical_memory_limit"):
+        if f"total_{key}" in raw:
+            out[key] = raw[f"total_{key}"]
+        elif key in raw:
+            out[key] = raw[key]
+    return out
+
+
+def read_memory(loc: MemoryLocation) -> dict[str, Any]:
+    """Cumulative memory counters and current levels of the process's memory cgroup.
+
+    Keys are the same for v1 and v2; a value the version does not have is None and
+    named in ``unavailable`` with the reason.
+    """
+    d = loc.dir
+    unavailable: dict[str, str] = {}
+    out: dict[str, Any] = {"version": loc.version}
+    if loc.version == "v2":
+        out["usage_bytes"] = _int_file(d / "memory.current")
+        out["max_bytes"] = parse_memory_value(read_text(d / "memory.max"))
+        out["high_bytes"] = parse_memory_value(read_text(d / "memory.high"))
+        out["swap_usage_bytes"] = _int_file(d / "memory.swap.current")
+        if out["usage_bytes"] is None:
+            unavailable["usage_bytes"] = (
+                "no memory.current (the root cgroup, or the memory controller is not enabled "
+                "for this cgroup)"
+            )
+        events = parse_flat_keyed(read_text(d / "memory.events") or "")
+        out["events"] = {k: events.get(k) for k in MEMORY_EVENT_KEYS}
+        if not events:
+            unavailable["events"] = "memory.events not readable"
+        raw = parse_flat_keyed(read_text(d / "memory.stat") or "")
+        out["stat"] = {k: raw[k] for k in (*MEMORY_STAT_KEYS, *MEMORY_STAT_LEVELS) if k in raw}
+        if not raw:
+            unavailable["stat"] = "memory.stat not readable"
+    else:
+        raw = _v1_stat(parse_flat_keyed(read_text(d / "memory.stat") or ""))
+        out["usage_bytes"] = _int_file(d / "memory.usage_in_bytes")
+        own = parse_memory_value(read_text(d / "memory.limit_in_bytes"))
+        # hierarchical_memory_limit is the tightest limit of this cgroup and its ancestors.
+        hier = parse_memory_value(str(raw.pop("hierarchical_memory_limit", "")))
+        limits = [v for v in (own, hier) if v is not None]
+        out["max_bytes"] = min(limits) if limits else None
+        out["high_bytes"] = None
+        unavailable["high_bytes"] = "cgroup v1 has no memory.high"
+        memsw = _int_file(d / "memory.memsw.usage_in_bytes")
+        out["swap_usage_bytes"] = (
+            memsw - out["usage_bytes"]
+            if memsw is not None and out["usage_bytes"] is not None
+            else None
+        )
+        if memsw is None:
+            unavailable["swap_usage_bytes"] = "memory.memsw.* not present (swap accounting off)"
+        oom = parse_flat_keyed(read_text(d / "memory.oom_control") or "")
+        out["events"] = {
+            "low": None,
+            "high": None,
+            # failcnt counts the times usage hit the limit: the v1 counterpart of "max".
+            "max": _int_file(d / "memory.failcnt"),
+            "oom": None,
+            "oom_kill": oom.get("oom_kill"),
+            "oom_group_kill": None,
+        }
+        out["under_oom"] = bool(oom.get("under_oom")) if "under_oom" in oom else None
+        unavailable["events.high"] = "cgroup v1 has no memory.high"
+        unavailable["events.oom"] = "cgroup v1 has no oom event counter; see under_oom"
+        unavailable["events.max"] = "cgroup v1: memory.failcnt stands in for max events"
+        out["stat"] = raw
+        unavailable["pressure_level"] = (
+            "cgroup v1 memory.pressure_level is a notification interface (eventfd through "
+            "cgroup.event_control) and cannot be read; pressure comes from the v2 directory"
+        )
+    for key in ("pgscan", "pgsteal"):
+        if key not in out["stat"]:
+            unavailable[f"stat.{key}"] = (
+                f"{key} is not in this memory.stat (cgroup v1 reports no scan or steal counters)"
+                if loc.version == "v1"
+                else f"{key} is not in this memory.stat (kernel before 4.13)"
+            )
+    pressure = read_text(loc.pressure_dir / "memory.pressure") if loc.pressure_dir else None
+    out["pressure"] = parse_psi(pressure) if pressure else None
+    if out["pressure"] is None:
+        unavailable["pressure"] = (
+            "no memory.pressure in the process's cgroup v2 directory (no v2 mount, or PSI off)"
+        )
+    out["unavailable"] = unavailable
+    return out
+
+
+def memory_limits(loc: MemoryLocation) -> list[dict[str, Any]]:
+    """The process's memory cgroup and each ancestor with a ``memory.max`` or
+    ``memory.high`` (v2), nearest first. v1 hierarchies give the effective limit in
+    ``hierarchical_memory_limit`` instead, so only the own level is listed."""
+    out: list[dict[str, Any]] = []
+    d = loc.dir
+    for _ in range(64):
+        if loc.version == "v2":
+            mx = parse_memory_value(read_text(d / "memory.max"))
+            hi = parse_memory_value(read_text(d / "memory.high"))
+        else:
+            mx = parse_memory_value(read_text(d / "memory.limit_in_bytes"))
+            hi = None
+        if d == loc.dir or mx is not None or hi is not None:
+            try:
+                rel = "/" + str(d.relative_to(loc.root)) if d != loc.root else "/"
+            except ValueError:
+                rel = str(d)
+            out.append({"path": rel, "max_bytes": mx, "high_bytes": hi})
+        if loc.version == "v1" or d == loc.root or d.parent == d or len(out) > MAX_ANCESTORS:
+            break
+        d = d.parent
+    return out[: MAX_ANCESTORS + 1]
+
+
+# --- freezer --------------------------------------------------------------------
+
+
+def read_freezer(pid_cgroup: PidCgroups, mounts: CgroupMounts) -> dict[str, Any]:
+    """Freezer state of the process's cgroups.
+
+    cgroup v2: ``cgroup.events`` ``frozen`` (1 once every task in the cgroup is
+    frozen) and the requested ``cgroup.freeze``. cgroup v1: ``freezer.state``
+    (``THAWED``, ``FREEZING``, ``FROZEN``) and ``self_freezing`` / ``parent_freezing``.
+    ``frozen`` is True when either says the cgroup is frozen or freezing.
+    """
+    out: dict[str, Any] = {"frozen": None, "v2": None, "v1": None}
+    reasons: list[str] = []
+    if mounts.v2 is not None and pid_cgroup.v2_path is not None:
+        d, _ = _join(mounts.v2, mounts.v2_root, pid_cgroup.v2_path)
+        events = read_text(d / "cgroup.events")
+        if events is not None:
+            ev = parse_flat_keyed(events)
+            out["v2"] = {
+                "frozen": bool(ev.get("frozen")) if "frozen" in ev else None,
+                "freeze_requested": _int_file(d / "cgroup.freeze") == 1,
+                "path": pid_cgroup.v2_path,
+            }
+        else:
+            reasons.append("no v2 cgroup.events (root cgroup, which cannot be frozen)")
+    if "freezer" in mounts.v1 and "freezer" in pid_cgroup.v1_paths:
+        d, _ = _join(
+            mounts.v1["freezer"],
+            mounts.v1_roots.get("freezer", "/"),
+            pid_cgroup.v1_paths["freezer"],
+        )
+        state = read_text(d / "freezer.state")
+        if state is not None:
+            out["v1"] = {
+                "state": state.strip(),
+                "self_freezing": _int_file(d / "freezer.self_freezing") == 1,
+                "parent_freezing": _int_file(d / "freezer.parent_freezing") == 1,
+                "path": pid_cgroup.v1_paths["freezer"],
+            }
+        else:
+            reasons.append("no v1 freezer.state (root freezer cgroup, which cannot be frozen)")
+    flags = []
+    if out["v2"] is not None and out["v2"]["frozen"] is not None:
+        flags.append(out["v2"]["frozen"] or out["v2"]["freeze_requested"])
+    if out["v1"] is not None:
+        flags.append(out["v1"]["state"] in ("FROZEN", "FREEZING"))
+    if flags:
+        out["frozen"] = any(flags)
+    elif reasons:
+        # The root cgroups cannot be frozen, so "not frozen" is known here.
+        out["frozen"] = False
+        out["note"] = "; ".join(reasons)
+    else:
+        out["unavailable_reason"] = "no cgroup v2 mount and no v1 freezer hierarchy"
+    return out
