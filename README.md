@@ -118,7 +118,7 @@ heapspy flamegraph app.hpy -o app.svg
 
 A retention flame graph shows the dominator tree. A snapshot has no call stacks, so a frame is not a function. Each frame is one hop of a retaining path, and its width is the bytes it retains: the objects in that frame and everything only reachable through them. The bottom row holds the roots (`sys.modules['__main__']`, frame locals, thread state). Each row above it names the reference that holds the next object. To find a leak, look for the widest frame you did not expect and read down to its root. In the image above, `.cell_contents bytearray` under `BUS.listeners` holds 70% of the heap: closures registered as listeners keep their buffers alive. `['SESSIONS'] dict` holds most of the rest.
 
-A CPU flame graph is different. Its widths count samples of time, and its frames are call stacks. An allocation flame graph (memray, tracemalloc) counts bytes allocated by each call stack, including memory freed long ago. A retention flame graph counts only memory that is alive in the snapshot, grouped by what keeps it alive, not by where it was allocated.
+A CPU flame graph is different. Its widths count samples of time, and its frames are call stacks. An allocation flame graph (memray, tracemalloc, or `heapspy flamegraph --allocations` below) counts bytes allocated by each call stack, including memory freed long ago. A retention flame graph counts only memory that is alive in the snapshot, grouped by what keeps it alive, not by where it was allocated.
 
 Frame format:
 
@@ -155,9 +155,32 @@ The differential graph matches frames between the two dumps by frame text, not b
 heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
 
 heapspy analyze app.hpy --allocations app.hpya
+heapspy query app.hpy --type Session --allocations app.hpya
 ```
 
-`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The command and the `--allocations` flag on `analyze`, `query` and `diff` are wired up, and the `.hpya` file format is final for version 1. The recorders and the join are not implemented yet: `record` exits with a "not implemented yet" error (with `--json`, an error document with code `unimplemented`; a PID with no process gives `no_such_process`), and `--allocations` checks the file against the snapshot but adds no allocation data. See [docs/allocation-sampling.md](docs/allocation-sampling.md).
+`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The `.hpya` file format is final for version 1. The recorders are not implemented yet: `record` exits with a "not implemented yet" error (with `--json`, an error document with code `unimplemented`; a PID with no process gives `no_such_process`). The analyzer side works on any `.hpya` file.
+
+`analyze --allocations` links snapshot objects to samples by address. Each object gets the latest sample whose range (an arena, a pool, or one large allocation) contains it. It then adds an "Allocated by" section: the stacks that allocated the most during the window, innermost frame first with `file:line`, with estimated bytes allocated and the bytes of live objects linked to each. Under each top retainer it shows the one or two stacks that allocated the memory it retains. `query --type --allocations` shows the same per instance. Read the numbers as an estimate of where growth came from:
+
+- Only allocations made while recording are covered. Memory allocated before recording started, and blocks reused from freed memory, have no stack.
+- Links through large-object samples are exact. Links through arena and pool samples are approximate: they name the most recent growth event that created the memory, not necessarily the call that allocated the object. The text output marks each stack `exact` or `approx`.
+- If the profile is from another pid or CPython version, or recording started after the snapshot, heapspy warns and links nothing.
+
+`diff --allocations` only checks the profile against AFTER for now; it does not add stacks to growth sites. The JSON fields are `allocations` and `allocated_at` ([docs/json-schema.md](docs/json-schema.md#allocations)), and the join is described in [docs/allocation-sampling.md](docs/allocation-sampling.md#joining-with-a-snapshot).
+
+### Allocation flame graph
+
+```sh
+# Width is estimated bytes allocated while recording
+heapspy flamegraph --allocations app.hpya -o alloc.svg
+
+# Width is the bytes still alive in the snapshot, by allocating stack
+heapspy flamegraph --allocations app.hpya --retained app.hpy -o alive.svg
+
+heapspy flamegraph --allocations app.hpya --folded > alloc.folded
+```
+
+This is a classic flame graph of the sampled stacks. Frames are Python functions written `function (file:line)`, the outermost frame is at the root, and width is bytes. Without `--retained`, the width is the estimated bytes allocated, which includes memory freed since. With `--retained SNAP`, the width is the bytes of the objects in the snapshot linked to each stack's samples, which shows where the memory still alive was allocated. The subtitle gives the recording length, the sample count, the mechanisms, and whether any frames were matched by time (approximate). `--min-bytes` and `--min-pct` fold narrow frames into `[other]` as for retention graphs. `--max-depth` does not apply.
 
 ### JSON output
 

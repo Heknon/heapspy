@@ -32,13 +32,8 @@ pub fn run(args: QueryArgs) -> anyhow::Result<()> {
         (Some(t), None, None) => {
             let report = match &alloc {
                 None => heapspy_analyzer::query_type(&snap, &path, &t, &opts)?,
-                Some(a) => allocations::joined_or_plain(
-                    a,
-                    heapspy_analyzer::allocations::query_type_with_allocations(
-                        &snap, &path, &t, &opts, &a.profile,
-                    ),
-                    || heapspy_analyzer::query_type(&snap, &path, &t, &opts),
-                    |r| &mut r.notes,
+                Some(a) => heapspy_analyzer::allocations::query_type_with_allocations(
+                    &snap, &path, &t, &opts, &a.profile,
                 )?,
             };
             return if args.json {

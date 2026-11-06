@@ -254,8 +254,7 @@ pub struct AnalyzeReport {
     pub type_histogram: Vec<TypeRow>,
     pub notes: Vec<Note>,
     /// What an allocation profile (`--allocations`) says about where the
-    /// memory came from. `null` without `--allocations`, and while the join
-    /// is not implemented.
+    /// memory came from. `null` without `--allocations`.
     #[serde(default)]
     pub allocations: Option<Allocations>,
 }
@@ -408,6 +407,13 @@ pub struct Coverage {
     pub linked_bytes: u64,
     /// `linked_bytes / totals.reachable_bytes * 100`.
     pub linked_pct: f64,
+    /// The part of `linked_objects` linked through large-object samples,
+    /// which cover exactly one allocation. The rest is linked through arena
+    /// and pool samples: the most recent growth event that created the
+    /// memory, not necessarily the call that allocated the object.
+    pub exact_linked_objects: u64,
+    /// Shallow bytes of `exact_linked_objects`.
+    pub exact_linked_bytes: u64,
 }
 
 /// One Python frame of an allocation stack.
@@ -440,6 +446,9 @@ pub struct AllocationStack {
     pub events: Vec<String>,
     /// Shallow bytes of reachable snapshot objects linked to these samples.
     pub linked_bytes: u64,
+    /// The part of `linked_bytes` linked through large-object samples
+    /// (exact links); the rest came through arena and pool samples.
+    pub exact_linked_bytes: u64,
     /// Any frame of any sample was approximate.
     pub approximate: bool,
 }
@@ -452,6 +461,8 @@ pub struct AllocatedAt {
     pub linked_objects: u64,
     /// Their shallow bytes.
     pub linked_bytes: u64,
+    /// The part of `linked_bytes` linked through large-object samples.
+    pub exact_linked_bytes: u64,
     /// Stacks by `linked_bytes`, largest first. At most 5.
     pub stacks: Vec<AllocatedAtStack>,
     /// Any listed stack is approximate.
@@ -466,6 +477,8 @@ pub struct AllocatedAtStack {
     /// Linked objects in the subtree allocated through this stack.
     pub linked_objects: u64,
     pub linked_bytes: u64,
+    /// The part of `linked_bytes` linked through large-object samples.
+    pub exact_linked_bytes: u64,
     /// `rank` of the same stack in `allocations.top_stacks`, if listed there.
     pub top_stack_rank: Option<u32>,
 }

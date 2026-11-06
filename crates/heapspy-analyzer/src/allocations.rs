@@ -1,49 +1,90 @@
 //! Joining an allocation profile (`.hpya`, from `heapspy record`) with a
 //! snapshot.
 //!
-//! **Status:** [`compatibility`] is implemented. The join itself
-//! ([`analyze_with_allocations`], [`query_type_with_allocations`]) is a stub
-//! that returns [`Error::Unimplemented`] (M7c). Callers fall back to the
-//! plain report and add [`not_joined`] to its notes, which is what the CLI
-//! does.
-//!
-//! # What the join has to produce
-//!
 //! The report fields are defined in [`crate::report`] and documented in
 //! `docs/json-schema.md`: `AnalyzeReport.allocations`,
 //! `Retainer.allocated_at` and `Instance.allocated_at`. Design:
 //! `docs/allocation-sampling.md`, "Joining with a snapshot".
 //!
-//! - **By address.** A sample covers `[address, address + size)`. An object
-//!   whose address falls inside a sampled arena, pool or large allocation,
-//!   with no later sample covering the same address, is linked to that
-//!   sample (samples are sorted by time, so "later" is a higher index).
-//!   Sort the samples' ranges once and binary-search per object; objects
-//!   are already sorted by address, so a merge walk works too. Only some
-//!   objects get a sample, because only a sample of allocations is recorded.
-//! - **By site.** Group samples by their resolved stack (the sequence of
-//!   `(function, location)` from `Profile::stack`, innermost first) and sum
-//!   their `weight` into `estimated_bytes`. The largest groups, at most
-//!   `--top`, are `allocations.top_stacks`; `linked_bytes` there is the
-//!   shallow bytes of reachable objects linked to the group's samples.
-//! - **Per retainer / instance.** For each listed object, group the linked
-//!   objects of its dominator subtree by their sample's stack, counting
-//!   objects and shallow bytes (not sample weights). The 5 largest groups
-//!   by bytes are `allocated_at.stacks`, each with the rank of the same
-//!   stack in `top_stacks` if it is there. Every listed object gets an
-//!   `allocated_at`, with zero counts and no stacks if nothing is linked.
-//! - **Coverage.** `coverage.linked_objects` / `linked_bytes` count the
-//!   reachable objects linked to any sample; `linked_pct` is
-//!   `linked_bytes / totals.reachable_bytes * 100`.
-//! - `approximate` (block, stack, frame) is true when the samples involved
-//!   have approximate frames.
-//! - Add the [`compatibility`] notes to the report.
+//! # By address
+//!
+//! A sample covers `[address, address + size)`: one 16 KiB pool, one 1 MiB
+//! arena, or one large allocation. An object is *linked* to the latest
+//! sample (highest index; samples are sorted by time) whose range contains
+//! the object's address. A later sample over the same memory supersedes an
+//! earlier one, because the memory was freed and reused in between.
+//!
+//! [`latest_covering`] does this in one sweep. Object addresses are sorted
+//! (the snapshot stores objects by address); sample ranges are sorted by
+//! start once. Walking the objects in address order, every sample whose
+//! range starts at or before the current address is pushed onto a max-heap
+//! keyed by sample index. The heap top is the answer once samples whose
+//! range ended at or before the address have been popped from the top.
+//! Ended samples below the top are popped later, when they surface; they
+//! never hide a live one, because the top is the largest index of all
+//! entries. Each sample is pushed and popped once, so the sweep costs
+//! `O(n + m log m)` for `n` objects and `m` samples, with `O(m)` extra
+//! memory (the heap, the order, and the ranges) plus one `u32` per object
+//! for the result.
+//!
+//! Links through large-object samples are exact: the range is one
+//! allocation. Links through arena and pool samples (and unknown event
+//! kinds) are approximate: they name the most recent growth event that
+//! created the memory, not necessarily the call that allocated the object.
+//! The report keeps the two apart with `exact_linked_*` fields; the
+//! `approximate` flags keep their schema meaning (frames matched to events
+//! by time).
+//!
+//! Samples taken after the snapshot (timestamp past the snapshot's capture
+//! second) are not used for linking: they describe memory the snapshot has
+//! not seen. When [`compatibility`] reports a mismatch (another pid, another
+//! CPython, or a snapshot from before the recording), nothing is linked and
+//! the report says so with an `allocations_not_linked` note; the sampled
+//! stacks are still reported.
+//!
+//! # By site
+//!
+//! Samples are grouped by their resolved stack: the sequence of
+//! `(function, location)` pairs from `Profile::stack`, innermost first. Raw
+//! frames are resolved once per distinct `(code entry, instruction offset)`
+//! and interned, so a stack is a short list of frame ids. Each group sums
+//! its samples' weights (`estimated_bytes`) and the shallow bytes of the
+//! reachable objects linked to its samples (`linked_bytes`). The largest
+//! groups by estimated bytes are `top_stacks`.
+//!
+//! # Per retainer and instance
+//!
+//! The dominator subtree of `v` is exactly the nodes whose dominator-tree
+//! preorder number lies in `tin[v] .. tin[v] + retained_count[v]`. The
+//! reachable linked objects are sorted by `tin` once; each listed object's
+//! subtree is then a contiguous slice found by two binary searches, and
+//! only the linked objects in that slice are visited. Top retainers are
+//! disjoint, so all of them together visit each linked object at most once.
 
-use heapspy_alloc::Profile;
+use std::collections::{BinaryHeap, HashMap};
+
+use heapspy_alloc::{EventKind, Profile, SampleFlags};
 use heapspy_snapshot::{Snapshot, SourceKind};
 
-use crate::report::{AnalyzeReport, Note, TypeQueryReport};
-use crate::{AnalyzeOptions, Error, QueryOptions, Result};
+use crate::analysis::Analysis;
+use crate::flame::{sanitise, FoldedLine, FxMap, MinWidth, TextTree};
+use crate::report::{
+    AllocatedAt, AllocatedAtStack, AllocationStack, Allocations, AnalyzeReport, Coverage, Note,
+    OverheadInfo, SamplingInfo, StackFrame, TypeQueryReport,
+};
+use crate::{pct, AnalyzeOptions, Error, QueryOptions, Result};
+
+/// "No sample" in the result of [`latest_covering`].
+pub const NO_LINK: u32 = u32::MAX;
+
+/// Most stacks listed in one `allocated_at`.
+pub const ALLOCATED_AT_STACKS: usize = 5;
+
+/// Frame text for a sample without Python frames in an allocation flame
+/// graph.
+pub const NO_STACK_FRAME: &str = "[no Python stack]";
+
+const NS_PER_S: u64 = 1_000_000_000;
 
 fn note(code: &str, message: String) -> Note {
     Note {
@@ -86,7 +127,7 @@ pub fn compatibility(snap: &Snapshot, profile: &Profile) -> Vec<Note> {
         ));
     }
     // Snapshot time is in seconds, profile times in nanoseconds.
-    let start_s = p.start_ns / 1_000_000_000;
+    let start_s = p.start_ns / NS_PER_S;
     if s.captured_at < start_s {
         notes.push(note(
             "allocations_after_snapshot",
@@ -99,31 +140,525 @@ pub fn compatibility(snap: &Snapshot, profile: &Profile) -> Vec<Note> {
     notes
 }
 
-/// The note added when a profile was checked but not joined.
-pub fn not_joined() -> Note {
+/// The note every joined report carries: what the samples can and cannot
+/// say.
+pub fn sampled_note() -> Note {
     note(
-        "allocations_not_joined",
-        "The allocation profile was opened and checked, but joining samples with the snapshot is \
-         not implemented yet, so the report has no allocation data."
+        "allocations_sampled",
+        "Allocation stacks cover only allocations made while recording, and only the sampled \
+         events (arena, pool, large object); objects allocated before recording started have no \
+         stack. Links through arena and pool samples are approximate: they name the most recent \
+         growth event that created the memory, not necessarily the call that allocated the \
+         object. Links through large-object samples are exact."
             .to_string(),
     )
 }
 
+/// The note added when the profile does not line up with the snapshot and
+/// no sample was linked.
+pub fn not_linked_note() -> Note {
+    note(
+        "allocations_not_linked",
+        "The allocation profile does not match the snapshot (see the notes above), so no sample \
+         was linked to an object. Only the sampled stacks are reported."
+            .to_string(),
+    )
+}
+
+// ---------------------------------------------------------------- by address
+
+/// For each address of `addrs`, the index of the latest range in `ranges`
+/// that contains it, or [`NO_LINK`].
+///
+/// `ranges[i]` is `(start, end)`, half-open, for sample `i`; a range with
+/// `start >= end` covers nothing. "Latest" is the highest index. `addrs`
+/// must be sorted ascending (snapshot objects are). Fails if there are
+/// `u32::MAX` ranges or more.
+pub fn latest_covering(
+    addrs: impl IntoIterator<Item = u64>,
+    ranges: &[(u64, u64)],
+) -> Result<Vec<u32>> {
+    if ranges.len() >= NO_LINK as usize {
+        return Err(Error::InvalidArgument(
+            "the allocation profile has more than 2^32 - 2 samples".into(),
+        ));
+    }
+    let mut order: Vec<u32> = (0..ranges.len() as u32)
+        .filter(|&i| ranges[i as usize].0 < ranges[i as usize].1)
+        .collect();
+    order.sort_unstable_by_key(|&i| ranges[i as usize].0);
+    let addrs = addrs.into_iter();
+    let mut out = Vec::with_capacity(addrs.size_hint().0);
+    let mut heap: BinaryHeap<u32> = BinaryHeap::new();
+    let mut next = 0;
+    let mut prev = 0u64;
+    for a in addrs {
+        debug_assert!(a >= prev, "addresses must be sorted");
+        prev = a;
+        while next < order.len() && ranges[order[next] as usize].0 <= a {
+            heap.push(order[next]);
+            next += 1;
+        }
+        while let Some(&top) = heap.peek() {
+            if ranges[top as usize].1 <= a {
+                heap.pop();
+            } else {
+                break;
+            }
+        }
+        out.push(heap.peek().copied().unwrap_or(NO_LINK));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- by site
+
+/// One interned resolved frame.
+struct FrameText {
+    function: String,
+    file: Option<String>,
+    line: Option<u32>,
+    location: String,
+}
+
+const EV_OTHER: u8 = 1 << 0;
+const EV_ARENA: u8 = 1 << 1;
+const EV_POOL: u8 = 1 << 2;
+const EV_LARGE: u8 = 1 << 3;
+const EV_UNKNOWN: u8 = 1 << 4;
+
+fn event_bit(k: EventKind) -> u8 {
+    match k {
+        EventKind::Other => EV_OTHER,
+        EventKind::Arena => EV_ARENA,
+        EventKind::Pool => EV_POOL,
+        EventKind::LargeObject => EV_LARGE,
+        EventKind::Unknown(_) => EV_UNKNOWN,
+    }
+}
+
+/// Event names in a mask, sorted.
+fn event_names(mask: u8) -> Vec<String> {
+    let mut v: Vec<String> = [
+        (EV_ARENA, "arena"),
+        (EV_LARGE, "large_object"),
+        (EV_OTHER, "other"),
+        (EV_POOL, "pool"),
+        (EV_UNKNOWN, "unknown"),
+    ]
+    .iter()
+    .filter(|(b, _)| mask & b != 0)
+    .map(|(_, n)| n.to_string())
+    .collect();
+    v.sort();
+    v
+}
+
+/// Samples with the same resolved stack.
+struct Group {
+    frames: Box<[u32]>,
+    /// Per frame: approximate in any of the group's samples.
+    frame_approx: Vec<bool>,
+    estimated: u64,
+    samples: u64,
+    events: u8,
+    approximate: bool,
+    linked_objects: u64,
+    linked_bytes: u64,
+    exact_bytes: u64,
+}
+
+/// The samples of a profile grouped by resolved stack.
+struct Stacks {
+    frames: Vec<FrameText>,
+    groups: Vec<Group>,
+    /// Group of each sample, with [`EXACT_BIT`] set for large-object samples.
+    of_sample: Vec<u32>,
+    approximate: bool,
+    estimated: u64,
+}
+
+/// Set in [`Stacks::of_sample`] when the sample's links are exact.
+const EXACT_BIT: u32 = 1 << 31;
+
+impl Stacks {
+    fn new(profile: &Profile) -> Result<Stacks> {
+        let m = profile.sample_count();
+        if m >= EXACT_BIT as u64 {
+            return Err(Error::InvalidArgument(
+                "the allocation profile has more than 2^31 - 1 samples".into(),
+            ));
+        }
+        let mut frames: Vec<FrameText> = Vec::new();
+        let mut raw: FxMap<(Option<u32>, Option<u32>), u32> = FxMap::default();
+        let mut by_text: HashMap<(String, String), u32> = HashMap::new();
+        let mut index: FxMap<Box<[u32]>, u32> = FxMap::default();
+        let mut groups: Vec<Group> = Vec::new();
+        let mut of_sample = Vec::with_capacity(m as usize);
+        let mut ids: Vec<u32> = Vec::new();
+        let mut approx: Vec<bool> = Vec::new();
+        let (mut any_approx, mut estimated) = (false, 0u64);
+        for s in profile.samples() {
+            ids.clear();
+            approx.clear();
+            for f in profile.frames(&s) {
+                let key = (f.code.map(|c| c.0), f.instr_offset);
+                let id = match raw.get(&key) {
+                    Some(&id) => id,
+                    None => {
+                        let r = profile.resolve(f);
+                        let function = r.function().to_string();
+                        let location = r.location();
+                        let id = *by_text
+                            .entry((function.clone(), location.clone()))
+                            .or_insert_with(|| {
+                                frames.push(FrameText {
+                                    function,
+                                    file: r.filename.map(str::to_string),
+                                    line: r.line,
+                                    location,
+                                });
+                                frames.len() as u32 - 1
+                            });
+                        raw.insert(key, id);
+                        id
+                    }
+                };
+                ids.push(id);
+                approx.push(f.approximate);
+            }
+            let g = match index.get(&ids[..]) {
+                Some(&g) => g,
+                None => {
+                    groups.push(Group {
+                        frames: ids.clone().into_boxed_slice(),
+                        frame_approx: vec![false; ids.len()],
+                        estimated: 0,
+                        samples: 0,
+                        events: 0,
+                        approximate: false,
+                        linked_objects: 0,
+                        linked_bytes: 0,
+                        exact_bytes: 0,
+                    });
+                    let g = groups.len() as u32 - 1;
+                    index.insert(ids.clone().into_boxed_slice(), g);
+                    g
+                }
+            };
+            let grp = &mut groups[g as usize];
+            grp.estimated = grp.estimated.saturating_add(s.weight);
+            grp.samples += 1;
+            grp.events |= event_bit(s.kind);
+            let sample_approx =
+                s.flags.contains(SampleFlags::APPROXIMATE_FRAMES) || approx.iter().any(|&a| a);
+            grp.approximate |= sample_approx;
+            any_approx |= sample_approx;
+            for (slot, &a) in grp.frame_approx.iter_mut().zip(&approx) {
+                *slot |= a;
+            }
+            estimated = estimated.saturating_add(s.weight);
+            let exact = if s.kind == EventKind::LargeObject {
+                EXACT_BIT
+            } else {
+                0
+            };
+            of_sample.push(g | exact);
+        }
+        Ok(Stacks {
+            frames,
+            groups,
+            of_sample,
+            approximate: any_approx,
+            estimated,
+        })
+    }
+
+    fn stack_frames(&self, g: u32) -> Vec<StackFrame> {
+        let grp = &self.groups[g as usize];
+        grp.frames
+            .iter()
+            .zip(&grp.frame_approx)
+            .map(|(&f, &approximate)| {
+                let t = &self.frames[f as usize];
+                StackFrame {
+                    function: t.function.clone(),
+                    file: t.file.clone(),
+                    line: t.line,
+                    location: t.location.clone(),
+                    approximate,
+                }
+            })
+            .collect()
+    }
+
+    /// Flame graph frames of group `g`, outermost first.
+    fn flame_frames(&self, g: u32) -> Vec<String> {
+        let grp = &self.groups[g as usize];
+        if grp.frames.is_empty() {
+            return vec![NO_STACK_FRAME.to_string()];
+        }
+        grp.frames
+            .iter()
+            .rev()
+            .map(|&f| {
+                let t = &self.frames[f as usize];
+                let mut s = format!("{} ({})", t.function, t.location);
+                sanitise(&mut s);
+                s
+            })
+            .collect()
+    }
+
+    /// Groups by estimated bytes, then linked bytes, then first appearance.
+    fn ranked(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = (0..self.groups.len() as u32).collect();
+        v.sort_by(|&x, &y| {
+            let (a, b) = (&self.groups[x as usize], &self.groups[y as usize]);
+            (b.estimated, b.linked_bytes)
+                .cmp(&(a.estimated, a.linked_bytes))
+                .then(x.cmp(&y))
+        });
+        v
+    }
+}
+
+// ---------------------------------------------------------------- the join
+
+/// A profile joined with an analysed snapshot.
+struct Join<'a, 's> {
+    a: &'a Analysis<'s>,
+    stacks: Stacks,
+    /// Linked sample per object, or [`NO_LINK`]. Empty when nothing was
+    /// linked.
+    link: Vec<u32>,
+    coverage: Coverage,
+    notes: Vec<Note>,
+    /// Reachable linked objects in dominator-tree preorder.
+    by_tin: Vec<u32>,
+}
+
+impl<'a, 's> Join<'a, 's> {
+    fn new(a: &'a Analysis<'s>, profile: &Profile) -> Result<Join<'a, 's>> {
+        let snap = a.snap;
+        let mut stacks = Stacks::new(profile)?;
+        let mut notes = compatibility(snap, profile);
+        let link = if notes.is_empty() {
+            // Samples after the snapshot's capture second cannot describe it.
+            let cutoff = snap
+                .info()
+                .captured_at
+                .saturating_add(1)
+                .saturating_mul(NS_PER_S);
+            let ranges: Vec<(u64, u64)> = profile
+                .samples()
+                .map(|s| {
+                    if s.timestamp_ns < cutoff {
+                        (s.address, s.address.saturating_add(s.size))
+                    } else {
+                        (0, 0)
+                    }
+                })
+                .collect();
+            let n = snap.object_count() as u32;
+            latest_covering((0..n).map(|i| snap.object_addr(i)), &ranges)?
+        } else {
+            notes.push(not_linked_note());
+            Vec::new()
+        };
+        notes.push(sampled_note());
+
+        let mut coverage = Coverage {
+            linked_objects: 0,
+            linked_bytes: 0,
+            linked_pct: 0.0,
+            exact_linked_objects: 0,
+            exact_linked_bytes: 0,
+        };
+        // Linked objects scattered to their preorder slot, then compacted:
+        // O(n) instead of a sort by tin.
+        let mut by_tin = if link.is_empty() {
+            Vec::new()
+        } else {
+            vec![NO_LINK; a.order.len()]
+        };
+        for (v, &l) in link.iter().enumerate() {
+            if l == NO_LINK || !a.reachable(v as u32) {
+                continue;
+            }
+            let bytes = snap.object(v as u32).shallow_size;
+            let packed = stacks.of_sample[l as usize];
+            let grp = &mut stacks.groups[(packed & !EXACT_BIT) as usize];
+            grp.linked_objects += 1;
+            grp.linked_bytes += bytes;
+            coverage.linked_objects += 1;
+            coverage.linked_bytes += bytes;
+            if packed & EXACT_BIT != 0 {
+                grp.exact_bytes += bytes;
+                coverage.exact_linked_objects += 1;
+                coverage.exact_linked_bytes += bytes;
+            }
+            by_tin[a.tin[v] as usize] = v as u32;
+        }
+        coverage.linked_pct = pct(coverage.linked_bytes, a.reachable_bytes());
+        by_tin.retain(|&v| v != NO_LINK);
+        by_tin.shrink_to_fit();
+        Ok(Join {
+            a,
+            stacks,
+            link,
+            coverage,
+            notes,
+            by_tin,
+        })
+    }
+
+    /// The first `top` groups, best first.
+    fn top(&self, top: usize) -> Vec<u32> {
+        let mut r = self.stacks.ranked();
+        r.truncate(top);
+        r
+    }
+
+    fn top_stacks(&self, top: &[u32]) -> Vec<AllocationStack> {
+        top.iter()
+            .enumerate()
+            .map(|(i, &g)| {
+                let grp = &self.stacks.groups[g as usize];
+                AllocationStack {
+                    rank: i as u32 + 1,
+                    frames: self.stacks.stack_frames(g),
+                    estimated_bytes: grp.estimated,
+                    samples: grp.samples,
+                    events: event_names(grp.events),
+                    linked_bytes: grp.linked_bytes,
+                    exact_linked_bytes: grp.exact_bytes,
+                    approximate: grp.approximate,
+                }
+            })
+            .collect()
+    }
+
+    /// `allocated_at` of node `v`: the linked objects of its dominator
+    /// subtree by stack. `rank_of` gives the `top_stacks` rank of a group.
+    fn allocated_at(&self, v: u32, rank_of: &HashMap<u32, u32>) -> AllocatedAt {
+        let a = self.a;
+        let mut out = AllocatedAt {
+            linked_objects: 0,
+            linked_bytes: 0,
+            exact_linked_bytes: 0,
+            stacks: Vec::new(),
+            approximate: false,
+        };
+        if !a.reachable(v) {
+            return out;
+        }
+        let lo = a.tin[v as usize];
+        let hi = lo + a.retained_count[v as usize];
+        let tin = |x: &u32| a.tin[*x as usize];
+        let start = self.by_tin.partition_point(|x| tin(x) < lo);
+        let end = self.by_tin.partition_point(|x| tin(x) < hi);
+        // group -> (objects, bytes, exact bytes)
+        let mut per: FxMap<u32, (u64, u64, u64)> = FxMap::default();
+        for &x in &self.by_tin[start..end] {
+            let bytes = a.snap.object(x).shallow_size;
+            let packed = self.stacks.of_sample[self.link[x as usize] as usize];
+            let exact = if packed & EXACT_BIT != 0 { bytes } else { 0 };
+            let e = per.entry(packed & !EXACT_BIT).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+            e.2 += exact;
+            out.linked_objects += 1;
+            out.linked_bytes += bytes;
+            out.exact_linked_bytes += exact;
+        }
+        let mut groups: Vec<(u32, (u64, u64, u64))> = per.into_iter().collect();
+        groups.sort_by(|x, y| (y.1 .1, y.1 .0).cmp(&(x.1 .1, x.1 .0)).then(x.0.cmp(&y.0)));
+        groups.truncate(ALLOCATED_AT_STACKS);
+        for (g, (objects, bytes, exact)) in groups {
+            out.approximate |= self.stacks.groups[g as usize].approximate;
+            out.stacks.push(AllocatedAtStack {
+                frames: self.stacks.stack_frames(g),
+                linked_objects: objects,
+                linked_bytes: bytes,
+                exact_linked_bytes: exact,
+                top_stack_rank: rank_of.get(&g).copied(),
+            });
+        }
+        out
+    }
+
+    fn block(&self, profile: &Profile, path: &str, top: &[u32]) -> Allocations {
+        let i = profile.info();
+        let mut events: Vec<String> = i
+            .sampling
+            .events
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        events.sort();
+        Allocations {
+            path: path.to_string(),
+            pid: i.pid,
+            python_version: i.python.to_string(),
+            started_at: i.start_ns / NS_PER_S,
+            duration_ms: i.duration_ns() / 1_000_000,
+            mechanisms: i
+                .mechanisms
+                .iter()
+                .map(|m| m.as_str().to_string())
+                .collect(),
+            sampling: SamplingInfo {
+                events,
+                byte_interval: i.sampling.byte_interval,
+                max_frames: i.sampling.max_frames,
+            },
+            overhead: OverheadInfo {
+                samples_taken: i.overhead.samples_taken,
+                samples_dropped: i.overhead.samples_dropped,
+                probe_hits: i.overhead.probe_hits,
+                total_pause_ns: i.overhead.total_pause_ns,
+            },
+            truncated: i.truncated,
+            approximate: self.stacks.approximate,
+            samples: profile.sample_count(),
+            estimated_bytes: self.stacks.estimated,
+            coverage: self.coverage.clone(),
+            top_stacks: self.top_stacks(top),
+        }
+    }
+}
+
 /// [`crate::analyze`] plus the `allocations` block and per-retainer
-/// `allocated_at`. Stub (M7c).
+/// `allocated_at`. `profile_path` is the profile's path as given by the
+/// user.
 pub fn analyze_with_allocations(
     snap: &Snapshot,
     path: &str,
     opts: &AnalyzeOptions,
     profile: &Profile,
+    profile_path: &str,
 ) -> Result<AnalyzeReport> {
-    let _ = (snap, path, opts, profile);
-    Err(Error::Unimplemented(
-        "joining allocation samples with a snapshot (M7c)",
-    ))
+    let a = Analysis::new(snap)?;
+    let (mut report, nodes) = crate::analyze_with(&a, path, opts)?;
+    let j = Join::new(&a, profile)?;
+    let top = j.top(opts.top);
+    let rank_of: HashMap<u32, u32> = top
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| (g, i as u32 + 1))
+        .collect();
+    for (r, &v) in report.top_retainers.iter_mut().zip(&nodes) {
+        r.allocated_at = Some(j.allocated_at(v, &rank_of));
+    }
+    report.allocations = Some(j.block(profile, profile_path, &top));
+    report.notes.extend(j.notes);
+    Ok(report)
 }
 
-/// [`crate::query_type`] plus per-instance `allocated_at`. Stub (M7c).
+/// [`crate::query_type`] plus per-instance `allocated_at`.
+/// `top_stack_rank` is always `null` here, since a type query has no
+/// `top_stacks`.
 pub fn query_type_with_allocations(
     snap: &Snapshot,
     path: &str,
@@ -131,10 +666,155 @@ pub fn query_type_with_allocations(
     opts: &QueryOptions,
     profile: &Profile,
 ) -> Result<TypeQueryReport> {
-    let _ = (snap, path, type_name, opts, profile);
-    Err(Error::Unimplemented(
-        "joining allocation samples with a snapshot (M7c)",
-    ))
+    let a = Analysis::new(snap)?;
+    let (mut report, nodes) = crate::query::query_type(&a, path, type_name, opts)?;
+    let j = Join::new(&a, profile)?;
+    let none = HashMap::new();
+    for (r, &v) in report.top_instances.iter_mut().zip(&nodes) {
+        r.allocated_at = Some(j.allocated_at(v, &none));
+    }
+    report.notes.extend(j.notes);
+    Ok(report)
+}
+
+/// For tests and tools: the sample linked to each object of `snap` by
+/// index, or [`NO_LINK`], with the same rules as the reports (no links
+/// when [`compatibility`] reports a mismatch, samples after the snapshot
+/// ignored). Unreachable objects are linked too.
+pub fn object_links(snap: &Snapshot, profile: &Profile) -> Result<Vec<u32>> {
+    let a = Analysis::new(snap)?;
+    let j = Join::new(&a, profile)?;
+    Ok(if j.link.is_empty() {
+        vec![NO_LINK; snap.object_count()]
+    } else {
+        j.link
+    })
+}
+
+// ---------------------------------------------------------------- flame graph
+
+/// What an allocation flame graph's widths are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlameWeight {
+    /// Estimated bytes allocated (sample weights).
+    Estimated,
+    /// Shallow bytes of reachable snapshot objects linked to the samples:
+    /// where the memory still alive was allocated.
+    Linked,
+}
+
+/// Folded stacks of an allocation profile, sorted by stack. Frames are
+/// Python functions, `qualname (file:line)`, outermost first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AllocationFolded {
+    pub lines: Vec<FoldedLine>,
+    pub weight: FlameWeight,
+    /// Sum of all widths: estimated bytes, or linked bytes.
+    pub total_bytes: u64,
+    pub samples: u64,
+    /// Some frames were matched to events by time.
+    pub approximate: bool,
+    /// The cutoff that was applied, in bytes.
+    pub min_bytes: u64,
+    /// Compatibility notes ([`FlameWeight::Linked`] only).
+    pub notes: Vec<Note>,
+}
+
+impl AllocationFolded {
+    /// Write `stack bytes` lines.
+    pub fn write_to(&self, mut w: impl std::io::Write) -> std::io::Result<()> {
+        for l in &self.lines {
+            writeln!(w, "{} {}", l.stack, l.bytes)?;
+        }
+        Ok(())
+    }
+}
+
+fn min_bytes(min_width: MinWidth, total: u64) -> Result<u64> {
+    Ok(match min_width {
+        MinWidth::Bytes(b) => b,
+        MinWidth::Pct(p) if (0.0..=100.0).contains(&p) => (total as f64 * p / 100.0).ceil() as u64,
+        MinWidth::Pct(p) => {
+            return Err(Error::InvalidArgument(format!(
+                "min percentage must be between 0 and 100, got {p}"
+            )))
+        }
+    })
+}
+
+fn fold(
+    stacks: &Stacks,
+    width: impl Fn(&Group) -> u64,
+    min_width: MinWidth,
+    samples: u64,
+    weight: FlameWeight,
+    notes: Vec<Note>,
+) -> Result<AllocationFolded> {
+    let total: u64 = stacks.groups.iter().map(&width).sum();
+    let min = min_bytes(min_width, total)?;
+    let mut tt = TextTree::default();
+    for (g, grp) in stacks.groups.iter().enumerate() {
+        let w = width(grp);
+        if w > 0 {
+            let frames = stacks.flame_frames(g as u32);
+            tt.add_path(frames.iter().map(String::as_str), w);
+        }
+    }
+    let tt = if min > 0 { tt.pruned(min) } else { tt };
+    let lines = tt
+        .lines()
+        .into_iter()
+        .map(|(stack, b)| FoldedLine { stack, bytes: b[0] })
+        .collect();
+    Ok(AllocationFolded {
+        lines,
+        weight,
+        total_bytes: total,
+        samples,
+        approximate: stacks.approximate,
+        min_bytes: min,
+        notes,
+    })
+}
+
+/// Folded stacks of a profile, weighted by estimated bytes allocated.
+/// Frames narrower than `min_width` (a percentage is of the total
+/// estimated bytes) are folded into an `[other]` sibling.
+pub fn folded_allocations(profile: &Profile, min_width: MinWidth) -> Result<AllocationFolded> {
+    let stacks = Stacks::new(profile)?;
+    fold(
+        &stacks,
+        |g| g.estimated,
+        min_width,
+        profile.sample_count(),
+        FlameWeight::Estimated,
+        Vec::new(),
+    )
+}
+
+/// Folded stacks of a profile, weighted by the shallow bytes of the
+/// reachable objects of `snap` linked to each stack's samples.
+pub fn folded_allocations_linked(
+    snap: &Snapshot,
+    profile: &Profile,
+    min_width: MinWidth,
+) -> Result<AllocationFolded> {
+    let a = Analysis::new(snap)?;
+    let j = Join::new(&a, profile)?;
+    let notes: Vec<Note> = j
+        .notes
+        .iter()
+        .filter(|n| n.code != "allocations_sampled")
+        .cloned()
+        .collect();
+    fold(
+        &j.stacks,
+        |g| g.linked_bytes,
+        min_width,
+        profile.sample_count(),
+        FlameWeight::Linked,
+        notes,
+    )
 }
 
 #[cfg(test)]
@@ -184,16 +864,30 @@ mod tests {
     }
 
     #[test]
-    fn join_is_a_stub() {
-        let s = snap("42", 1000);
-        let p = profile(42, 12, 900);
-        assert!(matches!(
-            analyze_with_allocations(&s, "s.hpy", &AnalyzeOptions::default(), &p),
-            Err(Error::Unimplemented(_))
-        ));
-        assert!(matches!(
-            query_type_with_allocations(&s, "s.hpy", "dict", &QueryOptions::default(), &p),
-            Err(Error::Unimplemented(_))
-        ));
+    fn latest_covering_basics() {
+        // 0: [100, 200), 1: [150, 160), 2: empty, 3: [100, 120)
+        let ranges = [(100, 200), (150, 160), (5, 5), (100, 120)];
+        let got = latest_covering([0, 5, 100, 119, 120, 150, 159, 160, 199, 200], &ranges).unwrap();
+        assert_eq!(
+            got,
+            [NO_LINK, NO_LINK, 3, 3, 0, 1, 1, 0, 0, NO_LINK],
+            "{got:?}"
+        );
+        assert!(latest_covering([1, 2], &[])
+            .unwrap()
+            .iter()
+            .all(|&l| l == NO_LINK));
+        // A range ending at u64::MAX saturates and still covers the top.
+        let got = latest_covering([u64::MAX - 1], &[(u64::MAX - 8, u64::MAX)]).unwrap();
+        assert_eq!(got, [0]);
+    }
+
+    #[test]
+    fn event_names_are_sorted() {
+        assert_eq!(
+            event_names(EV_POOL | EV_ARENA | EV_LARGE),
+            ["arena", "large_object", "pool"]
+        );
+        assert!(event_names(0).is_empty());
     }
 }

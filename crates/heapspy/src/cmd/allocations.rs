@@ -1,24 +1,40 @@
-//! `--allocations FILE.hpya` on analyze, query and diff.
+//! `--allocations FILE.hpya` on analyze, query, diff and flamegraph.
 //!
 //! The profile is opened (which validates it) and checked against the
 //! snapshot with `heapspy_analyzer::allocations::compatibility`; each
-//! mismatch is printed as a warning and added to the report's notes. The
-//! join itself is not implemented yet: until it is, the plain report is
-//! printed with an `allocations_not_joined` note.
+//! mismatch is printed as a warning. `analyze` and `query --type` then join
+//! the profile with the snapshot, and the joined report carries the same
+//! notes. `diff` and `--retaining-path` have no allocation fields: they
+//! only add the compatibility notes.
 
 use std::path::Path;
 
 use anyhow::Context;
 use heapspy_alloc::Profile;
-use heapspy_analyzer::allocations::{compatibility, not_joined};
+use heapspy_analyzer::allocations::compatibility;
 use heapspy_analyzer::report::Note;
 use heapspy_snapshot::Snapshot;
 
 /// An opened and checked allocation profile.
 pub(crate) struct Allocations {
     pub profile: Profile,
+    /// The path as given, for the report.
+    pub path: String,
     /// Compatibility notes, already printed as warnings.
     pub notes: Vec<Note>,
+}
+
+/// Open `path` and validate it, without a snapshot to check it against.
+pub(crate) fn open_profile(path: &Path) -> anyhow::Result<Profile> {
+    Profile::open(path)
+        .with_context(|| format!("cannot open allocation profile {}", path.display()))
+}
+
+/// Print compatibility notes as warnings.
+pub(crate) fn warn(notes: &[Note]) {
+    for n in notes {
+        eprintln!("heapspy: warning: {}", n.message);
+    }
 }
 
 /// Open `path` (if given) and check it against `snap`.
@@ -26,36 +42,14 @@ pub(crate) fn open(path: Option<&Path>, snap: &Snapshot) -> anyhow::Result<Optio
     let Some(path) = path else {
         return Ok(None);
     };
-    let profile = Profile::open(path)
-        .with_context(|| format!("cannot open allocation profile {}", path.display()))?;
+    let profile = open_profile(path)?;
     let notes = compatibility(snap, &profile);
-    for n in &notes {
-        eprintln!("heapspy: warning: {}", n.message);
-    }
-    Ok(Some(Allocations { profile, notes }))
-}
-
-/// The joined report, or, while the join is unimplemented, the plain one
-/// with the compatibility notes and `allocations_not_joined` appended.
-pub(crate) fn joined_or_plain<T>(
-    a: &Allocations,
-    joined: heapspy_analyzer::Result<T>,
-    plain: impl FnOnce() -> heapspy_analyzer::Result<T>,
-    notes: impl FnOnce(&mut T) -> &mut Vec<Note>,
-) -> anyhow::Result<T> {
-    match joined {
-        Ok(r) => Ok(r),
-        Err(heapspy_analyzer::Error::Unimplemented(_)) => {
-            let n = not_joined();
-            eprintln!("heapspy: note: {}", n.message);
-            let mut r = plain()?;
-            let list = notes(&mut r);
-            list.extend(a.notes.iter().cloned());
-            list.push(n);
-            Ok(r)
-        }
-        Err(e) => Err(e.into()),
-    }
+    warn(&notes);
+    Ok(Some(Allocations {
+        profile,
+        path: super::display_path(path),
+        notes,
+    }))
 }
 
 /// For reports that have no allocation fields: keep the compatibility

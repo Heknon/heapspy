@@ -300,14 +300,35 @@ fn matching_allocations_are_accepted() {
     let out = heapspy(&["analyze", s, "--json", "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let r: AnalyzeReport = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(notes(&r.notes).last(), Some(&"allocations_not_joined"));
-    assert!(!notes(&r.notes).iter().any(|c| c.ends_with("_mismatch")));
+    let codes = notes(&r.notes);
+    assert_eq!(codes.last(), Some(&"allocations_sampled"));
+    assert!(!codes.contains(&"allocations_not_joined"), "{codes:?}");
+    assert!(!codes.contains(&"allocations_not_linked"), "{codes:?}");
+    assert!(!codes.iter().any(|c| c.ends_with("_mismatch")));
     assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+    let a = r.allocations.as_ref().unwrap();
+    assert_eq!(a.path, p);
+    assert_eq!(a.samples, 1);
+    assert_eq!(a.coverage.linked_objects, 1);
+    assert_eq!(a.coverage.exact_linked_bytes, 4096);
+    assert_eq!(a.top_stacks[0].frames[0].location, "app.py:4");
+    let at = r.top_retainers[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.linked_bytes, 4096);
+    assert_eq!(at.stacks[0].top_stack_rank, Some(1));
 
-    let out = heapspy(&["query", s, "--type", "dict", "--json", "--allocations", p]);
+    let out = heapspy(&["query", s, "--type", "bytes", "--json", "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let r: TypeQueryReport = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(notes(&r.notes).contains(&"allocations_not_joined"));
+    assert!(notes(&r.notes).contains(&"allocations_sampled"));
+    let at = r.top_instances[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.stacks[0].frames[0].function, "fill");
+    assert_eq!(at.stacks[0].top_stack_rank, None);
+
+    // Without --allocations the fields are null.
+    let out = heapspy(&["analyze", s, "--json"]);
+    let r: AnalyzeReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(r.allocations.is_none());
+    assert!(r.top_retainers.iter().all(|t| t.allocated_at.is_none()));
 
     let out = heapspy(&[
         "query",
@@ -327,10 +348,148 @@ fn matching_allocations_are_accepted() {
     let _: DiffReport = serde_json::from_slice(&out.stdout).unwrap();
     assert!(stderr(&out).contains("not used by diff"));
 
-    // Text output works too.
+    // Text output.
     let out = heapspy(&["analyze", s, "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Top retainers"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    println!("{text}");
+    assert!(text.contains("Top retainers"));
+    assert!(
+        text.contains("Allocated by (sampled while recording)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("only allocations made while recording"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Arena and pool links are approximate"),
+        "{text}"
+    );
+    assert!(
+        text.contains("allocated at: 4.0 KiB (exact, stack #1) fill (app.py:4)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("#1  4.0 KiB estimated, 4.0 KiB linked (exact)"),
+        "{text}"
+    );
+    assert!(text.contains("      fill  app.py:4"), "{text}");
+    // The caveat is in the section, not repeated as a note.
+    assert!(!text.contains("note: Allocation stacks cover"), "{text}");
+
+    let out = heapspy(&["query", s, "--type", "bytes", "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    println!("{text}");
+    assert!(
+        text.contains("allocated at: 4.0 KiB (exact) fill (app.py:4)"),
+        "{text}"
+    );
+    assert!(text.contains("note: Allocation stacks cover only allocations made while recording"));
+}
+
+#[test]
+fn allocation_flame_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("a.hpy");
+    let prof = dir.path().join("a.hpya");
+    write_snapshot(&snap);
+    write_profile(&prof, 4242, 0);
+    let (s, p) = (snap.to_str().unwrap(), prof.to_str().unwrap());
+
+    let out = heapspy(&["flamegraph", "--allocations", p, "--folded"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fill (app.py:4) 4096\n"
+    );
+
+    let svg_path = dir.path().join("alloc.svg");
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "-o",
+        svg_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let svg = std::fs::read_to_string(&svg_path).unwrap();
+    assert!(svg.starts_with("<?xml"));
+    assert!(svg.contains("heapspy allocation flame graph"));
+    assert!(
+        svg.contains("60.0 s, 1 samples (ebpf), 4.0 KiB estimated, approximate: no"),
+        "{}",
+        &svg[..2000.min(svg.len())]
+    );
+    assert!(svg.contains("fill (app.py:4)"));
+    // Deterministic.
+    let again = dir.path().join("again.svg");
+    heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "-o",
+        again.to_str().unwrap(),
+    ]);
+    assert_eq!(svg, std::fs::read_to_string(&again).unwrap());
+
+    // Weighted by what is still alive in the snapshot.
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "--retained",
+        s,
+        "--folded",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fill (app.py:4) 4096\n"
+    );
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        p,
+        "--retained",
+        s,
+        "-o",
+        svg_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let svg = std::fs::read_to_string(&svg_path).unwrap();
+    assert!(svg.contains(&format!("4.0 KiB live in {s}")));
+
+    // A profile from another process links nothing.
+    let other = dir.path().join("other.hpya");
+    write_profile(&other, 77, 0);
+    let out = heapspy(&[
+        "flamegraph",
+        "--allocations",
+        other.to_str().unwrap(),
+        "--retained",
+        s,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let e = stderr(&out);
+    assert!(
+        e.contains("warning: The allocation profile was recorded from pid 77"),
+        "{e}"
+    );
+    assert!(e.contains("no sampled allocation is linked"), "{e}");
+
+    // Usage errors.
+    for args in [
+        &["flamegraph", s, "--allocations", p][..],
+        &["flamegraph", "--allocations", p, "--diff", s, s],
+        &["flamegraph", s, "--retained", s],
+    ] {
+        assert_eq!(heapspy(args).status.code(), Some(2), "{args:?}");
+    }
+    let out = heapspy(&["flamegraph", "--allocations", s]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("cannot open allocation profile"));
 }
 
 #[test]
@@ -354,6 +513,10 @@ fn mismatched_allocations_warn() {
     let codes = notes(&r.notes);
     assert!(codes.contains(&"allocations_pid_mismatch"), "{codes:?}");
     assert!(codes.contains(&"allocations_python_mismatch"), "{codes:?}");
+    assert!(codes.contains(&"allocations_not_linked"), "{codes:?}");
+    let a = r.allocations.as_ref().unwrap();
+    assert_eq!(a.coverage.linked_objects, 0);
+    assert_eq!(a.top_stacks.len(), 1);
 
     let out = heapspy(&["diff", s, s, "--json", "--allocations", p]);
     let r: DiffReport = serde_json::from_slice(&out.stdout).unwrap();

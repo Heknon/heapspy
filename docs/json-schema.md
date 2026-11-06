@@ -210,7 +210,9 @@ Codes defined so far:
 | `allocations_pid_mismatch` | `--allocations`: the profile was recorded from another pid than the (live-process) snapshot |
 | `allocations_python_mismatch` | `--allocations`: the profile and the snapshot name different CPython versions |
 | `allocations_after_snapshot` | `--allocations`: the snapshot was taken before recording started, so no sampled allocation can be in it |
-| `allocations_not_joined` | `--allocations`: the profile was opened and checked, but the join is not implemented yet, so `allocations` and `allocated_at` are `null` |
+| `allocations_not_linked` | `--allocations` on analyze and `query --type`: one of the three notes above applies, so no object was linked to a sample; `top_stacks` is still reported, with `linked_bytes` 0 |
+| `allocations_sampled` | always on analyze and `query --type` with `--allocations`: what the samples cover (allocations made while recording, sampled events only) and that arena and pool links are approximate |
+| `allocations_not_joined` | no longer emitted. heapspy versions before the join printed it when `--allocations` was given to analyze or `query --type` |
 
 `truncated_snapshot` is also used by dump, when `truncated` is true.
 
@@ -450,12 +452,20 @@ window, not a full allocation history: only arena, pool and large-object
 events are sampled, blocks reused from freed memory are not, and objects
 allocated before recording started have no sample. An object is *linked*
 to a sample when its address lies inside the sampled range and no later
-sample covers that address.
+sample covers that address. Samples taken after the snapshot's capture
+second are not used for linking. When the profile does not match the
+snapshot (the `allocations_*_mismatch` and `allocations_after_snapshot`
+notes), nothing is linked and the report carries `allocations_not_linked`.
+The algorithm is described in `docs/allocation-sampling.md`, "Joining with
+a snapshot".
 
-**Status:** the profile is opened, validated and checked against the
-snapshot, but the join is not implemented yet. Until it is, `allocations`
-and every `allocated_at` are `null` and the report carries the
-`allocations_not_joined` note.
+Links through `large_object` samples are *exact*: the sample's range is
+one allocation. Links through `arena` and `pool` samples (and `other`) are
+*approximate*: the sample is the most recent growth event that created
+the memory, not necessarily the call that allocated the object. The
+`exact_linked_*` fields give the exact part of each linked count. The
+`approximate` flags mean something else: Python frames matched to the
+event by time (ETW).
 
 ### Allocations (`allocations`)
 
@@ -481,6 +491,8 @@ and every `allocated_at` are `null` and the report carries the
 | `coverage.linked_objects` | integer | reachable objects linked to a sample |
 | `coverage.linked_bytes` | integer | their shallow bytes |
 | `coverage.linked_pct` | float | `coverage.linked_bytes / totals.reachable_bytes * 100` |
+| `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` samples (exact links) |
+| `coverage.exact_linked_bytes` | integer | their shallow bytes |
 | `top_stacks` | array of AllocationStack | stacks by `estimated_bytes`, at most `--top` |
 
 AllocationStack (`top_stacks[]`):
@@ -493,6 +505,7 @@ AllocationStack (`top_stacks[]`):
 | `samples` | integer | samples with this stack |
 | `events` | array of string | event kinds among them, sorted |
 | `linked_bytes` | integer | shallow bytes of reachable objects linked to these samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
 | `approximate` | bool | any frame of any of these samples was approximate |
 
 Two samples have the same stack when their frames have the same
@@ -520,6 +533,7 @@ objects has `linked_objects: 0` and no stacks.
 |---|---|---|
 | `linked_objects` | integer | objects in the subtree linked to a sample |
 | `linked_bytes` | integer | their shallow bytes |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
 | `stacks` | array of AllocatedAtStack | by `linked_bytes`, at most 5 |
 | `approximate` | bool | any listed stack is approximate |
 
@@ -530,6 +544,7 @@ AllocatedAtStack:
 | `frames` | array of StackFrame | innermost first |
 | `linked_objects` | integer | linked objects in the subtree allocated through this stack |
 | `linked_bytes` | integer | their shallow bytes |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
 | `top_stack_rank` | integer, nullable | `rank` of the same stack in `allocations.top_stacks`, if it is listed there; always `null` on query reports |
 
 ## `retaining_path`

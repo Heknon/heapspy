@@ -57,15 +57,17 @@ fn matched_groups(a: &Analysis, type_name: &str) -> Result<Vec<u32>> {
     Ok(groups)
 }
 
-pub fn query_type(
-    snap: &Snapshot,
+/// The type query report of an analysed snapshot, and the node of each
+/// entry of `top_instances`, in order.
+pub(crate) fn query_type(
+    a: &Analysis,
     path: &str,
     type_name: &str,
     opts: &QueryOptions,
-) -> Result<TypeQueryReport> {
-    let a = Analysis::new(snap)?;
-    let groups = matched_groups(&a, type_name)?;
-    let mut inst = instances(&a, &groups);
+) -> Result<(TypeQueryReport, Vec<u32>)> {
+    let snap = a.snap;
+    let groups = matched_groups(a, type_name)?;
+    let mut inst = instances(a, &groups);
     let shallow_bytes = inst.iter().map(|&v| snap.object(v).shallow_size).sum();
     let retained_bytes = a.set_retained(&inst);
 
@@ -103,7 +105,8 @@ pub fn query_type(
     holders.truncate(opts.top);
 
     let total = inst.len() as u64;
-    rank_by_retained(&a, &mut inst, opts.top);
+    rank_by_retained(a, &mut inst, opts.top);
+    inst.truncate(opts.top);
     let mut top_instances = Vec::new();
     for &v in inst.iter().take(opts.top) {
         let o = snap.object(v);
@@ -138,7 +141,7 @@ pub fn query_type(
             type_location_reason,
         });
     }
-    Ok(TypeQueryReport {
+    let report = TypeQueryReport {
         schema_version: SchemaVersion,
         kind: TypeQueryKind::Kind,
         snapshot: snapshot_summary(snap, path),
@@ -151,7 +154,8 @@ pub fn query_type(
         top_instances,
         holders,
         notes,
-    })
+    };
+    Ok((report, inst))
 }
 
 /// Up to `max` distinct shortest paths to each target: the BFS path, then
