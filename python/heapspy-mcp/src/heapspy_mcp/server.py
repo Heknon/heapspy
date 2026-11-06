@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import capture as capture_mod
-from . import processes
+from . import processes, source_map
 from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
 from .config import Config
@@ -69,7 +69,7 @@ def _guard(fn: Callable[[], T]) -> T:
         raise _tool_error(e.to_dict()) from e
     except capture_mod.CaptureRefused as e:
         raise _tool_error(e.to_dict()) from e
-    except (InvalidArgument, SnapshotRefError) as e:
+    except (InvalidArgument, SnapshotRefError, source_map.SourceMapError) as e:
         raise _tool_error({"code": "invalid_argument", "message": str(e)}) from e
 
 
@@ -336,6 +336,23 @@ def build_server(config: Config) -> MCPServer:
             return S.summarize_diff(doc, n)
 
         return _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Resolve a module.qualname from heapspy output (a type such as "
+            "app.session.Session, a module global such as app.cache.CACHE, a method such as "
+            "app.cache.Store.get, or an attribute set as self.x in a method) to file:line "
+            "inside repo_path, with a short source excerpt. Handles src/ layouts, packages, "
+            "and __main__. Read-only and confined to repo_path. Next step: read the file "
+            "around that line and find where the holder grows without being cleared."
+        ),
+    )
+    def map_to_source(
+        qualname: Annotated[str, Field(description="Dotted name, e.g. app.cache.CACHE.")],
+        repo_path: Annotated[str, Field(description="Absolute path of the repository root.")],
+    ) -> dict[str, Any]:
+        return _guard(lambda: source_map.map_to_source(qualname, repo_path))
 
     @server.resource(
         "heapspy://workflow",

@@ -6,6 +6,25 @@ from mcp import Client
 
 from heapspy_mcp.server import build_server
 
+EXPECTED_TOOLS = {
+    "list_python_processes",
+    "capture_snapshot",
+    "heap_summary",
+    "retaining_path",
+    "type_detail",
+    "diff_snapshots",
+    "map_to_source",
+}
+
+
+async def test_all_tools_are_listed(make_config) -> None:
+    async with Client(build_server(make_config())) as client:
+        assert client.server_info.name == "heapspy"
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    assert set(tools) == EXPECTED_TOOLS
+    read_only = {name for name, t in tools.items() if t.annotations.read_only_hint}
+    assert read_only == EXPECTED_TOOLS - {"capture_snapshot"}
+
 
 async def test_workflow_resource_and_prompt(make_config) -> None:
     async with Client(build_server(make_config())) as client:
