@@ -1,0 +1,25 @@
+python3 (2817, #threads: 1)
+-------------------------------------------------------------------
+se.exec_start                                :      12345678.901234
+se.vruntime                                  :         12345.678901
+se.sum_exec_runtime                          :          1234.567890
+se.nr_migrations                             :                   42
+se.statistics.sum_sleep_runtime              :         98765.432100
+se.statistics.wait_start                     :             0.000000
+se.statistics.sleep_start                    :      12345678.000000
+se.statistics.wait_sum                       :           123.456789
+se.statistics.wait_count                     :                 1000
+se.statistics.nr_wakeups                     :                  900
+nr_switches                                  :                 1100
+nr_voluntary_switches                        :                  900
+nr_involuntary_switches                      :                  200
+se.load.weight                               :              1048576
+policy                                       :                    0
+prio                                         :                  120
+clock-delta                                  :                   45
+mm->numa_scan_seq                            :                    0
+numa_pages_migrated                          :                    0
+numa_preferred_nid                           :                   -1
+total_numa_faults                            :                    0
+current_node=0, numa_group_id=0
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0

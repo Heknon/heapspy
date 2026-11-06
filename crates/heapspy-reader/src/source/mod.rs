@@ -144,6 +144,15 @@ pub trait MemorySource: Send + Sync {
     /// the image. A zero-length read succeeds.
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()>;
 
+    /// Bytes of memory that the image's own headers say it contains but that
+    /// are missing from it, for example the tail of a core file that was cut
+    /// short. Reads of those bytes fail like reads of unmapped memory, so the
+    /// walk may silently miss objects; `dump` marks the snapshot truncated
+    /// when this is non-zero. The default is 0 (complete, or cannot tell).
+    fn missing_bytes(&self) -> u64 {
+        0
+    }
+
     /// Readable ranges, sorted by start address, non-overlapping.
     fn mapped_ranges(&self) -> Result<Vec<MappedRange>>;
 

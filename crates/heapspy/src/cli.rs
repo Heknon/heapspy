@@ -25,22 +25,22 @@ pub enum Command {
     Query(QueryArgs),
     /// Growth by type and by retaining site between two snapshots.
     Diff(DiffArgs),
-    /// Sample allocations with their Python stacks for a bounded window.
-    Record(RecordArgs),
     /// Retention flame graph (SVG or folded stacks), or a differential one.
     Flamegraph(FlamegraphArgs),
+    /// Sample allocations with their Python stacks for a bounded window.
+    Record(RecordArgs),
 }
 
 impl Command {
     /// Whether the command was asked for JSON output (errors are then also JSON).
     pub fn json(&self) -> bool {
         match self {
-            Command::Dump(_) => false,
+            Command::Dump(a) => a.json,
             Command::Analyze(a) => a.json,
             Command::Query(a) => a.json,
             Command::Diff(a) => a.json,
-            Command::Record(_) => false,
             Command::Flamegraph(_) => false,
+            Command::Record(a) => a.json,
         }
     }
 }
@@ -66,6 +66,10 @@ pub struct DumpArgs {
     /// Cap on captured text, in characters.
     #[arg(long, value_name = "N", requires = "capture_contents", default_value_t = heapspy_reader::DEFAULT_MAX_STR)]
     pub max_str: usize,
+    /// Print a JSON report (schema version 1) on stdout. The summary line
+    /// on stderr is printed either way.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -158,6 +162,10 @@ pub struct RecordArgs {
     /// auto, ebpf, ptrace (Linux), etw, debugger (Windows).
     #[arg(long, value_name = "MECH", default_value = "auto")]
     pub mechanism: heapspy_record::MechanismChoice,
+    /// Print a JSON report (schema version 1) on stdout. The summary lines
+    /// on stderr are printed either way.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -238,6 +246,8 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["heapspy", "dump", "--pid", "1", "-o", "x"]).is_ok());
+        let cli = Cli::try_parse_from(["heapspy", "dump", "--pid", "1", "-o", "x", "--json"]);
+        assert!(cli.unwrap().command.json());
         assert!(Cli::try_parse_from([
             "heapspy",
             "dump",

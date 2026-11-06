@@ -1,0 +1,63 @@
+{
+ "process": {
+  "context_switches": {
+   "nonvoluntary_switches_per_s": 198.7,
+   "switches_per_cpu_second": 1315.7,
+   "voluntary_share": 0.0,
+   "voluntary_switches_per_s": 0.0
+  },
+  "cpu": {
+   "cpu_cores_used": 0.151,
+   "cpu_percent_on_cpu": 15.1,
+   "cpu_seconds_system": 0.0,
+   "cpu_seconds_user": 1.21,
+   "user_share": 1.0
+  },
+  "scheduler": {
+   "cpu_migrations_per_s": 0.0,
+   "on_cpu_seconds": 1.2157,
+   "runqueue_wait_ratio": 5.588,
+   "runqueue_wait_seconds": 6.7929,
+   "runqueue_wait_seconds_per_s": 0.848,
+   "timeslices_per_s": 198.7
+  }
+ },
+ "signal_unavailable_reasons": {
+  "iowait_seconds_per_s": "delay accounting is off (kernel.task_delayacct=0); enable it with sysctl kernel.task_delayacct=1 or boot with delayacct",
+  "ipc": "cycles: unavailable: no PMU exposed (common in VMs); event_source devices: breakpoint, msr, software, tracepoint, uprobe",
+  "llc_mpki": "llc_misses: unavailable: no PMU exposed (common in VMs); event_source devices: breakpoint, msr, software, tracepoint, uprobe"
+ },
+ "signals": {
+  "cfs_throttled_ratio": null,
+  "cgroup_available": true,
+  "cgroup_reason": null,
+  "cpu_cores_used": 0.151,
+  "disk_wait_share": 0.0,
+  "futex_wait_share": null,
+  "iowait_seconds_per_s": null,
+  "ipc": null,
+  "is_python": false,
+  "llc_mpki": null,
+  "major_faults_per_s": 0.0,
+  "mean_futex_waiting_threads": 0.0,
+  "mean_runnable_threads": 1.0,
+  "nonvoluntary_switches_per_s": 198.7,
+  "process_cpu_cores_to_tightest_limit_ratio": null,
+  "procs_running_per_core": 3.0,
+  "psi_cpu_some_window_pct": 67.39,
+  "psi_io_some_window_pct": 0.0,
+  "psi_memory_full_window_pct": 0.0,
+  "psi_memory_some_window_pct": 0.0,
+  "python_free_threaded": false,
+  "runqueue_wait_ratio": 5.588,
+  "steal_pct": 0.25,
+  "switches_per_cpu_second": 1315.7,
+  "threads": 1,
+  "throttled_seconds_per_s": 0,
+  "tightest_limit_cores": null,
+  "user_share": 1.0,
+  "voluntary_share": 0.0,
+  "voluntary_switches_per_s": 0.0
+ },
+ "source": "diagnose_process_cpu on a starved api worker at 2 cores, from the CPU-contention blind test (signals and process block only)"
+}

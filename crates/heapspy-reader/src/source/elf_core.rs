@@ -82,6 +82,9 @@ pub struct ElfCore {
     modules: Vec<Module>,
     threads: Vec<ThreadInfo>,
     captured_at: Option<u64>,
+    /// Bytes of `PT_LOAD` data that the program headers place past the end of
+    /// the file (a core cut short by `RLIMIT_CORE`, a full disk, or a copy).
+    missing_bytes: u64,
     /// Mapped module files, opened on first use. `None`: missing or unreadable.
     file_cache: Mutex<HashMap<usize, Option<Arc<Mmap>>>>,
 }
@@ -266,12 +269,24 @@ impl ElfCore {
         if phentsize < 56 {
             return Err(fmt_err(format!("program header size {phentsize}")));
         }
+        let ph_end = phnum
+            .checked_mul(phentsize)
+            .and_then(|n| n.checked_add(phoff))
+            .ok_or_else(|| fmt_err("program header table overflows"))?;
+        if ph_end > b.len() {
+            return Err(Error::Truncated(format!(
+                "{}: program headers end at {ph_end:#x}, past the end of the file ({:#x} bytes)",
+                path.display(),
+                b.len()
+            )));
+        }
 
         let mut segments = Vec::new();
         let mut files = Vec::new();
         let mut paths = Vec::new();
         let mut threads = Vec::new();
         let mut entry = None;
+        let mut missing_bytes = 0u64;
         for i in 0..phnum {
             let ph = phoff
                 .checked_add(i.checked_mul(phentsize).ok_or_else(|| fmt_err("phdr"))?)
@@ -284,13 +299,16 @@ impl ElfCore {
             let p_memsz = u64_at(b, ph + 0x28)?;
             match p_type {
                 PT_LOAD if p_memsz > 0 => {
-                    // Clamp to what is really in the file (truncated cores).
+                    // Clamp to what is really in the file (truncated cores),
+                    // and remember how much is missing.
                     let avail = (b.len() as u64).saturating_sub(p_offset);
+                    let want = p_filesz.min(p_memsz);
+                    missing_bytes += want.saturating_sub(avail);
                     segments.push(Segment {
                         vaddr: p_vaddr,
                         memsz: p_memsz,
                         offset: p_offset,
-                        filesz: p_filesz.min(p_memsz).min(avail),
+                        filesz: want.min(avail),
                         perms: Perms {
                             read: p_flags & 4 != 0,
                             write: p_flags & 2 != 0,
@@ -303,9 +321,14 @@ impl ElfCore {
                     let end = start
                         .checked_add(usize::try_from(p_filesz).map_err(|_| fmt_err("note"))?)
                         .ok_or_else(|| fmt_err("note size overflow"))?;
-                    let seg = b
-                        .get(start..end)
-                        .ok_or_else(|| fmt_err("PT_NOTE outside the file"))?;
+                    let seg = b.get(start..end).ok_or_else(|| {
+                        Error::Truncated(format!(
+                            "{}: PT_NOTE at {start:#x}..{end:#x} is past the end of the file \
+                             ({:#x} bytes)",
+                            path.display(),
+                            b.len()
+                        ))
+                    })?;
                     for n in parse_notes(seg) {
                         if n.name != b"CORE\0" && n.name != b"CORE" {
                             continue;
@@ -351,6 +374,7 @@ impl ElfCore {
             modules: Vec::new(),
             threads,
             captured_at,
+            missing_bytes,
             file_cache: Mutex::new(HashMap::new()),
         };
         core.modules = core.build_modules(entry);
@@ -544,6 +568,10 @@ impl MemorySource for ElfCore {
             done += n;
         }
         Ok(())
+    }
+
+    fn missing_bytes(&self) -> u64 {
+        self.missing_bytes
     }
 
     fn mapped_ranges(&self) -> Result<Vec<MappedRange>> {
@@ -791,6 +819,45 @@ mod tests {
         assert!(ranges.windows(2).all(|w| w[0].start < w[1].start));
         assert!(!ranges.iter().any(|r| r.start == 0x9000_0000));
         assert!(core.captured_at().is_some());
+    }
+
+    #[test]
+    fn a_cut_core_reports_its_missing_bytes() {
+        let mut b = CoreBuilder::new();
+        b.notes.push((NT_PRSTATUS, prstatus(1, 0, 0)));
+        b.loads.push((0x1000, 0x100, vec![1; 0x100]));
+        b.loads.push((0x2000, 0x100, vec![2; 0x100]));
+        let full = b.build();
+        let core = open_bytes(&full).unwrap();
+        assert_eq!(core.missing_bytes(), 0);
+
+        // Cut 0x30 bytes into the second segment: 0xd0 of it are gone.
+        let cut = &full[..full.len() - 0xd0];
+        let core = open_bytes(cut).unwrap();
+        assert_eq!(core.missing_bytes(), 0xd0);
+        assert_eq!(core.read_u8(0x202f).unwrap(), 2);
+        assert!(core.read_u8(0x2030).is_err());
+
+        // Cut before the second segment starts: all of it is gone.
+        let core = open_bytes(&full[..full.len() - 0x100]).unwrap();
+        assert_eq!(core.missing_bytes(), 0x100);
+    }
+
+    #[test]
+    fn a_core_cut_in_its_headers_or_notes_is_truncated() {
+        let mut b = CoreBuilder::new();
+        b.notes.push((NT_PRSTATUS, prstatus(1, 0, 0)));
+        b.loads.push((0x1000, 0x100, vec![1; 0x100]));
+        let full = b.build();
+        // ELF header, then 2 program headers of 56 bytes, then the notes.
+        for cut in [70, 64 + 56, 64 + 2 * 56 + 4] {
+            let r = open_bytes(&full[..cut]);
+            assert!(matches!(r, Err(Error::Truncated(_))), "cut at {cut}: {r:?}");
+        }
+        // Not a cut: an ELF header that is not a core.
+        let mut not_core = full.clone();
+        not_core[0x10] = 2;
+        assert!(matches!(open_bytes(&not_core), Err(Error::Format(_))));
     }
 
     #[test]

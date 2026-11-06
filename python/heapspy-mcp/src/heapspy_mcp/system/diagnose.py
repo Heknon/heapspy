@@ -1,0 +1,1042 @@
+"""Weigh competing explanations for a process's CPU use, CPU wait, slowness or stalls.
+
+Each hypothesis is scored from the measurements of one window. Every
+judgement lists the raw value, the threshold it was compared with, and its
+weight. A signal that could not be measured is listed under ``unknown`` and
+contributes nothing. The output is a ranking of how well each explanation
+fits these numbers; it is not a finding, and several can hold at once.
+
+All thresholds are in :data:`THRESHOLDS`, in one place, for review.
+
+``memory_thrashing`` replaced the earlier ``memory_pressure`` hypothesis. That
+one read only memory PSI and the major-fault rate; ``memory_thrashing`` reads
+the same signals and adds workingset refaults and the share of the threads'
+sampled time spent in page-fault I/O, reclaim, ``memory.high`` throttling or
+compaction (from ``watch_process_stalls``). Keeping both would have counted
+the same PSI and fault evidence twice.
+
+``deliberately_frozen`` is a fact check, not a hypothesis: when the process is
+in a frozen cgroup or stopped by a signal, every explanation is moot and the
+result says so.
+
+A thread that is runnable but not running is starved, not idle. When the
+run-queue wait or the share of samples in state R says so, the busy and idle
+tests use ``cpu_demand_cores`` (on-CPU time plus run-queue wait, per second)
+instead of ``cpu_cores_used``, and switches that are mostly preemptions are not
+read as the thread blocking on its own.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+# name -> (value, unit, why this value). Reviewed as a table; change here only.
+THRESHOLDS: dict[str, tuple[float, str, str]] = {
+    "runqueue_wait_ratio_high": (
+        0.20,
+        "ratio",
+        "runnable-but-waiting time is at least a fifth of on-CPU time",
+    ),
+    "runqueue_wait_ratio_very_high": (0.50, "ratio", "waiting half as long as running"),
+    "runqueue_wait_ratio_low": (0.05, "ratio", "wait under 5% of run time: CPUs were available"),
+    "nonvoluntary_switches_per_s_high": (100.0, "1/s", "frequent preemption"),
+    "procs_running_per_core_high": (1.0, "ratio", "more runnable tasks than online cores"),
+    "procs_running_per_core_low": (0.7, "ratio", "host has idle cores on average"),
+    "psi_cpu_some_window_pct_high": (20.0, "%", "tasks were waiting for CPU 20% of the window"),
+    "ipc_low": (0.8, "instructions/cycle", "low for general-purpose server code"),
+    "ipc_normal": (1.5, "instructions/cycle", "typical of code not bound on memory"),
+    "llc_mpki_high": (10.0, "misses per 1000 instructions", "heavy last-level cache missing"),
+    "llc_mpki_low": (2.0, "misses per 1000 instructions", "the working set mostly hits LLC"),
+    "cfs_throttled_ratio_high": (0.20, "ratio", "a fifth of CFS periods hit the quota"),
+    "cfs_throttled_ratio_some": (0.05, "ratio", "some CFS periods hit the quota"),
+    "cfs_throttled_ratio_none": (0.01, "ratio", "throttling is rare"),
+    "throttled_seconds_per_s_high": (0.10, "s/s", "100 ms of throttling per second"),
+    "throttled_share_of_runqueue_wait_high": (
+        0.50,
+        "ratio",
+        "cgroup throttled time is at least half of the process's run-queue wait: the wait "
+        "is mostly the quota, not other runnable tasks",
+    ),
+    "usage_to_limit_ratio_high": (0.90, "ratio", "usage within 10% of the quota"),
+    "voluntary_share_high": (0.70, "ratio", "most switches are the thread blocking itself"),
+    "voluntary_share_low": (0.30, "ratio", "most switches are preemptions"),
+    "voluntary_switches_per_s_high": (500.0, "1/s", "frequent blocking and waking"),
+    "voluntary_switches_per_s_low": (50.0, "1/s", "little blocking"),
+    "futex_wait_share_high": (0.50, "ratio", "half of sleeping-thread samples are in futex"),
+    "switches_per_cpu_second_high": (2000.0, "1/cpu-s", "short bursts of CPU between switches"),
+    "switches_per_cpu_second_low": (50.0, "1/cpu-s", "long uninterrupted runs on CPU"),
+    "cpu_cores_used_busy": (0.5, "cores", "at least half a core busy"),
+    "cpu_cores_used_idle": (0.2, "cores", "mostly idle"),
+    "runnable_share_starved": (
+        0.9,
+        "ratio",
+        "threads were in state R (running or waiting for a CPU) in nine of ten samples",
+    ),
+    "cpu_demand_cores_busy": (
+        0.5,
+        "cores",
+        "on-CPU time plus run-queue wait is at least half a core: the threads would use "
+        "that much CPU if they got it",
+    ),
+    "cpu_demand_cores_idle": (
+        0.2,
+        "cores",
+        "on-CPU time plus run-queue wait under a fifth of a core: idle even counting wait",
+    ),
+    "preempted_switch_share": (
+        0.5,
+        "ratio",
+        "voluntary share under one half: most switches are preemptions, not the thread "
+        "blocking on its own",
+    ),
+    "timeslice_ratio_very_short": (
+        0.10,
+        "ratio",
+        "average timeslice under a tenth of the scheduler slice",
+    ),
+    "timeslice_ratio_short": (
+        0.25,
+        "ratio",
+        "average timeslice under a quarter of the scheduler slice",
+    ),
+    "timeslice_ratio_full": (
+        0.50,
+        "ratio",
+        "average timeslice at least half the scheduler slice: slices are not cut short",
+    ),
+    "colocated_wakeups_per_s_high": (
+        1000.0,
+        "1/s",
+        "tasks sharing the target's CPUs wake at least 1000 times a second",
+    ),
+    "short_sleeper_wakeup_share_high": (
+        0.50,
+        "ratio",
+        "half of the co-located wakeups come from tasks that sleep under 1 ms at a time",
+    ),
+    "user_share_high": (0.90, "ratio", "time is in user space"),
+    "gil_cores_ceiling": (1.3, "cores", "a GIL-bound process stays near one core"),
+    "gil_cores_exceeded": (1.5, "cores", "well above one core: threads run in parallel"),
+    "active_threads_min": (2.0, "threads", "at least two threads runnable or waiting on futex"),
+    "voluntary_switches_per_s_gil": (200.0, "1/s", "frequent hand-offs between threads"),
+    "steal_pct_high": (5.0, "%", "hypervisor took 5% of host CPU time"),
+    "steal_pct_very_high": (10.0, "%", "hypervisor took 10% of host CPU time"),
+    "steal_pct_low": (1.0, "%", "little steal"),
+    "psi_memory_some_window_pct_high": (5.0, "%", "tasks stalled on memory 5% of the window"),
+    "psi_memory_full_window_pct_high": (1.0, "%", "all tasks stalled on memory 1% of the time"),
+    "psi_memory_some_window_pct_low": (0.5, "%", "negligible memory stall"),
+    "major_faults_per_s_high": (100.0, "1/s", "frequent reads of pages from storage"),
+    "major_faults_per_s_low": (5.0, "1/s", "few major faults"),
+    "refaults_per_s_high": (
+        100.0,
+        "pages/s",
+        "pages evicted earlier are read back often: the working set does not fit",
+    ),
+    "refaults_per_s_low": (10.0, "pages/s", "evicted pages are rarely needed again"),
+    "memory_stall_share_high": (
+        0.50,
+        "ratio",
+        "half of the non-idle thread samples are in page-fault I/O, reclaim, memory.high "
+        "throttling or compaction",
+    ),
+    "memory_stall_share_some": (0.10, "ratio", "a tenth of non-idle thread samples"),
+    "memory_stall_share_low": (0.01, "ratio", "almost no non-idle sample in a memory wait"),
+    "memory_stall_no_progress_high": (
+        0.20,
+        "s/s",
+        "threads spent a fifth of the window with no CPU progress in a memory wait",
+    ),
+    "frozen_share": (
+        0.90,
+        "ratio",
+        "nine in ten thread samples were stopped or frozen: the process is held on purpose",
+    ),
+    "psi_io_some_window_pct_high": (10.0, "%", "tasks stalled on I/O 10% of the window"),
+    "psi_io_some_window_pct_low": (1.0, "%", "negligible I/O stall"),
+    "iowait_seconds_per_s_high": (0.10, "s/s", "threads waited on block I/O 10% of the time"),
+    "disk_wait_share_high": (0.20, "ratio", "a fifth of thread samples in D state or block I/O"),
+}
+
+ASSESSMENTS = (
+    "consistent_with_measurements",  # score >= 3
+    "partly_consistent",  # 1..2
+    "not_indicated",  # <= 0 with evidence
+    "insufficient_signals",  # nothing measured
+)
+
+
+def T(name: str) -> float:
+    return THRESHOLDS[name][0]
+
+
+@dataclass
+class Hyp:
+    id: str
+    title: str
+    for_: list[dict[str, Any]]
+    against: list[dict[str, Any]]
+    unknown: list[dict[str, Any]]
+    next_steps: list[str]
+    caveat: str | None = None
+
+    def add(
+        self, side: str, signal: str, value: Any, threshold: str, weight: int, note: str = ""
+    ) -> None:
+        val, unit, why = THRESHOLDS[threshold]
+        item = {
+            "signal": signal,
+            "value": value,
+            "threshold_name": threshold,
+            "threshold": val,
+            "unit": unit,
+            "weight": weight,
+            "threshold_meaning": why,
+        }
+        if note:
+            item["note"] = note
+        (self.for_ if side == "for" else self.against).append(item)
+
+    def missing(self, signal: str, reason: str) -> None:
+        self.unknown.append({"signal": signal, "reason": reason})
+
+    def result(self) -> dict[str, Any]:
+        score = sum(e["weight"] for e in self.for_) - sum(e["weight"] for e in self.against)
+        if not self.for_ and not self.against:
+            assessment = "insufficient_signals"
+        elif score >= 3:
+            assessment = "consistent_with_measurements"
+        elif score >= 1:
+            assessment = "partly_consistent"
+        else:
+            assessment = "not_indicated"
+        out = {
+            "id": self.id,
+            "title": self.title,
+            "score": score,
+            "assessment": assessment,
+            "evidence_for": self.for_,
+            "evidence_against": self.against,
+            "unknown": self.unknown,
+            "next_measurements": self.next_steps,
+        }
+        if self.caveat:
+            out["caveat"] = self.caveat
+        return out
+
+
+def _get(d: dict[str, Any] | None, *path: str) -> Any:
+    cur: Any = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
+def extract_signals(
+    view: dict[str, Any],
+    hw: dict[str, Any] | None,
+    python: dict[str, Any],
+    stalls: dict[str, Any] | None = None,
+    stalls_reason: str | None = None,
+    colocation: dict[str, Any] | None = None,
+    colocation_reason: str | None = None,
+):
+    """The flat set of numbers the hypotheses read, with a reason for each missing one.
+
+    ``stalls`` is a ``watch_process_stalls`` result over the same window, or None
+    (with ``stalls_reason``) when it was not taken. ``colocation`` is a
+    ``cpu_colocation`` result for the process over the same window, or None.
+    """
+    env = view.get("environment") or {}
+    host = env.get("host")
+    cgv = env.get("cgroup") or {}
+    window = _get(view, "measurement", "window_s") or 1.0
+    states = _get(view, "threads", "state_share_over_window") or {}
+    threads = _get(view, "threads", "count") or 0
+    sites = _get(view, "wait_sites", "share_by_site") or {}
+    sleeping = _get(view, "wait_sites", "sleeping_thread_samples") or 0
+    ticks = _get(view, "wait_sites", "samples") or 0
+    counts = _get(view, "wait_sites", "samples_by_site") or {}
+    thread_samples = _get(view, "wait_sites", "thread_samples") or 0
+    reasons: dict[str, str] = {}
+    unavailable = view.get("unavailable") or {}
+
+    def pick(name: str, value: Any, reason: str | None) -> Any:
+        if value is None:
+            reasons[name] = reason or "not measured"
+        return value
+
+    def psi(src: dict[str, Any] | None, res: str, kind: str) -> float | None:
+        return _get(src, res, kind, "window_pct")
+
+    host_reason = (
+        env.get("host_unavailable_reason") if host is None else None
+    ) or "host context unavailable"
+    cg_reason = cgv.get("reason") if not cgv.get("available") else None
+    psi_cg = cgv.get("pressure") if cgv.get("available") else None
+    psi_host = host.get("psi") if host else None
+
+    def max_psi(res: str, kind: str) -> float | None:
+        vals = [v for v in (psi(psi_cg, res, kind), psi(psi_host, res, kind)) if v is not None]
+        return max(vals) if vals else None
+
+    iowait = view.get("iowait_seconds")
+    s: dict[str, Any] = {
+        "cpu_cores_used": _get(view, "cpu", "cpu_cores_used"),
+        "user_share": _get(view, "cpu", "user_share"),
+        "threads": threads,
+        "voluntary_switches_per_s": _get(view, "context_switches", "voluntary_switches_per_s"),
+        "nonvoluntary_switches_per_s": _get(
+            view, "context_switches", "nonvoluntary_switches_per_s"
+        ),
+        "voluntary_share": _get(view, "context_switches", "voluntary_share"),
+        "switches_per_cpu_second": _get(view, "context_switches", "switches_per_cpu_second"),
+        "runqueue_wait_ratio": pick(
+            "runqueue_wait_ratio",
+            _get(view, "scheduler", "runqueue_wait_ratio"),
+            unavailable.get("runqueue_wait_ratio"),
+        ),
+        "runqueue_wait_seconds_per_s": _get(view, "scheduler", "runqueue_wait_seconds_per_s"),
+        "runnable_share": states.get("running_or_runnable") if states else None,
+        "avg_timeslice_us": pick(
+            "avg_timeslice_us",
+            _get(view, "scheduler", "avg_timeslice_us"),
+            unavailable.get("avg_timeslice_us"),
+        ),
+        "sched_slice_us": _get(view, "scheduler", "sched_slice_us"),
+        "sched_slice_source": _get(view, "scheduler", "sched_slice_source"),
+        "avg_timeslice_to_sched_slice_ratio": _get(
+            view, "scheduler", "avg_timeslice_to_sched_slice_ratio"
+        ),
+        "mean_runnable_threads": round(states.get("running_or_runnable", 0) * threads, 2)
+        if states
+        else None,
+        "futex_wait_share": sites.get("futex", 0.0) if sleeping else None,
+        "mean_futex_waiting_threads": round(counts.get("futex", 0) / ticks, 2) if ticks else None,
+        "disk_wait_share": round(counts.get("block_io", 0) / thread_samples, 3)
+        if thread_samples
+        else None,
+        "major_faults_per_s": _get(view, "page_faults", "major_faults_per_s"),
+        "iowait_seconds_per_s": pick(
+            "iowait_seconds_per_s",
+            round(iowait / window, 4) if iowait is not None else None,
+            unavailable.get("iowait_seconds"),
+        ),
+        "procs_running_per_core": pick(
+            "procs_running_per_core",
+            _get(host, "procs_running_per_core"),
+            host_reason,
+        ),
+        "steal_pct": pick(
+            "steal_pct",
+            _get(host, "cpu_time_pct", "steal_pct"),
+            host_reason if host is None else _get(host, "unavailable", "steal_pct"),
+        ),
+        "psi_cpu_some_window_pct": pick(
+            "psi_cpu_some_window_pct", max_psi("cpu", "some"), "no PSI from cgroup or host"
+        ),
+        "psi_memory_some_window_pct": pick(
+            "psi_memory_some_window_pct", max_psi("memory", "some"), "no PSI from cgroup or host"
+        ),
+        "psi_memory_full_window_pct": pick(
+            "psi_memory_full_window_pct", max_psi("memory", "full"), "no PSI from cgroup or host"
+        ),
+        "psi_io_some_window_pct": pick(
+            "psi_io_some_window_pct", max_psi("io", "some"), "no PSI from cgroup or host"
+        ),
+        "cgroup_available": bool(cgv.get("available")),
+        "cgroup_reason": cg_reason,
+        "cfs_throttled_ratio": cgv.get("max_cfs_throttled_ratio"),
+        "tightest_limit_cores": cgv.get("tightest_limit_cores"),
+        "process_cpu_cores_to_tightest_limit_ratio": cgv.get(
+            "process_cpu_cores_to_tightest_limit_ratio"
+        ),
+        "throttled_seconds_per_s": max(
+            (
+                lv.get("throttled_seconds_per_s") or 0
+                for lv in [cgv.get("own") or {}, *(cgv.get("ancestors_with_quota") or [])]
+            ),
+            default=None,
+        )
+        if cgv.get("available")
+        else None,
+        "ipc": None,
+        "llc_mpki": None,
+        "is_python": python.get("is_python"),
+        "python_free_threaded": python.get("free_threaded"),
+    }
+    _stall_signals(s, reasons, stalls, stalls_reason)
+    _colocation_signals(s, reasons, colocation, colocation_reason)
+    if hw is not None:
+        s["ipc"] = hw.get("ipc")
+        s["llc_mpki"] = hw.get("llc_mpki")
+        for k in ("ipc", "llc_mpki"):
+            if s[k] is None:
+                reasons[k] = (hw.get("unavailable") or {}).get(k, "not measured")
+    else:
+        reasons["ipc"] = reasons["llc_mpki"] = "hardware counters not collected"
+    return s, reasons
+
+
+def _stall_signals(
+    s: dict[str, Any],
+    reasons: dict[str, str],
+    stalls: dict[str, Any] | None,
+    stalls_reason: str | None,
+) -> None:
+    keys = (
+        "refaults_per_s",
+        "memory_stall_share_of_active",
+        "memory_stall_no_progress_seconds_per_s",
+        "block_io_wait_share",
+        "stopped_or_frozen_share",
+        "cgroup_frozen",
+        "system_share",
+    )
+    if stalls is None:
+        for k in keys:
+            s[k] = None
+            reasons[k] = stalls_reason or "per-thread stall sampling was not run"
+        s["refaults_source"] = None
+        s["deliberately_frozen"] = None
+        reasons["deliberately_frozen"] = stalls_reason or "not measured"
+        return
+    pr = stalls.get("process") or {}
+    env = stalls.get("environment") or {}
+    cgm = env.get("cgroup_memory") or {}
+    host = env.get("host") or {}
+    if cgm.get("refaults_per_s") is not None:
+        s["refaults_per_s"], s["refaults_source"] = cgm["refaults_per_s"], "cgroup memory.stat"
+    elif host.get("refaults_per_s") is not None:
+        s["refaults_per_s"], s["refaults_source"] = host["refaults_per_s"], "host /proc/vmstat"
+    else:
+        s["refaults_per_s"], s["refaults_source"] = None, None
+        reasons["refaults_per_s"] = cgm.get("reason") or "no workingset_refault counters"
+    s["memory_stall_share_of_active"] = pr.get("memory_stall_share_of_active")
+    if s["memory_stall_share_of_active"] is None:
+        reasons["memory_stall_share_of_active"] = "every sampled thread was voluntarily idle"
+    s["memory_stall_no_progress_seconds_per_s"] = pr.get("memory_stall_no_progress_seconds_per_s")
+    shares = pr.get("category_share") or {}
+    s["block_io_wait_share"] = shares.get("block_io", 0.0) if shares else None
+    s["stopped_or_frozen_share"] = shares.get("stopped_or_frozen", 0.0) if shares else None
+    s["system_share"] = pr.get("system_share")
+    fz = stalls.get("frozen_or_stopped") or {}
+    s["cgroup_frozen"] = fz.get("cgroup_frozen")
+    share = s["stopped_or_frozen_share"]
+    if s["cgroup_frozen"] or (share is not None and share >= T("frozen_share")):
+        s["deliberately_frozen"] = True
+    elif s["cgroup_frozen"] is None and share is None:
+        s["deliberately_frozen"] = None
+        reasons["deliberately_frozen"] = "no freezer state and no thread samples"
+    else:
+        s["deliberately_frozen"] = False
+    s["frozen_or_stopped_assessment"] = fz.get("assessment")
+    # With per-thread categories, disk wait counts only block I/O outside page faults:
+    # D-state samples in page-fault I/O or reclaim are memory waits, scored under
+    # memory_thrashing.
+    if s["block_io_wait_share"] is not None:
+        s["disk_wait_share"] = s["block_io_wait_share"]
+        s["disk_wait_share_source"] = "watch_process_stalls block_io category"
+
+
+def _colocation_signals(
+    s: dict[str, Any],
+    reasons: dict[str, str],
+    co: dict[str, Any] | None,
+    co_reason: str | None,
+) -> None:
+    keys = ("colocated_wakeups_per_s", "colocated_short_sleeper_wakeup_share")
+    if co is None:
+        for k in keys:
+            s[k] = None
+            reasons[k] = co_reason or "co-location sampling was not run"
+        return
+    att = co.get("wakeup_preemption_attribution") or {}
+    s["colocated_wakeups_per_s"] = att.get("colocated_wakeups_per_s_on_target_cpus")
+    s["colocated_short_sleeper_wakeup_share"] = att.get(
+        "colocated_short_sleeper_wakeup_share_on_target_cpus"
+    )
+    if s["colocated_short_sleeper_wakeup_share"] is None:
+        reasons["colocated_short_sleeper_wakeup_share"] = "no co-located wakeups"
+
+
+def derive(s: dict[str, Any]) -> dict[str, Any]:
+    """Fill signals that follow from others, for inputs that lack them (older
+    results, synthetic tests): run-queue wait per second from the ratio and CPU
+    used, the runnable share from the mean runnable threads, and CPU demand."""
+    s = dict(s)
+    cores = s.get("cpu_cores_used")
+    ratio = s.get("runqueue_wait_ratio")
+    if s.get("runqueue_wait_seconds_per_s") is None and ratio is not None and cores is not None:
+        # runqueue_wait_ratio is wait / on-CPU time, and on-CPU time per second is
+        # close to cpu_cores_used.
+        s["runqueue_wait_seconds_per_s"] = round(ratio * cores, 4)
+    runnable, threads = s.get("mean_runnable_threads"), s.get("threads")
+    if s.get("runnable_share") is None and runnable is not None and threads:
+        s["runnable_share"] = round(min(runnable / threads, 1.0), 3)
+    rqw = s.get("runqueue_wait_seconds_per_s")
+    s["cpu_demand_cores"] = round(cores + rqw, 3) if cores is not None and rqw is not None else None
+    ratio, share = s.get("runqueue_wait_ratio"), s.get("runnable_share")
+    s["starved"] = bool(
+        (ratio is not None and ratio >= T("runqueue_wait_ratio_high"))
+        or (share is not None and share >= T("runnable_share_starved"))
+    )
+    return s
+
+
+def _ge(h: Hyp, side: str, s: dict, key: str, thr: str, w: int, note: str = "") -> bool:
+    v = s.get(key)
+    if v is not None and v >= T(thr):
+        h.add(side, key, v, thr, w, note)
+        return True
+    return False
+
+
+def _lt(h: Hyp, side: str, s: dict, key: str, thr: str, w: int, note: str = "") -> bool:
+    v = s.get(key)
+    if v is not None and v < T(thr):
+        h.add(side, key, v, thr, w, note)
+        return True
+    return False
+
+
+def _need(h: Hyp, s: dict, reasons: dict, *keys: str) -> None:
+    for k in keys:
+        if s.get(k) is None:
+            h.missing(k, reasons.get(k, "not measured"))
+
+
+def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]:
+    s = derive(s)
+    hyps: list[Hyp] = []
+    vshare = s.get("voluntary_share")
+    # Switches are mostly preemptions: they say nothing about the thread blocking.
+    preempted = vshare is not None and vshare < T("preempted_switch_share")
+
+    h = Hyp(
+        "runqueue_contention",
+        "Threads are runnable but wait for a CPU (more runnable work than CPUs it may use)",
+        [],
+        [],
+        [],
+        [
+            "Measure the same pid at two load levels with snapshot_process_metrics and "
+            "compare runqueue_wait_ratio and cpu_seconds_per_unit_work",
+            "Reduce threads per process, or processes per host, and re-measure",
+            "Give the workload dedicated CPUs (Kubernetes static CPU manager policy with a "
+            "Guaranteed pod and integer CPU requests) and compare",
+        ],
+    )
+    if not _ge(h, "for", s, "runqueue_wait_ratio", "runqueue_wait_ratio_very_high", 3):
+        _ge(h, "for", s, "runqueue_wait_ratio", "runqueue_wait_ratio_high", 2)
+    _lt(h, "against", s, "runqueue_wait_ratio", "runqueue_wait_ratio_low", 2)
+    if (s.get("voluntary_share") is not None and s["voluntary_share"] < 0.5) or (
+        s.get("voluntary_share") is None
+    ):
+        _ge(h, "for", s, "nonvoluntary_switches_per_s", "nonvoluntary_switches_per_s_high", 1)
+    _ge(h, "for", s, "procs_running_per_core", "procs_running_per_core_high", 1)
+    _lt(h, "against", s, "procs_running_per_core", "procs_running_per_core_low", 1)
+    _ge(h, "for", s, "psi_cpu_some_window_pct", "psi_cpu_some_window_pct_high", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "runnable_share",
+        "runnable_share_starved",
+        1,
+        "threads were runnable in almost every sample but got little CPU: starved, not idle",
+    )
+    ratio = s.get("cfs_throttled_ratio")
+    prc = s.get("procs_running_per_core")
+    thr = s.get("throttled_seconds_per_s")
+    rqw = s.get("runqueue_wait_seconds_per_s")
+    if thr and rqw and thr / rqw >= T("throttled_share_of_runqueue_wait_high"):
+        # Throttled time is counted as run-queue wait whatever the host load is, so a
+        # busy host must not make the quota look like contention.
+        h.add(
+            "against",
+            "throttled_share_of_runqueue_wait",
+            round(thr / rqw, 3),
+            "throttled_share_of_runqueue_wait_high",
+            3,
+            f"throttled_seconds_per_s={thr}, runqueue_wait_seconds_per_s={rqw}",
+        )
+    elif (
+        ratio is not None
+        and ratio >= T("cfs_throttled_ratio_high")
+        and prc is not None
+        and prc < T("procs_running_per_core_high")
+    ):
+        h.add(
+            "against",
+            "cfs_throttled_ratio",
+            ratio,
+            "cfs_throttled_ratio_high",
+            1,
+            "the cgroup was throttled while the host had fewer runnable tasks than cores; "
+            "throttled time can show up as run-queue wait",
+        )
+    _need(h, s, reasons, "runqueue_wait_ratio", "procs_running_per_core", "psi_cpu_some_window_pct")
+    hyps.append(h)
+
+    h = Hyp(
+        "cache_or_memory_bound_contention",
+        "Instructions per cycle are low and last-level cache misses are high "
+        "(shared-cache or memory-bandwidth contention, or a memory-bound workload)",
+        [],
+        [],
+        [],
+        [
+            "Measure ipc and llc_mpki with hw_counters at two densities (e.g. half the "
+            "processes or pods on the host); a fall in IPC as density rises points at shared "
+            "resources rather than the code itself",
+            "Run on a host that exposes a PMU (bare metal, or a VM with a virtual PMU) if "
+            "hw_counters reports no PMU",
+            "If /sys/fs/resctrl is available, compare L3 occupancy and memory bandwidth",
+        ],
+        caveat="One window cannot separate contention from a workload that is memory-bound "
+        "on its own; compare densities.",
+    )
+    _lt(h, "for", s, "ipc", "ipc_low", 2)
+    _ge(h, "for", s, "llc_mpki", "llc_mpki_high", 2)
+    _ge(h, "against", s, "ipc", "ipc_normal", 2)
+    _lt(h, "against", s, "llc_mpki", "llc_mpki_low", 1)
+    _need(h, s, reasons, "ipc", "llc_mpki")
+    hyps.append(h)
+
+    h = Hyp(
+        "cfs_throttling",
+        "The process's cgroup (or an ancestor) hits its CPU quota (cpu.max / cfs_quota_us)",
+        [],
+        [],
+        [],
+        [
+            "Raise or remove the CPU limit on one instance and compare throttling and latency",
+            "Compare usage with the quota over a shorter CFS period, since bursts within a "
+            "period can be throttled even when the average is under the limit",
+        ],
+    )
+    if s["cgroup_available"]:
+        if s.get("tightest_limit_cores") is None:
+            h.against.append(
+                {
+                    "signal": "tightest_limit_cores",
+                    "value": None,
+                    "note": "no CPU quota on the process's cgroup or its ancestors",
+                    "weight": 3,
+                }
+            )
+        else:
+            if not _ge(h, "for", s, "cfs_throttled_ratio", "cfs_throttled_ratio_high", 3):
+                _ge(h, "for", s, "cfs_throttled_ratio", "cfs_throttled_ratio_some", 1)
+            _lt(h, "against", s, "cfs_throttled_ratio", "cfs_throttled_ratio_none", 2)
+            _ge(h, "for", s, "throttled_seconds_per_s", "throttled_seconds_per_s_high", 1)
+            _ge(
+                h,
+                "for",
+                s,
+                "process_cpu_cores_to_tightest_limit_ratio",
+                "usage_to_limit_ratio_high",
+                1,
+            )
+            if s.get("cfs_throttled_ratio") is None:
+                h.missing("cfs_throttled_ratio", "no CFS periods were counted in the window")
+    else:
+        h.missing("cgroup", s.get("cgroup_reason") or "cgroup not found")
+    hyps.append(h)
+
+    h = Hyp(
+        "lock_contention",
+        "Threads block and wake often, mostly in futex (locks, condition variables)",
+        [],
+        [],
+        [],
+        [
+            "Take stacks of the threads waiting in futex (cpu_stacks / py-spy dump for Python; "
+            "gdb, or eBPF offcputime for native code)",
+            "Re-measure with fewer threads; contention falls faster than throughput if a lock "
+            "is shared",
+        ],
+    )
+    vs = s.get("voluntary_share")
+    vps = s.get("voluntary_switches_per_s")
+    if (
+        vs is not None
+        and vps is not None
+        and vs >= T("voluntary_share_high")
+        and vps >= T("voluntary_switches_per_s_high")
+    ):
+        h.add(
+            "for",
+            "voluntary_switches_per_s",
+            vps,
+            "voluntary_switches_per_s_high",
+            2,
+            f"voluntary_share={vs}",
+        )
+    if (s.get("threads") or 0) >= 2:
+        _ge(h, "for", s, "futex_wait_share", "futex_wait_share_high", 1)
+    if not preempted:
+        _ge(h, "for", s, "switches_per_cpu_second", "switches_per_cpu_second_high", 1)
+    _lt(h, "against", s, "voluntary_switches_per_s", "voluntary_switches_per_s_low", 2)
+    _lt(h, "against", s, "voluntary_share", "voluntary_share_low", 1)
+    if (s.get("threads") or 0) < 2:
+        h.against.append(
+            {
+                "signal": "threads",
+                "value": s.get("threads"),
+                "note": "single-threaded: no lock contention inside the process "
+                "(cross-process locks remain possible)",
+                "weight": 1,
+            }
+        )
+    if s.get("futex_wait_share") is None:
+        h.missing("futex_wait_share", "no sleeping threads were sampled")
+    hyps.append(h)
+
+    h = Hyp(
+        "spin_waiting_or_compute",
+        "Threads stay on CPU with few switches and normal IPC: busy-waiting or plain computation",
+        [],
+        [],
+        [],
+        [
+            "Take on-CPU stacks (cpu_stacks / py-spy top, or perf record) and look for loops "
+            "around atomics, polling or sched_yield",
+            "Compare cpu_seconds_per_unit_work at two load levels: spinning grows CPU without "
+            "growing work",
+        ],
+        caveat="Counters cannot tell spin-waiting from useful computation; stacks can.",
+    )
+    if s["starved"] and s.get("cpu_demand_cores") is not None:
+        note = (
+            f"cpu_cores_used={s.get('cpu_cores_used')} is low because the threads waited "
+            f"for a CPU (runqueue_wait_ratio={s.get('runqueue_wait_ratio')}, "
+            f"runnable_share={s.get('runnable_share')}); demand counts that wait"
+        )
+        _ge(h, "for", s, "cpu_demand_cores", "cpu_demand_cores_busy", 1, note)
+        _lt(h, "against", s, "cpu_demand_cores", "cpu_demand_cores_idle", 2)
+    else:
+        _ge(h, "for", s, "cpu_cores_used", "cpu_cores_used_busy", 1)
+        _lt(h, "against", s, "cpu_cores_used", "cpu_cores_used_idle", 2)
+    _lt(h, "for", s, "switches_per_cpu_second", "switches_per_cpu_second_low", 1)
+    _ge(h, "for", s, "user_share", "user_share_high", 1)
+    if s.get("ipc") is not None and s["ipc"] >= T("ipc_low"):
+        h.add("for", "ipc", s["ipc"], "ipc_low", 1, "IPC is not low")
+    if s.get("ipc") is not None and s["ipc"] < T("ipc_low"):
+        h.add("against", "ipc", s["ipc"], "ipc_low", 1)
+    if not preempted:
+        _ge(h, "against", s, "switches_per_cpu_second", "switches_per_cpu_second_high", 1)
+    _need(h, s, reasons, "ipc")
+    hyps.append(h)
+
+    h = Hyp(
+        "gil_convoy",
+        "Several Python threads take turns on the GIL: CPU stays near one core while threads "
+        "hand off often",
+        [],
+        [],
+        [],
+        [
+            "Take Python stacks with GIL information (cpu_stacks, or py-spy dump / "
+            "py-spy top --gil) to see which threads hold and wait for the GIL",
+            "Compare with the work split across processes instead of threads",
+        ],
+    )
+    if s.get("is_python") is False:
+        h.against.append(
+            {"signal": "is_python", "value": False, "note": "not a Python process", "weight": 3}
+        )
+    elif s.get("is_python") is None:
+        h.missing("is_python", "could not tell whether this is a CPython process")
+    else:
+        if s.get("python_free_threaded"):
+            h.against.append(
+                {
+                    "signal": "python_free_threaded",
+                    "value": True,
+                    "note": "free-threaded build: no GIL by default",
+                    "weight": 2,
+                }
+            )
+        active = (s.get("mean_runnable_threads") or 0) + (s.get("mean_futex_waiting_threads") or 0)
+        cores = s.get("cpu_cores_used")
+        if (
+            active >= T("active_threads_min")
+            and cores is not None
+            and cores <= T("gil_cores_ceiling")
+        ):
+            h.add(
+                "for",
+                "mean_active_threads",
+                round(active, 2),
+                "active_threads_min",
+                2,
+                f"while cpu_cores_used={cores} stays at or under {T('gil_cores_ceiling')} cores",
+            )
+        _ge(h, "for", s, "voluntary_switches_per_s", "voluntary_switches_per_s_gil", 1)
+        _ge(h, "for", s, "futex_wait_share", "futex_wait_share_high", 1)
+        _ge(h, "against", s, "cpu_cores_used", "gil_cores_exceeded", 2)
+        if (s.get("threads") or 0) < 2:
+            h.against.append(
+                {"signal": "threads", "value": s.get("threads"), "note": "one thread", "weight": 2}
+            )
+    hyps.append(h)
+
+    h = Hyp(
+        "short_timeslices",
+        "Timeslices are far shorter than the scheduler slice and end in preemption, with "
+        "frequent wakeups of tasks sharing the CPUs: any fixed cost per slice (such as "
+        "refilling caches after other tasks ran) is paid more often per unit of work",
+        [],
+        [],
+        [],
+        [
+            "cpu_colocation(pid) to see which tasks share the CPUs, how often they wake, how "
+            "long they sleep, and how the tasks are placed across CPUs",
+            "Put the co-located short sleepers on a separate cpuset (or this process on its "
+            "own) and compare cpu_seconds_per_unit_work with snapshot_process_metrics or "
+            "snapshot_group_metrics",
+            "Compare CPU per unit of work at different slice lengths: take snapshots at three "
+            "or more settings and run fit_per_slice_cost. Settings that change slice length "
+            "include the number of tasks per CPU, the waking tasks' policy (SCHED_BATCH tasks "
+            "do not preempt on wakeup) and a per-task slice through sched_setattr "
+            "(Linux 6.12+)",
+            "Where hw_counters has no PMU, cache_sensitivity_probe (opt-in) measures how much "
+            "a working set of a given size slows down on this host when time-sliced",
+        ],
+        caveat="Short slices cost more only if each slice pays a fixed cost; a fit across "
+        "settings (fit_per_slice_cost) tests that. Co-located wakeups are attributed by "
+        "rates on the same CPU, not traced.",
+    )
+    if not _lt(
+        h,
+        "for",
+        s,
+        "avg_timeslice_to_sched_slice_ratio",
+        "timeslice_ratio_very_short",
+        3,
+        f"avg_timeslice_us={s.get('avg_timeslice_us')}, sched_slice_us={s.get('sched_slice_us')} "
+        f"({s.get('sched_slice_source')})",
+    ):
+        _lt(
+            h,
+            "for",
+            s,
+            "avg_timeslice_to_sched_slice_ratio",
+            "timeslice_ratio_short",
+            2,
+            f"avg_timeslice_us={s.get('avg_timeslice_us')}, "
+            f"sched_slice_us={s.get('sched_slice_us')}",
+        )
+    _ge(h, "against", s, "avg_timeslice_to_sched_slice_ratio", "timeslice_ratio_full", 2)
+    if preempted:
+        h.add(
+            "for",
+            "voluntary_share",
+            vshare,
+            "preempted_switch_share",
+            1,
+            "slices end in preemption",
+        )
+    if vshare is not None and vshare >= T("voluntary_share_high"):
+        h.add(
+            "against",
+            "voluntary_share",
+            vshare,
+            "voluntary_share_high",
+            2,
+            "slices are short because the threads block on their own, not because they are "
+            "preempted",
+        )
+    _ge(h, "for", s, "colocated_wakeups_per_s", "colocated_wakeups_per_s_high", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "colocated_short_sleeper_wakeup_share",
+        "short_sleeper_wakeup_share_high",
+        1,
+    )
+    _need(h, s, reasons, "avg_timeslice_to_sched_slice_ratio", "colocated_wakeups_per_s")
+    hyps.append(h)
+
+    h = Hyp(
+        "steal",
+        "The hypervisor runs other guests on this VM's CPUs (steal time)",
+        [],
+        [],
+        [],
+        [
+            "Compare steal over time with the cloud provider's metrics; try a dedicated or "
+            "different instance type",
+        ],
+    )
+    if not _ge(h, "for", s, "steal_pct", "steal_pct_very_high", 3):
+        _ge(h, "for", s, "steal_pct", "steal_pct_high", 2)
+    _lt(h, "against", s, "steal_pct", "steal_pct_low", 2)
+    _need(h, s, reasons, "steal_pct")
+    hyps.append(h)
+
+    h = Hyp(
+        "memory_thrashing",
+        "Threads keep leaving their work to wait for memory: page faults that read evicted "
+        "pages back (refaults, swap-in), direct reclaim, memory.high throttling or compaction",
+        [],
+        [],
+        [],
+        [
+            "watch_process_stalls(pid) for the threads' wait categories, the longest "
+            "no-progress intervals and example kernel stacks",
+            "Compare the cgroup's usage with memory.max / memory.high and its working set; "
+            "raise the limit (or memory.high) on one instance and compare refaults and "
+            "major faults",
+            "For Python, heap_summary shows what is retained",
+        ],
+        caveat="Refault and memory.stat counters cover every process in the cgroup (or the "
+        "host when no cgroup counters exist); the per-thread wait share is this process's own.",
+    )
+    if s.get("deliberately_frozen"):
+        h.add(
+            "against",
+            "stopped_or_frozen_share",
+            s.get("stopped_or_frozen_share"),
+            "frozen_share",
+            3,
+            "the process is frozen or stopped; its lack of progress is not a memory stall",
+        )
+    _ge(h, "for", s, "major_faults_per_s", "major_faults_per_s_high", 2)
+    _ge(
+        h,
+        "for",
+        s,
+        "refaults_per_s",
+        "refaults_per_s_high",
+        2,
+        f"source: {s.get('refaults_source')}",
+    )
+    if not _ge(h, "for", s, "psi_memory_full_window_pct", "psi_memory_full_window_pct_high", 2):
+        _ge(h, "for", s, "psi_memory_some_window_pct", "psi_memory_some_window_pct_high", 1)
+    if not _ge(h, "for", s, "memory_stall_share_of_active", "memory_stall_share_high", 3):
+        _ge(h, "for", s, "memory_stall_share_of_active", "memory_stall_share_some", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "memory_stall_no_progress_seconds_per_s",
+        "memory_stall_no_progress_high",
+        1,
+    )
+    _lt(h, "against", s, "major_faults_per_s", "major_faults_per_s_low", 1)
+    _lt(h, "against", s, "refaults_per_s", "refaults_per_s_low", 1)
+    _lt(h, "against", s, "psi_memory_some_window_pct", "psi_memory_some_window_pct_low", 1)
+    _lt(h, "against", s, "memory_stall_share_of_active", "memory_stall_share_low", 2)
+    _need(
+        h,
+        s,
+        reasons,
+        "refaults_per_s",
+        "memory_stall_share_of_active",
+        "psi_memory_some_window_pct",
+    )
+    hyps.append(h)
+
+    h = Hyp(
+        "io_pressure",
+        "Threads wait on block I/O",
+        [],
+        [],
+        [],
+        [
+            "Check /proc/<pid>/io rates (find_processes sort_by=read_bytes_per_s) and the "
+            "block device's utilisation; look at the block_io wait channels",
+        ],
+    )
+    _ge(h, "for", s, "psi_io_some_window_pct", "psi_io_some_window_pct_high", 2)
+    _ge(h, "for", s, "iowait_seconds_per_s", "iowait_seconds_per_s_high", 2)
+    _ge(
+        h,
+        "for",
+        s,
+        "disk_wait_share",
+        "disk_wait_share_high",
+        1,
+        s.get("disk_wait_share_source", ""),
+    )
+    _lt(h, "against", s, "psi_io_some_window_pct", "psi_io_some_window_pct_low", 1)
+    if s.get("disk_wait_share") is not None and s["disk_wait_share"] == 0:
+        h.against.append(
+            {
+                "signal": "disk_wait_share",
+                "value": 0,
+                "note": "no thread was sampled in a block-I/O wait"
+                + (
+                    " outside page faults (those count under memory_thrashing)"
+                    if s.get("disk_wait_share_source")
+                    else " or in D state"
+                ),
+                "weight": 1,
+            }
+        )
+    _need(h, s, reasons, "psi_io_some_window_pct", "iowait_seconds_per_s")
+    hyps.append(h)
+
+    results = [x.result() for x in hyps]
+    order = {a: i for i, a in enumerate(ASSESSMENTS)}
+    results.sort(key=lambda x: (-x["score"], order[x["assessment"]], len(x["unknown"])))
+    for i, x in enumerate(results, 1):
+        x["rank"] = i
+        x["focus"] = [f for f, ids in FOCUS.items() if x["id"] in ids]
+        if s.get("deliberately_frozen"):
+            x["moot_because"] = "deliberately_frozen"
+    return results
+
+
+# Which hypotheses each diagnose_process focus lists ("all" lists every one).
+FOCUS: dict[str, frozenset[str]] = {
+    "cpu": frozenset(
+        {
+            "runqueue_contention",
+            "cache_or_memory_bound_contention",
+            "cfs_throttling",
+            "lock_contention",
+            "spin_waiting_or_compute",
+            "gil_convoy",
+            "steal",
+            "short_timeslices",
+        }
+    ),
+    "memory": frozenset({"memory_thrashing", "cache_or_memory_bound_contention"}),
+    "io": frozenset({"io_pressure"}),
+}
+
+
+def fact_checks(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]:
+    """Facts that change how every hypothesis reads, checked before the ranking."""
+    value = s.get("deliberately_frozen")
+    check: dict[str, Any] = {
+        "id": "deliberately_frozen",
+        "question": "Is the process frozen by a cgroup freezer, or stopped by a signal or ptrace?",
+        "value": value,
+        "evidence": {
+            "cgroup_frozen": s.get("cgroup_frozen"),
+            "stopped_or_frozen_share": s.get("stopped_or_frozen_share"),
+            "assessment": s.get("frozen_or_stopped_assessment"),
+            "threshold_name": "frozen_share",
+            "threshold": T("frozen_share"),
+        },
+    }
+    if value:
+        check["consequence"] = (
+            "the process is held on purpose and makes no progress whatever else is measured; "
+            "the explanations below are moot until it is thawed or continued"
+        )
+    elif value is None:
+        check["reason"] = reasons.get("deliberately_frozen", "not measured")
+    return [check]
+
+
+def threshold_table() -> list[dict[str, Any]]:
+    return [{"name": k, "value": v, "unit": u, "meaning": m} for k, (v, u, m) in THRESHOLDS.items()]

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "kind": "dump",
+  "path": "app.hpy",
+  "source": {
+    "kind": "pid",
+    "ref": "1234"
+  },
+  "python_version": "3.12.4",
+  "contents_captured": false,
+  "objects": 148213,
+  "edges": 402977,
+  "types": 1184,
+  "roots": 412,
+  "bytes_written": 9311488,
+  "read_errors": 2,
+  "truncated": false,
+  "image": {
+    "missing_bytes": 0
+  },
+  "pause_ms": 182.417,
+  "notes": [
+    {
+      "code": "read_errors",
+      "message": "2 reads of target memory failed; the objects involved are recorded as partial."
+    }
+  ]
+}

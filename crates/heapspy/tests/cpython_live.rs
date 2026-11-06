@@ -270,3 +270,36 @@ fn python314_pid() {
 fn python314_core() {
     run_core(14);
 }
+
+/// `record --json` on a live CPython process: the recorders are stubs, so
+/// it fails with `unimplemented` (from the eBPF stub on Linux), exits 1
+/// and writes neither the profile nor the `--then-dump` snapshot.
+#[test]
+#[ignore = "needs /usr/bin/python3.12"]
+fn python312_record_json_is_unimplemented() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = start_victim(&python(12), dir.path());
+    let prof = dir.path().join("a.hpya");
+    let snap = dir.path().join("a.hpy");
+    let o = heapspy(&[
+        "record",
+        "--json",
+        "--pid",
+        &v.pid.to_string(),
+        "--duration",
+        "1s",
+        "-o",
+        prof.to_str().unwrap(),
+        "--then-dump",
+        snap.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let doc: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(doc["kind"], "error");
+    assert_eq!(doc["error"]["code"], "unimplemented");
+    if cfg!(target_os = "linux") {
+        let msg = doc["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("eBPF"), "{msg}");
+    }
+    assert!(!prof.exists() && !snap.exists());
+}
