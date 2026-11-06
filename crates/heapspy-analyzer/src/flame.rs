@@ -28,6 +28,10 @@
 //!
 //! Neither stage recurses; both rely on parents having smaller ids than their
 //! children.
+//!
+//! A differential adds both snapshots' label trees to one text tree, so the
+//! frames of the two dumps are matched by frame text, never by address, and
+//! then applies the cutoff to the wider side of each frame.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -51,11 +55,11 @@ pub const OTHER_FRAME: &str = "[other]";
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MinWidth {
     Bytes(u64),
-    /// Percent of the reachable bytes.
+    /// Percent of the reachable bytes (for a diff, of the larger snapshot).
     Pct(f64),
 }
 
-/// Options for [`folded_stacks`].
+/// Options for [`folded_stacks`] and [`folded_diff`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlameOptions {
     /// Deepest dominator-tree level that gets its own frame. Objects below
@@ -122,6 +126,36 @@ impl FoldedStacks {
     pub fn write_to(&self, mut w: impl Write) -> io::Result<()> {
         for l in &self.lines {
             writeln!(w, "{} {}", l.stack, l.bytes)?;
+        }
+        Ok(())
+    }
+}
+
+/// One line of a differential: self bytes of the last frame in each snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffLine {
+    pub stack: String,
+    pub before: u64,
+    pub after: u64,
+}
+
+/// Differential folded stacks, sorted by stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedDiff {
+    pub lines: Vec<DiffLine>,
+    pub before_reachable_bytes: u64,
+    pub after_reachable_bytes: u64,
+    pub before_reachable_objects: u64,
+    pub after_reachable_objects: u64,
+    pub min_bytes: u64,
+}
+
+impl FoldedDiff {
+    /// Write `stack before after` lines, the input format of inferno's (and
+    /// FlameGraph's) differential mode.
+    pub fn write_to(&self, mut w: impl Write) -> io::Result<()> {
+        for l in &self.lines {
+            writeln!(w, "{} {} {}", l.stack, l.before, l.after)?;
         }
         Ok(())
     }
@@ -382,6 +416,51 @@ impl TextTree {
         Ok(())
     }
 
+    /// Width of every node per slot.
+    fn totals(&self) -> Vec<[u64; 2]> {
+        let mut t: Vec<[u64; 2]> = self.nodes.iter().map(|n| n.self_bytes).collect();
+        for i in (0..self.nodes.len()).rev() {
+            let p = self.nodes[i].parent;
+            if p != NONE {
+                let c = t[i];
+                t[p as usize][0] += c[0];
+                t[p as usize][1] += c[1];
+            }
+        }
+        t
+    }
+
+    /// A copy with every node narrower than `min_bytes` in both slots folded
+    /// into an `[other]` sibling.
+    fn pruned(&self, min_bytes: u64) -> TextTree {
+        let totals = self.totals();
+        let mut out = TextTree::default();
+        let mut map = vec![NONE; self.nodes.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            let parent = if n.parent == NONE {
+                NONE
+            } else {
+                match map[n.parent as usize] {
+                    NONE => continue,
+                    p => p,
+                }
+            };
+            let text = &*self.texts[n.text as usize];
+            let [b, a] = totals[i];
+            if text != OTHER_FRAME && b.max(a) < min_bytes {
+                let o = out.child(parent, OTHER_FRAME);
+                out.nodes[o as usize].self_bytes[0] += b;
+                out.nodes[o as usize].self_bytes[1] += a;
+            } else {
+                let m = out.child(parent, text);
+                out.nodes[m as usize].self_bytes[0] += n.self_bytes[0];
+                out.nodes[m as usize].self_bytes[1] += n.self_bytes[1];
+                map[i] = m;
+            }
+        }
+        out
+    }
+
     /// `(stack, self bytes)` for every node with self bytes in either slot,
     /// sorted by stack.
     fn lines(&self) -> Vec<(String, [u64; 2])> {
@@ -431,6 +510,45 @@ pub fn folded_stacks(snap: &Snapshot, opts: &FlameOptions) -> Result<FoldedStack
         lines,
         reachable_bytes,
         reachable_objects: a.reachable_objects(),
+        min_bytes,
+    })
+}
+
+/// Differential folded stacks: both snapshots are folded into one tree by
+/// frame text, then the cutoff is applied to the wider of the two widths, so
+/// a frame is either shown on both sides or folded on both sides.
+pub fn folded_diff(before: &Snapshot, after: &Snapshot, opts: &FlameOptions) -> Result<FoldedDiff> {
+    opts.validate()?;
+    let mut tt = TextTree::default();
+    let mut reach = [(0u64, 0u64); 2];
+    // One analysis at a time, so peak memory is that of the larger snapshot.
+    for (slot, snap) in [before, after].into_iter().enumerate() {
+        let a = Analysis::new(snap)?;
+        reach[slot] = (a.reachable_bytes(), a.reachable_objects());
+        let lt = label_tree(&a, opts.max_depth);
+        tt.add(&a, &lt, slot, 0)?;
+    }
+    let min_bytes = opts.min_bytes(reach[0].0.max(reach[1].0));
+    let tt = if min_bytes > 0 {
+        tt.pruned(min_bytes)
+    } else {
+        tt
+    };
+    let lines = tt
+        .lines()
+        .into_iter()
+        .map(|(stack, b)| DiffLine {
+            stack,
+            before: b[0],
+            after: b[1],
+        })
+        .collect();
+    Ok(FoldedDiff {
+        lines,
+        before_reachable_bytes: reach[0].0,
+        after_reachable_bytes: reach[1].0,
+        before_reachable_objects: reach[0].1,
+        after_reachable_objects: reach[1].1,
         min_bytes,
     })
 }

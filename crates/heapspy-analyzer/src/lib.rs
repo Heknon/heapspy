@@ -9,8 +9,8 @@
 //! from the super-root gives shortest retaining paths. All per-object state
 //! is flat `u32`/`u64` arrays indexed by object index.
 //!
-//! [`folded_stacks`] turns the dominator tree into folded stacks for a
-//! retention flame graph; see the [`flame`] module.
+//! [`folded_stacks`] and [`folded_diff`] turn the dominator tree into folded
+//! stacks for a retention flame graph; see the [`flame`] module.
 
 mod analysis;
 mod diff;
@@ -25,7 +25,10 @@ pub mod report;
 use heapspy_snapshot::Snapshot;
 
 use analysis::Analysis;
-pub use flame::{folded_stacks, FlameOptions, FoldedLine, FoldedStacks, MinWidth};
+pub use flame::{
+    folded_diff, folded_stacks, DiffLine, FlameOptions, FoldedDiff, FoldedLine, FoldedStacks,
+    MinWidth,
+};
 use report::{
     Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryTotals, Retainer, RetainingPathReport,
     SchemaVersion, SnapshotSummary, SourceRef, Totals, TypeQueryReport,

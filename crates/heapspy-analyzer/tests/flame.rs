@@ -4,7 +4,8 @@ mod common;
 
 use common::*;
 use heapspy_analyzer::{
-    analyze, folded_stacks, AnalyzeOptions, FlameOptions, FoldedLine, FoldedStacks, MinWidth,
+    analyze, folded_diff, folded_stacks, AnalyzeOptions, FlameOptions, FoldedLine, FoldedStacks,
+    MinWidth,
 };
 use heapspy_snapshot::RootKind;
 
@@ -333,6 +334,70 @@ fn output_is_deterministic() {
     let mut sorted: Vec<&str> = text.lines().collect();
     sorted.sort();
     assert_eq!(sorted, text.lines().collect::<Vec<_>>());
+}
+
+#[test]
+fn differential_sums_match_each_snapshot() {
+    let (before, _) = unbounded_cache(10, 1000);
+    let (after, _) = unbounded_cache(100, 1000);
+    for opts in [exact(), FlameOptions::default()] {
+        let d = folded_diff(&before.build(), &after.build(), &opts).unwrap();
+        let b: u64 = d.lines.iter().map(|l| l.before).sum();
+        let a: u64 = d.lines.iter().map(|l| l.after).sum();
+        assert_eq!(b, d.before_reachable_bytes);
+        assert_eq!(a, d.after_reachable_bytes);
+        let cache = d.lines.iter().find(|l| l.stack == CACHE).unwrap();
+        assert_eq!((cache.before, cache.after), (36 * 10 + 232, 36 * 100 + 232));
+        // Same frame paths as the single-snapshot output.
+        let single = fold(&after, &opts);
+        let mut keys: Vec<&str> = single.lines.iter().map(|l| l.stack.as_str()).collect();
+        keys.sort();
+        for k in keys {
+            assert!(d.lines.iter().any(|l| l.stack == k), "{k}");
+        }
+        let mut out = Vec::new();
+        d.write_to(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text
+            .lines()
+            .any(|l| l == format!("{CACHE} {} {}", 36 * 10 + 232, 36 * 100 + 232)));
+    }
+}
+
+#[test]
+fn differential_cutoff_uses_the_wider_side() {
+    // `GONE` is wide before and absent after; `NEW` is the reverse. Both
+    // must survive a cutoff that each would fail on one side.
+    let build = |gone: bool| {
+        let mut h = Heap::new();
+        let (_, d) = h.module("app");
+        let name = if gone { "GONE" } else { "NEW" };
+        let x = h.obj("builtins.bytes", 10_000);
+        h.untracked(x);
+        h.key(d, x, name);
+        let small = h.obj("builtins.bytes", 10);
+        h.untracked(small);
+        h.key(d, small, "SMALL");
+        h
+    };
+    let d = folded_diff(
+        &build(true).build(),
+        &build(false).build(),
+        &FlameOptions {
+            max_depth: 32,
+            min_width: MinWidth::Bytes(5000),
+        },
+    )
+    .unwrap();
+    let get = |s: &str| {
+        d.lines
+            .iter()
+            .find(|l| l.stack == format!("sys.modules['app'];.__dict__ dict;{s}"))
+            .map(|l| (l.before, l.after))
+    };
+    assert_eq!(get("['GONE'] bytes"), Some((10_000, 0)));
+    assert_eq!(get("['NEW'] bytes"), Some((0, 10_000)));
+    assert_eq!(get("[other]"), Some((10, 10)));
 }
 
 #[test]

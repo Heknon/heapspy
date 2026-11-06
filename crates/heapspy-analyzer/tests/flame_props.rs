@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use heapspy_analyzer::{folded_stacks, FlameOptions, MinWidth};
+use heapspy_analyzer::{folded_diff, folded_stacks, FlameOptions, MinWidth};
 use heapspy_snapshot::{RootKind, Snapshot, SnapshotBuilder};
 use proptest::prelude::*;
 
@@ -163,6 +163,32 @@ proptest! {
         }
     }
 
+    #[test]
+    fn diff_sides_sum_to_each_snapshot(g1 in strategy(), g2 in strategy(), min in 0u64..2000) {
+        let (s1, s2) = (build(&g1), build(&g2));
+        let exact = |s: &Snapshot| top_widths(&folded_stacks(s, &FlameOptions {
+            max_depth: 32,
+            min_width: MinWidth::Bytes(0),
+        }).unwrap());
+        let (e1, e2) = (exact(&s1), exact(&s2));
+        let opts = FlameOptions { max_depth: 32, min_width: MinWidth::Bytes(min) };
+        let d = folded_diff(&s1, &s2, &opts).unwrap();
+        prop_assert_eq!(d.lines.iter().map(|l| l.before).sum::<u64>(), expected_tops(&g1).0);
+        prop_assert_eq!(d.lines.iter().map(|l| l.after).sum::<u64>(), expected_tops(&g2).0);
+        let mut before: BTreeMap<String, u64> = BTreeMap::new();
+        let mut after: BTreeMap<String, u64> = BTreeMap::new();
+        for l in &d.lines {
+            let top = l.stack.split(';').next().unwrap().to_string();
+            *before.entry(top.clone()).or_default() += l.before;
+            *after.entry(top).or_default() += l.after;
+        }
+        for k in before.keys().filter(|k| *k != "[other]") {
+            let (b, a) = (e1.get(k).copied().unwrap_or(0), e2.get(k).copied().unwrap_or(0));
+            prop_assert!(b.max(a) >= min);
+            prop_assert_eq!(before[k], b);
+            prop_assert_eq!(after[k], a);
+        }
+    }
 }
 
 /// Width of each top-level frame, by exact text.
