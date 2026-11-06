@@ -12,7 +12,7 @@ pub fn run(args: DiffArgs) -> anyhow::Result<()> {
         &display_path(&args.before),
         &after,
         &display_path(&args.after),
-        &DiffOptions::default(),
+        &DiffOptions { top: args.top },
     )?;
     if args.json {
         print_json(&report)

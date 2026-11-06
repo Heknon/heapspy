@@ -4,13 +4,13 @@ Read the object graph of a running Python process from the outside, and find out
 
 py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
 
-> **Status: early development.** The workspace, the snapshot file format and the command-line interface exist; dumping and analysis do not work yet and report "not implemented". This README describes what heapspy is meant to do and how it will be used. Commands below are the planned interface.
+> **Status: early development.** `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query` and `diff` work on them. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). An end-to-end suite ([tests/e2e](tests/e2e/README.md)) checks on Linux that known leaks in real 3.12 to 3.14 processes are found, by `--pid` and from `gcore` cores. Packaging is still planned, and the MCP server is being reviewed separately.
 
 ## What it answers, and what it doesn't
 
 heapspy answers **"what is retained, and by whom?"** For a leak, that is usually the question that matters: the reference holding the memory is the thing you delete to fix it, and that reference is sitting in the heap right now. Eclipse MAT finds JVM leaks the same way, from heap dumps with no allocation stacks.
 
-heapspy cannot answer **"where was this allocated?"** for memory that already exists. That history is only recorded if a tracer was running at allocation time. If you need allocation call chains, use tracemalloc or memray from process start. For CPU and allocation churn, use py-spy alongside heapspy.
+heapspy cannot answer **"where was this allocated?"** for memory that already exists. That history is only recorded if a tracer was running at allocation time. A planned `heapspy record` command (M7) will sample allocations with their Python stacks from outside the process, for a bounded window. It uses eBPF on Linux, and ETW plus debugger breakpoints on Windows, and only sees allocations made while it runs. See [docs/allocation-sampling.md](docs/allocation-sampling.md). For full allocation history from process start, use tracemalloc or memray. For CPU, use py-spy alongside heapspy.
 
 ## How it works
 
@@ -102,10 +102,11 @@ heapspy diff before.hpy after.hpy
 
 ### JSON output
 
-Every analysis command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it.
+Every command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it. `dump --json` reports what was written; a failed command prints an error document with a stable code such as `not_python` or `permission_denied`. See [docs/json-schema.md](docs/json-schema.md).
 
 ```sh
 heapspy analyze app.hpy --json | jq '.top_retainers[0]'
+heapspy dump --pid 1234 -o app.hpy --json | jq '.objects, .pause_ms'
 ```
 
 ## Permissions
@@ -157,25 +158,37 @@ Tools:
 
 ## Installation (planned)
 
-heapspy will be a Rust binary distributed as PyPI wheels, the same way py-spy is:
+Nothing has been released yet. Until the first release, the commands below will not find a package. heapspy will be a Rust binary distributed as PyPI wheels, the same way py-spy is. The wheels contain only the binary and work with any Python 3.8 or later:
 
 ```sh
 pip install heapspy
+pipx install heapspy      # or keep it in its own environment
 pip install heapspy-mcp   # optional, for agent integration
 ```
 
+Wheels are planned for Linux x86_64 and aarch64 (glibc), Linux x86_64 (musl) and Windows x86_64. Each GitHub release will also have the bare binaries attached.
+
+To build from source now, with Rust 1.85 or later:
+
+```sh
+cargo install --git https://github.com/Heknon/heapspy heapspy
+```
+
+See [docs/releasing.md](docs/releasing.md) for how releases are built and published.
+
 ## Roadmap
 
-| Milestone | Deliverable |
-|---|---|
-| M1 | Linux core dump reader to snapshot, proven on one `gcore` of a 3.12 process |
-| M2 | Analyzer: dominators, retained sizes, histogram, retaining paths, `--json`, property tests |
-| M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI |
-| M4 | Windows minidump backend |
-| M5 | Windows end-to-end test matrix passing on `windows-latest` |
-| M6 | `heapspy-mcp` |
+| Milestone | Deliverable | Status |
+|---|---|---|
+| M1 | Linux core dump reader to snapshot, proven on one `gcore` of a 3.12 process | done |
+| M2 | Analyzer: dominators, retained sizes, histogram, retaining paths, `--json`, property tests | done |
+| M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI | passes locally; CI job added (`ci:e2e`), not yet run on GitHub |
+| M4 | Windows minidump backend | done |
+| M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
+| M6 | `heapspy-mcp` | done |
+| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
 
-The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path.
+The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
 
 ## Repository layout
 
@@ -185,9 +198,13 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
 | `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
 | `crates/heapspy` | the `heapspy` command-line tool |
+| `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
 | `python/heapspy-mcp` | the `heapspy-mcp` MCP server (Python) |
+| `docs/releasing.md` | how to cut a release and the one-time PyPI setup |
+| `pyproject.toml` | maturin config that packages the `heapspy` binary as a PyPI wheel |
+| `scripts/check-version.py` | checks that the release tag and package versions agree |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and how CI is run.
 
