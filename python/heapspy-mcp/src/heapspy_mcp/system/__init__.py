@@ -11,6 +11,7 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any, TypeVar
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -18,7 +19,7 @@ from pydantic import Field
 
 from ..config import DEFAULT_WINDOW, Config
 from ..processes import matches_allowlist
-from . import views
+from . import perf, views
 from .sampling import ProcessGone, identify
 
 T = TypeVar("T")
@@ -132,7 +133,7 @@ def register(server: MCPServer, config: Config) -> None:
         low.instructions = f"{low.instructions}\n{PROCESS_WORKFLOW}"
 
     async def measure(pid: int, window_s: float, hw: bool) -> views.Measurement:
-        session = None  # hardware counters are added with hw_counters
+        session = perf.CounterSession(pid, proc_root=d.proc_root) if hw else None
         return await views.measure(
             d.proc_root,
             pid,
@@ -166,6 +167,43 @@ def register(server: MCPServer, config: Config) -> None:
             check_pid(config, pid)
             m = await measure(pid, window_s, hw=False)
             return views.full_view(m, max(0, min(top_threads, views.MAX_TOP_THREADS)))
+
+        return await _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Hardware and software performance counters for every thread of one process over "
+            "a window, through perf_event_open: cycles, instructions, last-level cache "
+            "references and misses, context switches, CPU migrations and task clock. Returns "
+            "ipc, llc_mpki (LLC misses per 1000 instructions) and llc_miss_ratio. Counts are "
+            "scaled when the kernel multiplexes counters, and the scaling is reported. Where "
+            "the host exposes no PMU (common in VMs) or permissions block it, the hardware "
+            "fields are null with the exact reason."
+        ),
+    )
+    async def hw_counters(pid: PidArg, window_s: WindowArg = DEFAULT_WINDOW) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            check_pid(config, pid)
+            w = _window(config, window_s)
+            session = perf.CounterSession(pid, proc_root=d.proc_root)
+            session.start()
+            try:
+                t0 = anyio.current_time()
+                await anyio.sleep(w)
+                elapsed = anyio.current_time() - t0
+            finally:
+                counters = session.stop()
+            return {
+                "pid": pid,
+                "measurement": {"window_s": round(elapsed, 3), "window_requested_s": window_s},
+                "threads_counted": len(session.tids),
+                "threads_total": session.threads_total,
+                "threads_truncated": session.threads_total > len(session.tids),
+                **perf.derived(counters, elapsed),
+                "counters": counters,
+                "resctrl": perf.resctrl_for_pid(pid),
+            }
 
         return await _guard(body)
 

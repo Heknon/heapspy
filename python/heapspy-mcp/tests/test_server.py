@@ -16,6 +16,7 @@ EXPECTED_TOOLS = {
     "map_to_source",
     # process diagnostics (heapspy_mcp.system)
     "process_cpu",
+    "hw_counters",
 }
 
 
