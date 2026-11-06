@@ -185,7 +185,7 @@ See [docs/releasing.md](docs/releasing.md) for how releases are built and publis
 | M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI | passes locally; CI job added (`ci:e2e`), not yet run on GitHub |
 | M4 | Windows minidump backend | done |
 | M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
-| M6 | `heapspy-mcp` | in review on a separate branch |
+| M6 | `heapspy-mcp` | done |
 | M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
