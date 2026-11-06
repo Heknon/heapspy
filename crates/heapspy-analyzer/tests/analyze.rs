@@ -303,6 +303,35 @@ fn module_dict_shared_through_globals_is_still_a_namespace() {
 }
 
 #[test]
+fn equally_short_paths_start_at_the_module_root() {
+    // DATA is two hops from both sys.modules['__main__'] (via .__dict__) and
+    // a frame local holding a __main__ function (via .__globals__). The
+    // function is created first, so it has the lower address; the path must
+    // still start at the module, whatever the addresses.
+    let mut h = Heap::new();
+    let func = h.obj("builtins.function", 160);
+    h.root(func, RootKind::FrameLocal, "frame _victim:serve local 'cb'");
+    let (_, md) = h.module("__main__");
+    h.key(md, func, "handler");
+    h.attr(func, md, "__globals__");
+    let data = h.obj("builtins.list", 8 * 100 + 56);
+    h.key(md, data, "DATA");
+    for i in 0..100u32 {
+        let e = h.obj("builtins.bytes", 10_000);
+        h.untracked(e);
+        h.item(data, e, i);
+    }
+    let r = run(&h);
+    let top = r
+        .top_retainers
+        .iter()
+        .find(|t| t.address.0 == data)
+        .expect("DATA is listed");
+    assert_eq!(site(top), "sys.modules['__main__'].__dict__['DATA']");
+    assert_eq!(top.path[0].root_kind.as_deref(), Some("module_dict"));
+}
+
+#[test]
 fn empty_snapshot_and_top_limit() {
     let r = analyze(
         &SnapshotBuilder::new().build().unwrap(),
