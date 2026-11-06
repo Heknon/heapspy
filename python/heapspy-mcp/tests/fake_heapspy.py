@@ -6,7 +6,8 @@ the way ``heapspy ... --json`` would.
 Environment:
     FAKE_HEAPSPY_EXAMPLES  directory holding the example JSON documents (required)
     FAKE_HEAPSPY_MODE      ok (default), error:<code>, bad_schema, not_json, timeout,
-                           usage, wrong_kind, crash, big, error_exit0
+                           usage, wrong_kind, crash, big, error_exit0,
+                           dump_hang (dump writes a temporary file and hangs)
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
 """
 
@@ -118,6 +119,10 @@ def main() -> None:
             sys.exit(1)
         if MODE == "dump_no_file":
             sys.exit(0)
+        if MODE == "dump_hang":
+            # Like heapspy's writer: a temporary file next to the output, then a hang.
+            (Path(out).parent / ".tmpAbC123").write_bytes(b"partial")
+            time.sleep(30)
         Path(out).write_bytes(b"HPYSNAP\0" + b"\0" * 120)
         trunc = " (truncated)" if MODE == "dump_truncated" else ""
         print(f"wrote {out}: 10 objects, 20 edges, 3 roots, 128 bytes{trunc}", file=sys.stderr)
