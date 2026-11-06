@@ -7,6 +7,7 @@ import logging
 import sys
 
 from . import __version__
+from . import config as cpu_config  # CPU profiling (py-spy)
 from .config import (
     DEFAULT_CAPTURE_TIMEOUT,
     DEFAULT_TIMEOUT,
@@ -81,6 +82,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"timeout for heapspy dump (also ${ENV_CAPTURE_TIMEOUT}; "
         f"default {DEFAULT_CAPTURE_TIMEOUT:g})",
     )
+    # --- CPU profiling (py-spy) ---
+    p.add_argument(
+        "--py-spy-bin",
+        metavar="PATH",
+        help=f"py-spy executable for the CPU tools (else ${cpu_config.ENV_PY_SPY_BIN}, "
+        "else 'py-spy' on PATH or next to this Python)",
+    )
+    p.add_argument(
+        "--cpu-max-duration",
+        type=int,
+        metavar="SECONDS",
+        help=f"longest CPU profile a tool may record (also ${cpu_config.ENV_CPU_MAX_DURATION}; "
+        f"default {cpu_config.DEFAULT_CPU_MAX_DURATION})",
+    )
+    # --- end CPU profiling ---
     return p
 
 
@@ -103,6 +119,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             capture_timeout=args.capture_timeout,
         )
+        cpu_config.load_cpu_settings(
+            config, py_spy_bin=args.py_spy_bin, cpu_max_duration=args.cpu_max_duration
+        )
     except ConfigError as e:
         print(f"heapspy-mcp: error: {e}", file=sys.stderr)
         return 2
@@ -121,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
         config.allow_contents,
         config.max_rss_bytes,
     )
+
+    if config.py_spy_bin is None:
+        log.warning("py-spy not found; the CPU tools will return py_spy_not_found")
+    log.info("py_spy=%s cpu_max_duration=%ds", config.py_spy_bin, config.cpu_max_duration)
 
     from .server import build_server
 
