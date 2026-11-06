@@ -189,6 +189,16 @@ class Heapspy:
         assert r.stderr.strip().splitlines()[-1].startswith(f"wrote {out}: "), r.describe()
         return r
 
+    def error_code(self, *args: str, step: str | None = None) -> str:
+        """Run a command that must fail with ``--json``; return ``error.code``."""
+        r = self.run(*args, "--json", step=step)
+        assert not is_crash(r), r.describe()
+        assert r.returncode == 1, r.describe()
+        assert "heapspy: error:" in r.stderr, r.describe()
+        doc = json.loads(r.stdout)
+        assert doc["schema_version"] == 1 and doc["kind"] == "error", doc
+        return doc["error"]["code"]
+
     def json(self, *args: str, kind: str, step: str | None = None) -> dict[str, Any]:
         r = self.run(*args, "--json", step=step)
         assert not is_crash(r), r.describe()
@@ -325,7 +335,8 @@ def kernel_layout_core(src: Path, dst: Path) -> list[tuple[int, int, int]]:
     """Rewrite a gcore core so the PT_NOTE segment comes first, as in kernel cores.
 
     gdb's gcore writes the notes after all memory segments, so cutting the
-    file anywhere removes them and heapspy stops at "PT_NOTE outside the file".
+    file anywhere removes them and heapspy stops with "image cut short: ... PT_NOTE
+    ... is past the end of the file" (error code ``truncated_image``).
     A core the kernel writes (and truncates at RLIMIT_CORE or a full disk) has
     the notes first and loses memory segments instead. This produces that
     layout from a gcore file. Returns ``(vaddr, file_offset, filesz)`` of each
