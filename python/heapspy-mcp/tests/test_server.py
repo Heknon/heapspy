@@ -14,6 +14,8 @@ EXPECTED_TOOLS = {
     "type_detail",
     "diff_snapshots",
     "map_to_source",
+    # CPU tools (py-spy)
+    "cpu_stacks",
 }
 
 
