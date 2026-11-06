@@ -17,6 +17,8 @@ EXPECTED_TOOLS = {
     # process diagnostics (heapspy_mcp.system)
     "process_cpu",
     "hw_counters",
+    "snapshot_process_metrics",
+    "compare_process_snapshots",
 }
 
 

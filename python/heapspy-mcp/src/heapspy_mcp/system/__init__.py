@@ -19,7 +19,7 @@ from pydantic import Field
 
 from ..config import DEFAULT_WINDOW, Config
 from ..processes import matches_allowlist
-from . import perf, views
+from . import perf, views, windows
 from .sampling import ProcessGone, identify
 
 T = TypeVar("T")
@@ -87,6 +87,8 @@ async def _guard(fn: Callable[[], Awaitable[T]]) -> T:
         raise _tool_error(e.to_dict()) from e
     except ProcessGone as e:
         raise _tool_error({"code": "no_such_process", "message": str(e)}) from e
+    except windows.SnapshotError as e:
+        raise _tool_error({"code": "invalid_argument", "message": str(e)}) from e
 
 
 def check_pid(config: Config, pid: int) -> dict[str, Any]:
@@ -127,6 +129,7 @@ def _window(config: Config, window_s: float) -> float:
 
 def register(server: MCPServer, config: Config) -> None:
     d = config.diagnostics
+    store = windows.WindowStore()
     read_only = ToolAnnotations(read_only_hint=True, open_world_hint=False)
     low = getattr(server, "_lowlevel_server", None)
     if low is not None and getattr(low, "instructions", None):
@@ -142,6 +145,11 @@ def register(server: MCPServer, config: Config) -> None:
             cgroup_root=d.cgroup_root,
             hw_session=session,
         )
+
+    def hw_block(m: views.Measurement) -> dict[str, Any] | None:
+        if m.hw is None:
+            return None
+        return {**perf.derived(m.hw, m.window_s), "counters": m.hw}
 
     @server.tool(
         annotations=read_only,
@@ -204,6 +212,52 @@ def register(server: MCPServer, config: Config) -> None:
                 "counters": counters,
                 "resctrl": perf.resctrl_for_pid(pid),
             }
+
+        return await _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Measure one process over a window (as process_cpu, plus hardware counters when "
+            "available) and keep the key numbers in server memory under a token. Take one "
+            "before and one after a change, then call compare_process_snapshots. work_rate is "
+            "an optional number from your own metrics (requests/s, jobs/s); with it the "
+            "snapshot records cpu_seconds_per_unit_work."
+        ),
+    )
+    async def snapshot_process_metrics(
+        pid: PidArg,
+        window_s: WindowArg = DEFAULT_WINDOW,
+        work_rate: Annotated[
+            float | None, Field(description="Units of work per second during the window.")
+        ] = None,
+        label: Annotated[str | None, Field(description="Free text, e.g. 'before'.")] = None,
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            check_pid(config, pid)
+            if work_rate is not None and work_rate <= 0:
+                raise DiagnosticsRefused("invalid_argument", "work_rate must be positive")
+            m = await measure(pid, window_s, hw=True)
+            view = views.full_view(m)
+            view["hw"] = hw_block(m)
+            return store.put(pid, view, work_rate, (label or "")[:80] or None)
+
+        return await _guard(body)
+
+    @server.tool(
+        annotations=read_only,
+        description=(
+            "Compare two snapshots from snapshot_process_metrics: each metric before, after, "
+            "change and ratio. When both have work_rate: CPU seconds per unit of work before "
+            "and after, and cpu_per_unit_work_ratio (above 1 means CPU grew faster than work)."
+        ),
+    )
+    async def compare_process_snapshots(
+        before: Annotated[str, Field(description="Token of the earlier snapshot (pm-...).")],
+        after: Annotated[str, Field(description="Token of the later snapshot.")],
+    ) -> dict[str, Any]:
+        async def body() -> dict[str, Any]:
+            return windows.compare(store.get(before), store.get(after))
 
         return await _guard(body)
 
