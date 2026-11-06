@@ -11,6 +11,7 @@ mod allocations;
 mod analyze;
 mod diff;
 mod dump;
+mod flamegraph;
 mod query;
 mod record;
 
@@ -20,6 +21,7 @@ pub fn run(command: Command) -> anyhow::Result<()> {
         Command::Analyze(a) => analyze::run(a),
         Command::Query(a) => query::run(a),
         Command::Diff(a) => diff::run(a),
+        Command::Flamegraph(a) => flamegraph::run(a),
         Command::Record(a) => record::run(a),
     }
 }

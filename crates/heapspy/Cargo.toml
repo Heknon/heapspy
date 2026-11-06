@@ -19,6 +19,7 @@ heapspy-alloc.workspace = true
 heapspy-record.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+inferno.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
