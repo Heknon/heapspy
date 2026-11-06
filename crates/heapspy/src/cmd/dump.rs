@@ -20,6 +20,13 @@ pub fn run(args: DumpArgs) -> anyhow::Result<()> {
         .with_context(|| format!("cannot open {} {}", spec.kind(), spec.reference()))?;
     let stats = heapspy_reader::dump(src.as_ref(), &opts, &args.output)
         .with_context(|| format!("dump to {} failed", args.output.display()))?;
+    if stats.image_missing_bytes > 0 {
+        eprintln!(
+            "heapspy: warning: the image is missing {} bytes of memory its headers describe \
+             (cut short?); the snapshot is marked truncated",
+            stats.image_missing_bytes
+        );
+    }
     eprintln!(
         "wrote {}: {} objects, {} edges, {} roots, {} bytes{}",
         args.output.display(),
