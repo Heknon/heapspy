@@ -1,7 +1,8 @@
 """Helpers for driving the heapspy binary against victim processes.
 
 Everything platform-specific is in this file and kept to a few functions:
-``gcore`` (Linux), ``procdump`` (Windows) and ``acquisition_methods``.
+``gcore`` and the ELF rewrite (Linux), ``procdump`` (Windows),
+``acquisition_methods`` and ``SLEEPER``.
 """
 
 from __future__ import annotations
@@ -10,10 +11,11 @@ import contextlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,9 @@ IS_LINUX = sys.platform.startswith("linux")
 TIMEOUT = float(os.environ.get("HEAPSPY_E2E_TIMEOUT", "300"))
 # How long a victim may take to build its heap and write ready.json.
 READY_TIMEOUT = float(os.environ.get("HEAPSPY_E2E_READY_TIMEOUT", "180"))
+
+# A long-running process that is not Python.
+SLEEPER = ["ping", "-n", "600", "127.0.0.1"] if IS_WINDOWS else ["sleep", "600"]
 
 
 def acquisition_methods() -> list[str]:
@@ -302,3 +307,62 @@ def edges(hops: list[dict[str, Any]]) -> list[str]:
 def is_subsequence(needles: list[str], haystack: list[str]) -> bool:
     it = iter(haystack)
     return all(any(n == h for h in it) for n in needles)
+
+
+# -- core file surgery (Linux) ------------------------------------------------
+
+
+@dataclass
+class _Phdr:
+    raw: bytearray
+    p_type: int
+    offset: int
+    filesz: int
+    data: bytes = field(default=b"", repr=False)
+
+
+def kernel_layout_core(src: Path, dst: Path) -> list[tuple[int, int, int]]:
+    """Rewrite a gcore core so the PT_NOTE segment comes first, as in kernel cores.
+
+    gdb's gcore writes the notes after all memory segments, so cutting the
+    file anywhere removes them and heapspy stops at "PT_NOTE outside the file".
+    A core the kernel writes (and truncates at RLIMIT_CORE or a full disk) has
+    the notes first and loses memory segments instead. This produces that
+    layout from a gcore file. Returns ``(vaddr, file_offset, filesz)`` of each
+    PT_LOAD in the new file.
+    """
+    data = src.read_bytes()
+    assert data[:4] == b"\x7fELF" and data[4] == 2 and data[5] == 1, "64-bit LE ELF only"
+    (e_phoff,) = struct.unpack_from("<Q", data, 0x20)
+    e_phentsize, e_phnum = struct.unpack_from("<HH", data, 0x36)
+    phdrs = []
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        raw = bytearray(data[off : off + e_phentsize])
+        (p_type,) = struct.unpack_from("<I", raw, 0)
+        (p_offset,) = struct.unpack_from("<Q", raw, 8)
+        (p_filesz,) = struct.unpack_from("<Q", raw, 32)
+        phdrs.append(_Phdr(raw, p_type, p_offset, p_filesz, data[p_offset : p_offset + p_filesz]))
+    header_end = e_phoff + e_phnum * e_phentsize
+    ordered = [p for p in phdrs if p.p_type == 4] + [p for p in phdrs if p.p_type != 4]
+    pos = (header_end + 15) & ~15
+    body = bytearray()
+    loads = []
+    for p in ordered:
+        struct.pack_into("<Q", p.raw, 8, pos if p.filesz else 0)
+        if p.p_type == 1:
+            (vaddr,) = struct.unpack_from("<Q", p.raw, 16)
+            loads.append((vaddr, pos, p.filesz))
+        body += p.data
+        pos += p.filesz
+    out = bytearray(data[:header_end])
+    # Drop section headers (gcore writes a few); their offsets would be stale.
+    struct.pack_into("<Q", out, 0x28, 0)  # e_shoff
+    struct.pack_into("<HHH", out, 0x3A, 0, 0, 0)  # e_shentsize, e_shnum, e_shstrndx
+    for i, p in enumerate(phdrs):
+        off = e_phoff + i * e_phentsize
+        out[off : off + e_phentsize] = p.raw
+    out += b"\0" * (((header_end + 15) & ~15) - header_end)
+    out += body
+    dst.write_bytes(out)
+    return loads
