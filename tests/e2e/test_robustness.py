@@ -185,15 +185,19 @@ def test_pid_that_never_existed(heapspy, tmp_path) -> None:
 def test_permission_denied(heapspy, sleeper, tmp_path) -> None:
     """heapspy as ``nobody`` cannot ptrace a root process."""
     args = [str(heapspy.binary), "dump", f"--pid={sleeper.pid}", "-o", "/nonexistent/x.hpy"]
-    r = subprocess.run(
-        [*args, "--json"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        user=65534,
-        group=65534,
-        check=False,
-    )
+    try:
+        r = subprocess.run(
+            [*args, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            user=65534,
+            group=65534,
+            check=False,
+        )
+    except PermissionError as e:
+        # nobody cannot reach the binary (a build under a 0700 parent directory).
+        pytest.skip(f"user nobody cannot execute {heapspy.binary}: {e}")
     assert r.returncode == 1, (r.returncode, r.stderr)
     doc = json.loads(r.stdout)
     assert doc["error"]["code"] == "permission_denied", doc
