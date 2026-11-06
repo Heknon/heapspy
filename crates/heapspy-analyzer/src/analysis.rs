@@ -216,7 +216,7 @@ impl<'s> Analysis<'s> {
 
     /// Nodes on the BFS path to `v`, root object first, with the edge used to
     /// enter each. Empty if `v` is unreachable or the super-root.
-    fn bfs_chain(&self, v: u32) -> Vec<(u32, u32)> {
+    pub(crate) fn bfs_chain(&self, v: u32) -> Vec<(u32, u32)> {
         let mut chain = Vec::new();
         let mut x = v;
         while x != self.root() && self.via[x as usize] != NONE {
