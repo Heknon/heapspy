@@ -235,10 +235,14 @@ ENV_NO_HOST_CONTEXT = "HEAPSPY_MCP_NO_HOST_CONTEXT"
 ENV_PROC_ROOT = "HEAPSPY_MCP_PROC_ROOT"
 ENV_CGROUP_ROOT = "HEAPSPY_MCP_CGROUP_ROOT"
 ENV_MAX_STALL_RATE = "HEAPSPY_MCP_MAX_STALL_RATE"
+ENV_MAX_CMDLINE_CHARS = "HEAPSPY_MCP_MAX_CMDLINE_CHARS"
+ENV_ALLOW_LOAD_PROBES = "HEAPSPY_MCP_ALLOW_LOAD_PROBES"
 DEFAULT_WINDOW = 2.0
 DEFAULT_MAX_WINDOW = 10.0
 DEFAULT_MAX_STALL_RATE = 100.0
 MAX_STALL_RATE_LIMIT = 1000.0
+DEFAULT_MAX_CMDLINE_CHARS = 4096
+MAX_CMDLINE_CHARS_LIMIT = 131072
 
 
 @dataclass
@@ -247,13 +251,17 @@ class DiagnosticsConfig:
     host-wide figures (load, steal, host PSI) out of the process tools. ``proc_root``
     and ``cgroup_root`` point at a host ``/proc`` or cgroup v2 mount when the server
     sees them somewhere other than the usual place. ``max_stall_rate_hz`` caps the
-    per-thread sampling rate of ``watch_process_stalls``."""
+    per-thread sampling rate of ``watch_process_stalls`` and the other in-window
+    samplers. ``max_cmdline_chars`` caps the per-call ``cmdline_max_chars``.
+    ``allow_load_probes`` enables ``cache_sensitivity_probe``, which adds CPU load."""
 
     max_window_s: float = DEFAULT_MAX_WINDOW
     host_context: bool = True
     proc_root: Path = Path("/proc")
     cgroup_root: Path | None = None
     max_stall_rate_hz: float = DEFAULT_MAX_STALL_RATE
+    max_cmdline_chars: int = DEFAULT_MAX_CMDLINE_CHARS
+    allow_load_probes: bool = False
 
     @classmethod
     def from_sources(
@@ -264,6 +272,8 @@ class DiagnosticsConfig:
         proc_root: str | None = None,
         cgroup_root: str | None = None,
         max_stall_rate: float | None = None,
+        max_cmdline_chars: int | None = None,
+        allow_load_probes: bool = False,
         env: dict[str, str] | None = None,
     ) -> DiagnosticsConfig:
         env = dict(os.environ) if env is None else env
@@ -277,12 +287,22 @@ class DiagnosticsConfig:
         rate = max_stall_rate or _float_env(env, ENV_MAX_STALL_RATE, DEFAULT_MAX_STALL_RATE)
         if not 1 <= rate <= MAX_STALL_RATE_LIMIT:
             raise ConfigError(f"--max-stall-rate must be 1 to {MAX_STALL_RATE_LIMIT:g} Hz")
+        chars = max_cmdline_chars
+        if chars is None and env.get(ENV_MAX_CMDLINE_CHARS):
+            try:
+                chars = int(env[ENV_MAX_CMDLINE_CHARS])
+            except ValueError as e:
+                raise ConfigError(f"{ENV_MAX_CMDLINE_CHARS} must be a whole number") from e
+        if chars is not None and not 16 <= chars <= MAX_CMDLINE_CHARS_LIMIT:
+            raise ConfigError(f"--max-cmdline-chars must be 16 to {MAX_CMDLINE_CHARS_LIMIT}")
         return cls(
             max_window_s=max_window or _float_env(env, ENV_MAX_WINDOW, DEFAULT_MAX_WINDOW),
             host_context=not (no_host_context or parse_bool(env.get(ENV_NO_HOST_CONTEXT))),
             proc_root=Path(proc) if proc else Path("/proc"),
             cgroup_root=Path(cgroup) if cgroup else None,
             max_stall_rate_hz=rate,
+            max_cmdline_chars=chars or DEFAULT_MAX_CMDLINE_CHARS,
+            allow_load_probes=allow_load_probes or parse_bool(env.get(ENV_ALLOW_LOAD_PROBES)),
         )
 
 
@@ -311,8 +331,21 @@ def add_diagnostics_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-stall-rate",
         type=float,
         metavar="HZ",
-        help=f"cap on the per-thread sampling rate of watch_process_stalls "
-        f"(also ${ENV_MAX_STALL_RATE}; default {DEFAULT_MAX_STALL_RATE:g})",
+        help=f"cap on the per-thread sampling rate of watch_process_stalls and the other "
+        f"in-window samplers (also ${ENV_MAX_STALL_RATE}; default {DEFAULT_MAX_STALL_RATE:g})",
+    )
+    g.add_argument(
+        "--max-cmdline-chars",
+        type=int,
+        metavar="N",
+        help=f"cap on the cmdline_max_chars a tool call may ask for (also "
+        f"${ENV_MAX_CMDLINE_CHARS}; default {DEFAULT_MAX_CMDLINE_CHARS})",
+    )
+    g.add_argument(
+        "--allow-load-probes",
+        action="store_true",
+        help=f"enable cache_sensitivity_probe, which runs a benchmark that adds CPU load "
+        f"(also ${ENV_ALLOW_LOAD_PROBES}=1; off by default)",
     )
 
 
@@ -323,4 +356,6 @@ def diagnostics_from_args(args: argparse.Namespace) -> DiagnosticsConfig:
         proc_root=args.proc_root,
         cgroup_root=args.cgroup_root,
         max_stall_rate=getattr(args, "max_stall_rate", None),
+        max_cmdline_chars=getattr(args, "max_cmdline_chars", None),
+        allow_load_probes=bool(getattr(args, "allow_load_probes", False)),
     )

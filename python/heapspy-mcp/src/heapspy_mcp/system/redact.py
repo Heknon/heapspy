@@ -98,5 +98,8 @@ def redact_args(args: list[str]) -> list[str]:
 
 
 def redact_cmdline(args: list[str] | None, max_len: int) -> str:
+    """Redact, then join and cut to ``max_len`` characters, keeping the start (the
+    program and the leading arguments) and marking a cut with ``...``. Redaction runs
+    first so a cut never leaves part of a secret visible."""
     text = " ".join(redact_args(args or []))
-    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+    return text if len(text) <= max_len else text[: max(max_len - 3, 0)] + "..."
