@@ -86,7 +86,9 @@ Flags take precedence over environment variables.
 | `--no-host-context` | `HEAPSPY_MCP_NO_HOST_CONTEXT=1` | off | Leave host-wide load, steal and PSI out of the process tools' `environment` block. |
 | `--proc-root DIR` | `HEAPSPY_MCP_PROC_ROOT` | `/proc` | procfs to read. |
 | `--cgroup-root DIR` | `HEAPSPY_MCP_CGROUP_ROOT` | from `/proc/self/mountinfo` | A cgroup v2 mount to read instead, for example the host's cgroupfs mounted into a container. |
-| `--max-stall-rate HZ` | `HEAPSPY_MCP_MAX_STALL_RATE` | 100 | Cap on the per-thread sampling rate of `watch_process_stalls` (1 to 1000). |
+| `--max-stall-rate HZ` | `HEAPSPY_MCP_MAX_STALL_RATE` | 100 | Cap on the per-thread sampling rate of `watch_process_stalls`, and on the in-window sampling rates of `process_cpu`, `cpu_colocation` and `group_cpu` (1 to 1000). |
+| `--max-cmdline-chars N` | `HEAPSPY_MCP_MAX_CMDLINE_CHARS` | 4096 | Cap on the `cmdline_max_chars` a call may ask for (16 to 131072). |
+| `--allow-load-probes` | `HEAPSPY_MCP_ALLOW_LOAD_PROBES=1` | off | Enable `cache_sensitivity_probe`, which runs a benchmark that adds CPU load. |
 
 | `--py-spy-bin PATH` | `PY_SPY_BIN` | `py-spy` on `PATH`, else next to the server's Python | py-spy executable for the CPU tools. A configured path that is not executable stops the server at startup. If none is found the CPU tools return `py_spy_not_found`. |
 | `--cpu-max-duration SECONDS` | `HEAPSPY_MCP_CPU_MAX_DURATION` | 30 | Longest profile a CPU tool records (1 to 3600). Longer `duration_s` values are clamped, with a note in the result. |
@@ -297,11 +299,16 @@ to. The resource `heapspy://process-workflow` and the prompt
 2. `process_cpu(pid)` for one process and its environment.
 3. Process hangs or is intermittently slow? `watch_process_stalls(pid)`, then
    `diagnose_process(pid)`.
-4. `hw_counters(pid)` for IPC and cache misses, where a PMU exists.
-5. `diagnose_process(pid)` to weigh explanations against one window of numbers.
-6. `snapshot_process_metrics` before and after a change, then
-   `compare_process_snapshots`.
-7. For Python processes, the heap tools above.
+4. Many processes on few CPUs, or sibling workers that behave differently?
+   `cpu_colocation` for who shares the target's CPUs, and `group_cpu` to
+   measure a set of processes at once and compare services.
+5. `hw_counters(pid)` for IPC and cache misses, where a PMU exists; without
+   one, its `software_fallback` and the opt-in `cache_sensitivity_probe`.
+6. `diagnose_process(pid)` to weigh explanations against one window of numbers.
+7. `snapshot_process_metrics` or `snapshot_group_metrics` before and after a
+   change, then `compare_process_snapshots`; with three or more settings,
+   `fit_per_slice_cost`.
+8. For Python processes, the heap tools above.
 
 Conventions:
 
@@ -316,8 +323,14 @@ Conventions:
   levels. Sampling reads at most 1024 threads per process in `process_cpu`,
   64 per process and 20000 in total in a scan, 128 threads in `hw_counters`,
   and 64 threads in `watch_process_stalls` (20 thread rows, 10 intervals per
-  process, 3 per thread, 8 frames per example stack); the result says when it
-  truncated.
+  process, 3 per thread, 8 frames per example stack). `cpu_colocation` lists at
+  most 8192 host tasks, tracks at most 512 that ran, and takes at most 64
+  target pids; `group_cpu` measures at most 256 members, 64 threads each, in at
+  most 32 groups. The result says when it truncated.
+- In-window samplers keep to a budget: 5000 thread samples per second for
+  `process_cpu` and `group_cpu`, 20000 task samples per second for
+  `cpu_colocation`. With more threads the rate is lowered and the result
+  says so (`rate_note`).
 
 ### Process search
 
@@ -343,7 +356,9 @@ name), `cmdline` (substring), `cmdline_regex`, `user` (name or uid), `pids`,
 `parent_pid` with `include_descendants`, `cgroup` (substring of the path),
 `container_id` (prefix), `pod_uid`, `state` (`/proc` state letters, e.g. `D`),
 `is_python`, `include_kernel_threads`. `window_s=0` gives an instant listing
-with the rate metrics `null`. Each row has `pid`, `ppid`, `comm`, `exe`,
+with the rate metrics `null`. `cmdline_max_chars` (default 200, capped by
+`--max-cmdline-chars`) sets how much of each redacted command line is
+returned; the start is kept. `scan_processes` takes it too. Each row has `pid`, `ppid`, `comm`, `exe`,
 redacted `cmdline`, `user`, `state`, `cgroup`, `kubernetes` (pod UID, QoS
 class, container id) and `metrics`.
 
@@ -392,10 +407,15 @@ processes added), outside the window's sleeps: 0.29 to 0.32 s of CPU and
 wall time per call before the memory conditions were added, 0.30 to 0.31 s
 after, with 6 distinct cgroups read.
 
-### `process_cpu(pid, window_s=2, top_threads=5)`
+### `process_cpu(pid, window_s=2, top_threads=5, wait_sample_rate_hz=50)`
 
-Samples the process and its threads at the start and end of the window and
-four times inside it.
+Samples the process and its threads at the start and end of the window.
+Inside it, thread states and wait sites are sampled at `wait_sample_rate_hz`
+(capped by `--max-stall-rate` and the thread-sample budget), and the host's
+runnable count four times. `measurement.wait_site_sampling` gives the rate
+used, the sample count and late samples. Four samples in a window were too
+few: in the CPU-contention blind test (end of this file), a worker asleep
+about 28% of the time showed no sleeping samples.
 
 - `cpu`: `cpu_seconds_user`, `cpu_seconds_system`, `cpu_cores_used`,
   `cpu_percent_on_cpu`, `user_share`.
@@ -407,8 +427,14 @@ four times inside it.
 - `scheduler`: `on_cpu_seconds`, `runqueue_wait_seconds` and
   `runqueue_wait_ratio` (time runnable but waiting for a CPU, over time on CPU,
   from `/proc/<pid>/task/*/schedstat`), `runqueue_wait_seconds_per_s` (mean
-  number of the process's threads waiting), `timeslices_per_s`,
-  `cpu_migrations_per_s` (`se.nr_migrations`, needs `CONFIG_SCHED_DEBUG`).
+  number of the process's threads waiting), `on_cpu_seconds_per_s`,
+  `timeslices_per_s` (schedstat field 3, `pcount`), `cpu_migrations_per_s`
+  (`se.nr_migrations`, needs `CONFIG_SCHED_DEBUG`), `avg_timeslice_us`
+  (on-CPU time / timeslices; on-CPU time / switches, and said so, where
+  there is no timeslice count), `sched_slice_us` (`se.slice` from
+  `/proc/<tid>/sched` on 6.6+; otherwise debugfs `base_slice_ns`, the sysctl,
+  or the EEVDF default for the running kernel, marked as an estimate) and
+  `avg_timeslice_to_sched_slice_ratio`.
 - `page_faults`: major and minor faults per second.
 - `threads`: count, `threads_by_state`, `state_share_over_window`, started and
   exited in the window.
@@ -460,6 +486,15 @@ devices that do exist, `EACCES`/`EPERM` with `perf_event_paranoid` and the
 capability needed (`CAP_PERFMON` on 5.8+, `CAP_SYS_ADMIN` before), `ENOENT`
 for an event this PMU lacks, and so on. Software events are still reported.
 
+When IPC or LLC misses are `null`, `software_fallback` lists what can be
+measured instead over the same window: the perf software events
+(`context_switches_per_s`, `context_switches_per_cpu_second`,
+`cpu_migrations_per_s`), and from `/proc/<tid>/schedstat` `on_cpu_seconds_per_s`,
+`timeslices_per_s`, `avg_timeslice_us`, `switches_per_cpu_second`,
+`voluntary_share` and `runqueue_wait_ratio`. `see_also` points to
+`cpu_colocation`, `fit_per_slice_cost` and `cache_sensitivity_probe`, and says
+whether the probe is enabled on this server.
+
 If `/sys/fs/resctrl` is mounted and the pid is in a resctrl group, `resctrl`
 reports that group's L3 occupancy and cumulative memory-bandwidth bytes. These
 cover every task in the group. The tool never creates a group. Per-process
@@ -478,6 +513,153 @@ The comparison gives each metric `before`, `after`, `change` and
 `work_rate_ratio`, `cpu_cores_ratio` and `cpu_per_unit_work_ratio`. A value
 above 1 means CPU grew faster than work between the windows: the pattern to
 look for when a feedback loop is suspected.
+
+Process snapshots also keep `on_cpu_seconds_per_s`, `timeslices_per_s`,
+`avg_timeslice_us` and `sched_slice_us`. `compare_process_snapshots` also
+takes two group snapshots (below) and then compares per group key.
+
+### `cpu_colocation(pid | pids | name | cmdline | ..., window_s=2, rate_hz=50, colocated_per_cpu=10)`
+
+Which tasks shared CPUs with a target over the window, and how often they
+woke. It answers what `runqueue_contention` alone does not: who preempts whom
+and why per-unit CPU changed.
+
+At the start it reads `stat`, `status` and `schedstat` of every task on the
+host. Every task that runs in the window (its on-CPU time advanced, checked
+every 0.5 s, or it was runnable) is then sampled at `rate_hz` for its state
+and the CPU it last ran on (`/proc/<pid>/task/<tid>/stat` field 39; for a
+runnable task, the run queue it waits on). At the end it reads `stat`,
+`status`, `schedstat` and `sched` (for `se.slice`) of those tasks. The
+server's own process is left out.
+
+- `target_tasks`: per target thread, `home_cpu` (where most samples were),
+  samples per CPU and runnable samples per CPU, `cpus_allowed`
+  (`Cpus_allowed_list`), on-CPU and run-queue wait per second, voluntary and
+  non-voluntary switches per second, `timeslices_per_s`, `avg_timeslice_us`
+  with its source, `sched_slice_us`, `avg_sleep_us` and `short_sleeper`.
+- `cpus`: for each CPU the targets ran on or may run on: target tasks and other
+  busy tasks with that home CPU, `mean_runnable_tasks`, on-CPU and run-queue
+  wait per second, voluntary and non-voluntary switches per second,
+  `wakeups_per_s`, `colocated_wakeups_per_s` (non-target tasks only),
+  `colocated_short_sleeper_wakeup_share`, the targets' non-voluntary switches
+  there, `target_preemptions_per_colocated_wakeup`, and the co-located tasks
+  (by their on-CPU time there) with the same per-task fields. A task's rates
+  are spread over CPUs in proportion to its samples on each.
+- `placement`: target and other busy tasks per CPU, mean runnable tasks per
+  CPU, and the imbalance (`runnable_max_minus_min`, `runnable_max_to_min_ratio`,
+  `runnable_cv`, `busy_tasks_max_minus_min`).
+- `wakeup_preemption_attribution`: labelled `inference`. A task's voluntary
+  switches are taken as its wakeups: each voluntary switch is a sleep, and
+  each sleep ends in a wakeup. Per target thread, its non-voluntary switches
+  (also per second on CPU) next to the co-located wakeups on its home CPU; the
+  totals on the target CPUs; the share from short sleepers; the Pearson
+  correlation across target threads between non-voluntary switches per second
+  on CPU and co-located wakeups (per second on CPU, because a wakeup can only
+  preempt the task that is running); and the top short sleepers. A short
+  sleeper wakes at least 100 times a second and sleeps under 1 ms per wakeup
+  on average, where sleep is the window minus on-CPU time minus run-queue wait
+  (this needs no `CONFIG_SCHEDSTATS`). No trace is taken of which wakeup
+  preempted which task.
+- `cost`: tasks listed and tracked, rescans, the sampler's CPU seconds, and the
+  files read.
+
+The selector takes the `find_processes` filters: `pid`, `pids`, `name`,
+`cmdline`, `cmdline_regex`, `parent_pid`, `cgroup`, `pod_uid`,
+`container_id`. All threads of the matching processes are targets.
+
+### `group_cpu(selector..., group_by="none", group_regex?, window_s=2, rate_hz=20, work_rate?, work_rates?, include_members=true)`
+
+Measures a set of processes over one window, as `process_cpu` measures one.
+A single-pid view hid that sibling workers of one service behaved very
+differently; this one shows them side by side.
+
+- `member_rows`: per member `cpu_cores_used`, `on_cpu_seconds_per_s`, user and
+  system CPU per second, voluntary and non-voluntary switches per second,
+  `voluntary_share`, `switches_per_cpu_second`, run-queue wait per second and
+  ratio, `timeslices_per_s`, `avg_timeslice_us`, `cpu_migrations_per_s`, major
+  and minor faults per second, `threads`, `runnable_share` (share of in-window
+  thread samples in state R), `home_cpu`, samples per CPU and `cpus_allowed`.
+- `groups`: per group key, for every metric above: `sum` (for rates that add
+  up; `null` for ratios), `mean`, `p50`, `p90`, `min`, `max`, `spread` (max
+  minus min), `max_to_min_ratio` and `cv`; for ratios also `pooled`, recomputed
+  from the members' summed counts (for example `avg_timeslice_us` = total
+  on-CPU time / total timeslices). `placement` gives members per home CPU and
+  mean runnable member threads per CPU.
+- `comparison`: with two or more groups, each group's per-member mean or
+  pooled ratio side by side.
+- `work`: with `work_rate` (one group) or `work_rates` (group key to units per
+  second): `cpu_seconds_per_unit_work` (from schedstat on-CPU time, or clock
+  ticks without schedstat), `timeslices_per_unit_work` and
+  `units_of_work_per_timeslice`.
+
+`group_by`: `none`, `comm`, `exe`, `parent`, `cgroup`, `pod`, `container`,
+`cmdline_arg:N` (the Nth argument of the redacted command line, 0 being the
+program), or `cmdline_regex` with `group_regex` (its first capture group,
+searched in the redacted command line). The selector takes the
+`find_processes` filters. The server's own process is left out.
+
+### `snapshot_group_metrics(selector..., group_by, work_rate?, work_rates?, label?)` and `fit_per_slice_cost(tokens, group?, work_rates?)`
+
+`snapshot_group_metrics` measures as `group_cpu` does and keeps each group's
+numbers under a token (`pg-...`, in the same store as process snapshots).
+Compare two with `compare_process_snapshots`.
+
+`fit_per_slice_cost` takes three or more snapshots of one process or one group
+taken at different settings (CPU count, co-location, slice length) and fits
+
+    cpu_seconds_per_unit_work = a + b * timeslices_per_unit_work
+
+which is the same as `a + b / units_of_work_per_timeslice`. `b`, reported as
+`fixed_cost_per_timeslice_us`, is CPU each timeslice costs on top of the work
+in it, for example refilling caches after other tasks ran; `a`,
+`cost_per_unit_work_without_slicing_us`, is the cost with infinitely long
+slices. The result has standard errors, R squared, residuals per point and
+the largest residual as a share, and each point with its work rate, CPU per
+unit of work, average timeslice and timeslices per second. With fewer than
+three usable points it warns; with all points at the same timeslices per unit
+of work, or a negative slope, it says the model does not describe them.
+`work_rates` (token to units per second) supplies the rate for snapshots whose
+rate was known only after the window.
+
+### `cache_sensitivity_probe(confirm, mode="synthetic", pid?, cpu?, sizes_bytes?, phase_s=1, neighbour_bytes?)`
+
+For hosts without hardware counters. Off unless the server runs with
+`--allow-load-probes`, and every call needs `confirm=true`; without it the
+result is `confirmation_required` with the plan (CPUs, sizes, longest
+duration). It is the one process-diagnostics tool that is not read-only.
+
+It runs a small benchmark in separate processes and never attaches to, reads
+or signals the target. Per working-set size it walks a random linked list of
+64-byte nodes (one dependent load per cache line) pinned to one CPU, first
+alone and then shared:
+
+- `mode="synthetic"`: two neighbours pinned to the same CPU, one walking a
+  large buffer (default 4 x L2, at least 8 MiB) that evicts the probe's
+  working set from the per-core caches, and one that sleeps about 50 us
+  between short bursts, so its wakeups preempt the probe.
+- `mode="colocated"`: the shared phase runs on the CPU where `pid` ran most
+  (the pid must be on the allowlist), against the target's co-located tasks;
+  the alone phase runs on another CPU.
+
+Throughput is measured per second of the probe's own CPU time, so the share
+of the CPU it gets does not count. Per size: `ns_per_access` alone and shared,
+`slowdown_ratio`, the probe's timeslices per second and average timeslice
+(from its own `/proc/thread-self/schedstat`), and `extra_cpu_us_per_timeslice`,
+an estimate of the refill per slice to compare with
+`fixed_cost_per_timeslice_us`. Sizes default to the host's caches from
+`/sys/devices/system/cpu/cpu0/cache/`: L1d / 3 (at most 16 KiB), L2 / 2,
+L2 x 3/4, L2 x 4, and L3 x 2 when that is at most 64 MiB.
+
+It measures how sensitive a synthetic workload of a given size is to cache
+sharing on this host. It does not measure the target's cache misses. It adds
+up to one CPU of load on the chosen CPU for at most 2 x sizes x `phase_s`
+seconds (at most 6 sizes, `phase_s` at most 3). The benchmark is C, built
+once per server process with the host's C compiler into a temporary directory;
+without a compiler it falls back to the same walk in Python, whose interpreter
+overhead per access hides much of the difference. Every child process is
+killed on every exit path. Refusals are `diagnostics_refused` with reason
+`load_probes_disabled`, `confirmation_required` or `invalid_argument`; a
+benchmark that fails returns `probe_failed`.
 
 ### `watch_process_stalls(pid, window_s=5, rate_hz=20)`
 
@@ -595,12 +777,14 @@ dominant category `stopped_or_frozen`, not a memory one.
 
 Measures the process, its environment and its hardware counters in one
 window and, side by side in the same window, samples its threads as
-`watch_process_stalls` does at 10 Hz. It then checks one fact and scores
+`watch_process_stalls` does at 10 Hz and its CPUs as `cpu_colocation` does at
+20 Hz. It then checks one fact and scores
 these explanations for its CPU use, CPU wait, slowness or stalls:
 
 | id | What it describes |
 |---|---|
 | `runqueue_contention` | runnable threads waiting for a CPU |
+| `short_timeslices` | timeslices far shorter than the scheduler slice, ending in preemption, with frequent wakeups of co-located tasks |
 | `cache_or_memory_bound_contention` | low IPC with many LLC misses |
 | `cfs_throttling` | the cgroup or an ancestor hits its quota |
 | `lock_contention` | frequent blocking and waking, mostly in futex |
@@ -625,6 +809,27 @@ the same PSI and fault evidence twice. With per-thread categories,
 samples in page faults are memory waits. Refault and `memory.stat` counters
 cover every process in the cgroup; the wait share is the process's own.
 
+A thread that is runnable but not running is starved, not idle. When
+`runqueue_wait_ratio` is at least 0.2 or the thread was in state R in at least
+90% of samples (`runnable_share`), `spin_waiting_or_compute` judges busy and
+idle by `cpu_demand_cores` (on-CPU time plus run-queue wait, per second)
+instead of `cpu_cores_used`, and `runqueue_contention` gets evidence for from
+the runnable share. When `voluntary_share` is under 0.5, most switches are
+preemptions, so a high `switches_per_cpu_second` no longer counts against
+compute or for lock contention. In the blind test, a starved worker using
+0.151 cores with a run-queue wait ratio of 5.6 had compute marked
+`not_indicated` as mostly idle; it now counts 1.0 cores of demand.
+
+`short_timeslices` reads `avg_timeslice_to_sched_slice_ratio` (under 0.1
+scores 3, under 0.25 scores 2, 0.5 or more is against), `voluntary_share`
+(under 0.5 for: slices end in preemption; 0.7 or more against: the threads
+block on their own), `colocated_wakeups_per_s` (1000 or more) and
+`colocated_short_sleeper_wakeup_share` (0.5 or more). Its next measurements
+are `cpu_colocation`, moving the co-located short sleepers to a separate
+cpuset and comparing CPU per unit of work, comparing CPU per unit of work at
+different slice lengths with `fit_per_slice_cost`, and, without a PMU,
+`cache_sensitivity_probe`.
+
 `fact_checks` comes first. `deliberately_frozen` is true when the process's
 cgroup is frozen or at least 90% of thread samples were stopped or frozen.
 Then the result says that the explanations are moot until the process is
@@ -635,7 +840,9 @@ thawed or continued, every hypothesis carries `moot_because`, and
 all are measured. `diagnose_process_cpu` is the same tool with
 `focus="all"`, kept under its earlier name. Besides the hypotheses the result
 has `signals`, `memory_stalls` (the stall numbers that were scored, the 3
-longest no-progress intervals, `frozen_or_stopped`), and
+longest no-progress intervals, `frozen_or_stopped`), `colocation` (the
+co-location numbers that were scored, with the top 3 co-located tasks per
+CPU), and
 `environment.cgroup_memory` and `environment.host_memory` as in
 `watch_process_stalls`.
 
@@ -661,6 +868,11 @@ All thresholds are in one table, `THRESHOLDS` in
 |---|---|---|
 | Voluntary vs non-voluntary switches | `voluntary_share`, `*_switches_per_s` | blocking (locks, I/O, GIL) vs preemption (CPU contention, quota) |
 | Run-queue wait | `runqueue_wait_ratio` | waiting for a CPU vs running |
+| Runnable share and CPU demand | `runnable_share`, `cpu_demand_cores` | a starved thread vs an idle one |
+| Average timeslice vs scheduler slice | `avg_timeslice_us`, `sched_slice_us` | slices cut short by preemption vs full slices |
+| Co-located wakeups | `colocated_wakeups_per_s`, `colocated_short_sleeper_wakeup_share` | preemption by short sleepers on the same CPU vs by other CPU-bound tasks |
+| Placement | `placement` in `cpu_colocation` and `group_cpu` | uneven spread of tasks over CPUs vs an even one |
+| Per-slice cost | `fixed_cost_per_timeslice_us` | CPU per unit of work that rises with slicing vs a fixed cost per unit |
 | Host runnable per core | `procs_running_per_core` | host-wide CPU contention vs a quota on an otherwise idle host |
 | PSI cpu, memory, io | `psi`, `pressure` | CPU vs memory vs I/O stalls, host and cgroup |
 | CFS throttling | `cfs_throttled_ratio`, `throttled_seconds_per_s` | quota limits vs host contention |
@@ -679,11 +891,17 @@ All thresholds are in one table, `THRESHOLDS` in
 
 ### Safety and access
 
-All of these tools are read-only.
+All of these tools are read-only except `cache_sensitivity_probe`, which
+starts benchmark processes and is off by default.
 
-- `find_processes` and `scan_processes` read the same `/proc` metadata that
-  `ps` and `top` show, and are open without the allowlist, so an agent can find
-  the process to look at. Command lines are redacted.
+- `find_processes`, `scan_processes`, `cpu_colocation` and `group_cpu` read the
+  same per-task `/proc` files that `ps` and `top` show (`stat`, `status`,
+  `schedstat`, `sched`, `cgroup`), and are open without the allowlist, so an
+  agent can find the process to look at. They do not read wait channels,
+  syscalls or stacks. Command lines are redacted.
+- `cache_sensitivity_probe` needs `--allow-load-probes` on the server and
+  `confirm=true` on the call; with `mode="colocated"` the pid must also be on
+  the allowlist. It never touches the target.
 - `process_cpu`, `hw_counters`, `snapshot_process_metrics`,
   `watch_process_stalls`, `diagnose_process` and `diagnose_process_cpu` read
   one process in depth (its threads' wait channels, kernel stacks and
@@ -704,8 +922,12 @@ All of these tools are read-only.
 ### Command-line redaction
 
 Command lines returned by `find_processes`, `scan_processes` and
-`list_python_processes` pass through a best-effort filter
-(`src/heapspy_mcp/system/redact.py`) before truncation. It replaces with
+`list_python_processes`, `cpu_colocation` and `group_cpu` pass through a
+best-effort filter (`src/heapspy_mcp/system/redact.py`) before truncation,
+so a cut never leaves part of a secret. Truncation keeps the start (the
+program and the leading arguments); `cmdline_max_chars` sets the length per
+call, up to `--max-cmdline-chars`. `group_by="cmdline_arg:N"` and
+`cmdline_regex` read the redacted command line too. It replaces with
 `<redacted>`: values of options whose name looks secret (`--password=x`,
 `--token x`, `--api-key`, `--client-secret`), `NAME=value` pairs with a secret
 name (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*PASSWORD*`), `Authorization:` and
@@ -721,13 +943,13 @@ to publish.
 | Pod without host access | Processes in the pod's own PID namespace, the pod's cgroup, host `/proc/stat` and PSI (not namespaced) | Other pods' processes; `perf_event_open` without `PERFMON` |
 | Sidecar with `shareProcessNamespace: true` | The other containers of the pod, with `SYS_PTRACE` | Other pods |
 | Node agent (DaemonSet, `hostPID: true`) | Every process on the node, its cgroup, pod UID and container id; add `--cgroup-root` with the host cgroupfs mounted if the container's cgroup namespace hides it | Pod names (only UIDs) |
-| VM without a PMU | Everything except hardware counters, which are `null` with `no PMU exposed (common in VMs)`; `cache_or_memory_bound_contention` is then `insufficient_signals` | IPC, LLC misses |
+| VM without a PMU | Everything except hardware counters, which are `null` with `no PMU exposed (common in VMs)`; `cache_or_memory_bound_contention` is then `insufficient_signals`. `hw_counters` returns `software_fallback`, and `cache_sensitivity_probe` (opt-in) measures this host's cache sensitivity with a synthetic workload | IPC, LLC misses |
 
 Kernel features that change what is available, each reported as a reason when
 missing: delay accounting (`kernel.task_delayacct`) for iowait and the
 stall delays, `CONFIG_TASKSTATS` and `CAP_NET_ADMIN` for the taskstats
 delays, `CONFIG_SCHEDSTATS` for `/proc/schedstat`, `CONFIG_SCHED_DEBUG` for
-`se.nr_migrations`, PSI (`psi=1`) for pressure files, root
+`se.nr_migrations` and `se.slice` (6.6+ for `se.slice`), PSI (`psi=1`) for pressure files, root
 (`CAP_SYS_ADMIN`) and `CONFIG_STACKTRACE` for `/proc/<tid>/stack`, and a v2
 hierarchy (unified or hybrid) for cgroup memory pressure and the v2 freezer.
 
@@ -977,6 +1199,18 @@ the sampler, and live tests in `tests/test_stalls_live.py` (root only). They
 create their own cgroups and a 256 MiB temporary file, and remove both on
 every path. `uv run pytest -s tests/test_stalls_live.py` prints the numbers.
 
+The contention tools have parser tests for `/proc/<pid>/task/<tid>/stat`
+field 39, schedstat `pcount`, `/proc/<pid>/sched` from a 6.18 kernel (with
+`se.slice`) and a 5.15-style one (without), CPU lists and a fake sysfs cache
+tree (`tests/test_contention_parsers.py`); the co-location math on a fake
+`/proc` (`tests/test_colocation.py`); the group aggregation
+(`tests/test_groups.py`); the fit on exact and degenerate points
+(`tests/test_slice_fit.py`); the starvation gating and `short_timeslices`,
+including a regression test on the signals of the starved worker from the
+blind test (`tests/test_diagnose_contention.py`); and the tools through the
+server (`tests/test_contention_tools.py`). The live re-test of the blind
+test is described at the end of this file.
+
 The thrash in those tests is file-backed, since the development VM has no
 swap: a process maps the file and reads one byte of each page in a fixed
 random order inside a memory cgroup limited to 64 MiB. Three things were
@@ -1046,3 +1280,30 @@ the three versions:
   accounting is off on this VM, so `iowait_seconds` was `null`. In some runs
   `cpu_stacks` showed the thread idle with state R, because it woke up between
   py-spy's read and the `/proc` read.
+
+### Live re-test of the CPU-contention blind test
+
+`tests/test_contention_live.py` (root only, needs a C compiler and 4 CPUs)
+re-runs the scenario of a blind test in which an agent, given only "CPU went
+to 100% after capacity was halved, and context switches were high", found the
+mechanism partly with scripts of its own. It builds `tests/contention_worker.c`
+into a temporary directory and starts two services: `api`, 8 workers each
+walking a 1.5 MiB working set at 6500 requests/s offered, and `edge`, 4
+workers with a 16 KiB working set that sleep on short timers at 20000
+requests/s offered. `cores(k)` pins every worker to CPUs 0 to k-1. Each check
+takes medians over repeats. `uv run pytest -s tests/test_contention_live.py`
+prints the numbers. On the development VM (Linux 6.18, 4 vCPUs, L2 2 MiB per
+core, `se.slice` 2.1 ms, shared with other work), over five runs:
+
+| Check | Result |
+|---|---|
+| `group_cpu` at 2 cores, api | `voluntary_share` 0.002 to 0.039; pooled `avg_timeslice_us` 170 to 327; `runnable_share` 1.0; non-voluntary switches 580 to 1150/s per worker, max/min across workers 1.1 to 33 |
+| `group_cpu` at 2 cores, edge | `voluntary_share` 0.998 to 1.0; `avg_timeslice_us` 22 to 28; 3900 to 4600 voluntary switches/s per worker; `runnable_share` 0.67 to 0.73 |
+| `cpu_colocation` at 2 cores, api as targets | placement 4+4 api workers in most runs, 5+3 in one; edge split 2+2, 3+1 or 4+0; co-located wakeups 4000 to 17000/s on CPUs with edge workers, 9/s on the CPU without; short-sleeper share 0.998; `target_preemptions_per_colocated_wakeup` 0.26 to 1.01; the top short sleepers are the edge workers |
+| `fit_per_slice_cost` over 1, 2 and 4 cores (two orders per run, four runs) | `fixed_cost_per_timeslice_us` 39 to 79 (run medians 70, 71, 43, 56); per request without slicing 25 to 44 us; R squared 0.63 to 0.996 |
+| `diagnose_process` on a starved api worker at 2 cores | `cpu_cores_used` 0.17 to 0.29 with `runqueue_wait_ratio` 2.5 to 4.8 and `runnable_share` 1.0; `runqueue_contention` 7, `short_timeslices` 6 (average slice 146 to 168 us of 2100, 5200 to 14000 co-located wakeups/s, short-sleeper share 0.997 to 0.998), `spin_waiting_or_compute` partly consistent with no idle evidence against |
+| `cache_sensitivity_probe`, synthetic, CPU 3 | 16 KiB: slowdown 1.09 to 1.12, 11 to 14 us extra per slice; 1.5 MiB: slowdown 1.6 to 5.2, 50 to 111 us extra per slice, at 130 to 139 us slices |
+
+The blind test measured about 70 us of refill per api slice. The fit and the
+probe give the same order of magnitude; runs with other load on the VM give
+the lower fitted costs and the lower R squared.
