@@ -8,10 +8,14 @@
 //! gives the dominator tree; retained sizes are dominator-subtree sums; a BFS
 //! from the super-root gives shortest retaining paths. All per-object state
 //! is flat `u32`/`u64` arrays indexed by object index.
+//!
+//! [`folded_stacks`] turns the dominator tree into folded stacks for a
+//! retention flame graph; see the [`flame`] module.
 
 mod analysis;
 mod diff;
 mod dominators;
+pub mod flame;
 mod graph;
 mod notes;
 mod query;
@@ -21,6 +25,7 @@ pub mod report;
 use heapspy_snapshot::Snapshot;
 
 use analysis::Analysis;
+pub use flame::{folded_stacks, FlameOptions, FoldedLine, FoldedStacks, MinWidth};
 use report::{
     Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryTotals, Retainer, RetainingPathReport,
     SchemaVersion, SnapshotSummary, SourceRef, Totals, TypeQueryReport,
