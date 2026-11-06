@@ -5,6 +5,8 @@
 //! The analysis functions are **stubs** that return [`Error::Unimplemented`];
 //! [`snapshot_summary`] is implemented.
 
+mod dominators;
+mod graph;
 pub mod render;
 pub mod report;
 
