@@ -1,4 +1,5 @@
-"""Source locations from heapspy reports in the analysis tools' summaries.
+"""Source locations from heapspy reports in the analysis tools' summaries, and
+map_to_source's exact resolution through ``query --locate``.
 
 The fake heapspy prints docs/examples, which have the location fields; in
 ``old_binary`` mode it removes them, as a heapspy from before them would.
@@ -6,6 +7,7 @@ The fake heapspy prints docs/examples, which have the location fields; in
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -105,6 +107,118 @@ async def test_old_binary_summaries_are_unchanged(
     assert "type_location" not in target
     assert "source_loc" not in target["paths"][0]["hops"][0]
     assert "source_locations" not in target["paths"][0]
+
+
+MAIN_SCRIPT = (
+    "import time\n"
+    "\n"
+    "\n"
+    "class Session:\n"
+    "    def __init__(self):\n"
+    "        self.items = []\n"
+    "\n"
+    "\n"
+    'if __name__ == "__main__":\n'
+    "    Session()\n"
+)
+
+
+@pytest.fixture
+def two_scripts(tmp_path: Path) -> Path:
+    """A repository with two scripts that both define Session at line 4."""
+    repo = tmp_path / "repo"
+    for name in ("a_first.py", "b_second.py"):
+        (repo / "jobs").mkdir(parents=True, exist_ok=True)
+        (repo / "jobs" / name).write_text(MAIN_SCRIPT)
+    return repo
+
+
+def locate_table(monkeypatch: pytest.MonkeyPatch, table: dict) -> None:
+    monkeypatch.setenv("FAKE_HEAPSPY_LOCATE", json.dumps(table))
+
+
+def session_match(file: str) -> dict:
+    return {
+        "kind": "type",
+        "name": "__main__.Session",
+        "module": "__main__",
+        "qualname": "Session",
+        "address": "0x7f0000005000",
+        "source_loc": {"file": file, "line": 5, "exact": False, "via": "methods"},
+        "source_loc_reason": None,
+    }
+
+
+async def test_map_to_source_with_snapshot_is_exact(
+    call, snap_file: Path, two_scripts: Path, monkeypatch: pytest.MonkeyPatch, argv_log
+) -> None:
+    recorded = str(two_scripts / "jobs" / "b_second.py")
+    locate_table(monkeypatch, {"__main__.Session": [session_match(recorded)]})
+    args = {"qualname": "__main__.Session", "repo_path": str(two_scripts)}
+    err, out = await call("map_to_source", {**args, "snapshot": str(snap_file)})
+    assert not err, out
+    assert argv_log()[-1] == ["query", str(snap_file), "--locate=__main__.Session", "--json"]
+    assert out["heuristic"] is False and out["via"] == "snapshot"
+    assert [c["location"] for c in out["candidates"]] == ["jobs/b_second.py:4"]
+    assert out["candidates"][0]["matched_by"] == "exact_path"
+
+    # Without the snapshot, both scripts are heuristic candidates.
+    err, out = await call("map_to_source", args)
+    assert not err, out
+    assert out["heuristic"] is True
+    assert len(out["candidates"]) == 2
+
+
+async def test_map_to_source_name_not_in_snapshot_falls_back(
+    call, snap_file: Path, two_scripts: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    locate_table(monkeypatch, {})
+    args = {"qualname": "__main__.Session", "repo_path": str(two_scripts)}
+    err, out = await call("map_to_source", {**args, "snapshot": str(snap_file)})
+    assert not err, out
+    assert out["heuristic"] is True
+    assert out["snapshot_lookup"]["status"] == "not_in_snapshot"
+    assert len(out["candidates"]) == 2
+
+
+async def test_map_to_source_old_binary_is_unchanged(
+    call, snap_file: Path, two_scripts: Path, monkeypatch: pytest.MonkeyPatch, argv_log
+) -> None:
+    args = {"qualname": "__main__.Session", "repo_path": str(two_scripts)}
+    err, before = await call("map_to_source", args)
+    assert not err, before
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", "old_binary")
+    err, out = await call("map_to_source", {**args, "snapshot": str(snap_file)})
+    assert not err, out
+    assert argv_log()[-1][2] == "--locate=__main__.Session"
+    assert out == before
+
+
+async def test_map_to_source_checks_arguments_before_running_heapspy(
+    call, snap_file: Path, two_scripts: Path, argv_log
+) -> None:
+    err, out = await call(
+        "map_to_source",
+        {"qualname": "../etc", "repo_path": str(two_scripts), "snapshot": str(snap_file)},
+    )
+    assert err and out["error"]["code"] == "invalid_argument"
+    err, out = await call(
+        "map_to_source",
+        {"qualname": "a.B", "repo_path": str(two_scripts), "snapshot": "hs-ffffffff"},
+    )
+    assert err and out["error"]["code"] == "invalid_argument"
+    assert argv_log() == []
+
+
+async def test_map_to_source_snapshot_errors_are_reported(
+    call, snap_file: Path, two_scripts: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_HEAPSPY_MODE", "error:invalid_snapshot")
+    err, out = await call(
+        "map_to_source",
+        {"qualname": "a.B", "repo_path": str(two_scripts), "snapshot": str(snap_file)},
+    )
+    assert err and out["error"]["code"] == "invalid_snapshot"
 
 
 def test_locations_are_bounded() -> None:

@@ -20,6 +20,9 @@ Environment:
                            another pid); a profile path containing "corrupt" fails with
                            invalid_allocations, a missing one with io
     FAKE_HEAPSPY_LOG       if set, each argv is appended to this file as a JSON line
+    FAKE_HEAPSPY_LOCATE    JSON object mapping a name to the ``matches`` that
+                           ``query --locate NAME`` prints; a name not in it (and not the
+                           example's) is not_found
 """
 
 from __future__ import annotations
@@ -345,6 +348,20 @@ def main() -> None:
             ]
             doc["matched_types"] = [f"app.m{i}.Session" for i in range(300)]
             doc["holders"] = [doc["holders"][0]] * 20
+    elif cmd == "query" and opt(args, "locate") is not None:
+        name = opt(args, "locate")
+        if MODE == "old_binary":
+            usage_error("--locate", "heapspy query <SNAP> <--type <T>|--retaining-path <ADDR>>")
+        doc = load("locate")
+        doc["snapshot"]["path"] = args[1]
+        table = os.environ.get("FAKE_HEAPSPY_LOCATE")
+        matches = json.loads(table).get(name) if table else None
+        if matches is None and name == doc["query"]:
+            matches = doc["matches"]
+        if not matches:
+            fail("not_found", f"no type, function or module named {name!r} in the snapshot")
+        doc["query"] = name
+        doc["matches"] = matches
     elif cmd == "query" and opt(args, "retaining-path") is not None:
         addr = opt(args, "retaining-path")
         if addr == "0xdead":

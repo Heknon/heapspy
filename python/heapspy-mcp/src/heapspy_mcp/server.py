@@ -36,9 +36,10 @@ The loop:
 5. retaining_path(snapshot, address=... or type=...): the labelled chain of references
    from a root (module global, thread, frame local) to the suspect.
 6. type_detail(snapshot, type): instance counts, the largest instances, who holds them.
-7. map_to_source(qualname, repo_path): turn a source_hints entry (e.g. app.cache.CACHE,
-   app.session.Session) into file:line, then read that code and find where the holder
-   grows without being cleared.
+7. map_to_source(qualname, repo_path, snapshot): turn a source_hints entry (e.g.
+   app.cache.CACHE, app.session.Session) into file:line, then read that code and find where
+   the holder grows without being cleared. With snapshot, types and functions resolve
+   exactly from the locations the snapshot recorded (type_location, source_locations).
 8. For growth over time: capture twice and diff_snapshots(before, after). Objects are
    matched by type and retaining site, not by address, so per-object identity is approximate.
 
@@ -465,18 +466,49 @@ def build_server(config: Config) -> MCPServer:
             "app.session.Session, a module global such as app.cache.CACHE, a method such as "
             "app.cache.Store.get, or an attribute set as self.x in a method) to file:line "
             "inside repo_path, with a short source excerpt. Handles src/ layouts and packages. "
-            "__main__.X is resolved heuristically (heuristic=true): every script in the repo "
-            "that binds X at top level is a candidate, ranked by main_evidence (__main__.py, "
-            "a main guard, a #! line); confirm against the process's command line. "
-            "Read-only and confined to repo_path. Next step: read the file "
+            "With snapshot, a type or function the snapshot has a recorded location for "
+            "(co_filename:co_firstlineno, or a class's methods) is resolved exactly "
+            "(heuristic=false, via=snapshot); the recorded file is matched to a file inside "
+            "repo_path by exact path, repo-relative path or a unique path suffix. Give the "
+            "snapshot for __main__ names especially. Without it, or when the snapshot has no "
+            "location in the repo (snapshot_lookup says why), names are resolved from the "
+            "repo's files, and __main__.X heuristically (heuristic=true): every script in the "
+            "repo that binds X at top level is a candidate, ranked by main_evidence "
+            "(__main__.py, a main guard, a #! line); confirm against the process's command "
+            "line. Read-only and confined to repo_path. Next step: read the file "
             "around that line and find where the holder grows without being cleared."
         ),
     )
     def map_to_source(
         qualname: Annotated[str, Field(description="Dotted name, e.g. app.cache.CACHE.")],
         repo_path: Annotated[str, Field(description="Absolute path of the repository root.")],
+        snapshot: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional snapshot handle (hs-xxxxxxxx) or .hpy path the name came from, "
+                    "for its recorded source locations."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        return _guard(lambda: source_map.map_to_source(qualname, repo_path))
+        def body() -> dict[str, Any]:
+            source_map.check_arguments(qualname, repo_path)
+            located: dict[str, Any] | None = None
+            if snapshot is not None:
+                path = store.resolve(snapshot)
+                try:
+                    doc = cli.locate(path, qualname.strip())
+                    located = {"matches": doc.get("matches") or []}
+                except HeapspyError as e:
+                    if e.code == "not_found":
+                        located = {"matches": []}
+                    elif e.code != "locate_unsupported":
+                        raise
+                    # A heapspy without --locate: resolve from the repository as before.
+            return source_map.map_to_source(qualname, repo_path, located)
+
+        return _guard(body)
 
     @server.resource(
         "heapspy://workflow",

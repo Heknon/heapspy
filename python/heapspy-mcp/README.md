@@ -320,7 +320,7 @@ Runs `heapspy diff`. Returns `identity_approximate` (always true) and
 `identity_note`, `totals`, `by_type` and `by_site` growth rows, and `notes`.
 Objects are matched by type and retaining site, not by address.
 
-### `map_to_source(qualname, repo_path)`
+### `map_to_source(qualname, repo_path, snapshot?)`
 
 Resolves a dotted name to candidates with `file`, `line`, `end_line`,
 `location` (`file:line`), `kind` (`module`, `class`, `function`, `assignment`,
@@ -343,8 +343,29 @@ lines.
   `heuristic: true` and `main_resolution` (a note, files scanned, whether the
   scan limit was reached). Compare with the process's command line from
   `list_python_processes`.
-- Snapshots record the file and first line of each code object (`source_loc`),
-  but no heapspy JSON report exposes them yet, so they are not used here.
+- With `snapshot` (a handle or `.hpy` path), the server first runs
+  `heapspy query --locate NAME`. For a type, function or module the snapshot
+  has a location for, the recorded file is mapped to a file inside
+  `repo_path`: the path itself when it is absolute and inside the repository,
+  then the path relative to the repository root, then a unique path-suffix
+  match (`/srv/build/app/cache.py` finds `app/cache.py` when exactly one file
+  ends that way). The result then has `heuristic: false` and `via:
+  "snapshot"`, and each candidate has `matched_by` (`exact_path`,
+  `repo_relative`, `suffix`) and `recorded` (the file, line, `exact` and `via`
+  from the snapshot). The line is that of the definition found around the
+  recorded line, so a class (recorded at its first method) is shown from its
+  `class` statement. If the file no longer defines the name there, the
+  candidate has `source_mismatch: true` and an excerpt at the recorded line.
+  This settles `__main__` names, which are otherwise heuristic.
+- The repository rules apply to recorded files as well: a recorded path
+  outside `repo_path`, or one that leaves it through a symlink, is never
+  opened.
+- When the snapshot has no usable location, the name is resolved from the
+  repository's files as below, and the result has `snapshot_lookup`:
+  `status` (`not_in_snapshot`, `not_in_repo` with the `recorded` locations
+  and why each was not used, or `no_location` with the snapshot's
+  `reasons`) and a `note`. With a heapspy without `--locate`, the result is
+  the same as without `snapshot`.
 - Names are found as classes, functions, methods, nested classes,
   module-level and class-level assignments (including those inside `if` and
   `try` blocks), imports, and `self.X = ...` assignments in methods.

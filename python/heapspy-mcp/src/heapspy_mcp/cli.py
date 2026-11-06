@@ -113,7 +113,8 @@ class HeapspyError(Exception):
     ``usage_error`` (exit status 2), ``bad_output`` (stdout is not JSON),
     ``schema_mismatch``, ``unexpected_kind``, ``cli_failed`` (non-zero exit
     without an error document), ``allocations_unsupported`` (a heapspy
-    without ``--allocations``). ``cli_code`` holds a CLI code this server does
+    without ``--allocations``), ``locate_unsupported`` (a heapspy without
+    ``query --locate``). ``cli_code`` holds a CLI code this server does
     not know; ``code`` is then ``internal``.
     """
 
@@ -158,6 +159,8 @@ _UNKNOWN_JSON_FLAG_RE = re.compile(r"unexpected argument '--json'")
 _ALLOCATIONS_UNKNOWN_RE = re.compile(
     r"unexpected argument '--allocations'|unrecognized subcommand 'flamegraph'"
 )
+# clap's message from a heapspy without `query --locate`.
+_LOCATE_UNKNOWN_RE = re.compile(r"unexpected argument '--locate'")
 
 
 @dataclass(frozen=True)
@@ -219,6 +222,13 @@ class HeapspyCLI:
         return self.run_json(
             ["query", str(snapshot), f"--retaining-path={address}", "--json"], "retaining_path"
         )
+
+    def locate(self, snapshot: Path, name: str) -> dict[str, Any]:
+        """``query --locate``: where a type, function or module is defined.
+
+        A heapspy without ``--locate`` fails with ``locate_unsupported``.
+        """
+        return self.run_json(["query", str(snapshot), f"--locate={name}", "--json"], "locate")
 
     def diff(self, before: Path, after: Path) -> dict[str, Any]:
         return self.run_json(["diff", str(before), str(after), "--json"], "diff")
@@ -343,6 +353,13 @@ class HeapspyCLI:
                 "allocations_unsupported",
                 "this heapspy does not read allocation profiles (no --allocations or no "
                 "flamegraph command)",
+                exit_status=2,
+                stderr=proc.stderr,
+            )
+        if proc.returncode == 2 and _LOCATE_UNKNOWN_RE.search(proc.stderr or ""):
+            return HeapspyError(
+                "locate_unsupported",
+                "this heapspy has no query --locate (no source locations in its reports)",
                 exit_status=2,
                 stderr=proc.stderr,
             )
