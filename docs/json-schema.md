@@ -326,6 +326,10 @@ labels so that it can be found again in another dump:
   reached through several objects its dominator owns), the label is written
   as `...` followed by the label of the last edge, e.g.
   `sys.modules['app'].__dict__['PENDING']...[<index>]`.
+- An object that is not a root but is dominated only by the super-root
+  (several roots reach it and none of them owns it, e.g. a list imported
+  into two modules) has no owning site. Its site is `...` followed by the
+  label of the edge it was first reached through, e.g. `...['SHARED']`.
 - List and tuple indices are generalised to `[<index>]`, since positions
   shift as a container changes.
 - Only the first 6 levels of the dominator tree get sites (level 1 is the

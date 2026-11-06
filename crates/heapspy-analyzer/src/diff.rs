@@ -111,10 +111,16 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
         }
         let e = a.via[vi];
         let (parent, label) = if p == root {
-            let r =
-                a.g.root_entry(e)
-                    .expect("root objects are entered from the super-root");
-            (NONE, a.snap.string(r.label)?.to_string())
+            match a.g.root_entry(e) {
+                Some(r) => (NONE, a.snap.string(r.label)?.to_string()),
+                // Dominated only by the super-root but reached through an
+                // ordinary edge: the object hangs off several roots and none
+                // of them owns it. Name the site by the edge alone.
+                None => {
+                    let l = site_edge_label(a.snap, a.snap.edge(e as u64).label)?;
+                    (NONE, format!("...{l}"))
+                }
+            }
         } else {
             let l = site_edge_label(a.snap, a.snap.edge(e as u64).label)?;
             let l = if a.g.csr.source_of(e) == p {
