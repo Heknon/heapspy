@@ -275,18 +275,42 @@ With `allocations` (a path to a `.hpya` profile), it passes
 gives `app.cache.CACHE`, and an `app.session.Session` instance followed by
 `.payload` gives `app.session.Session.payload`.
 
+Source locations recorded in the snapshot (from a heapspy whose reports have
+them; see "Source locations" in `docs/json-schema.md`) are passed through:
+
+- `type_location` and `type_location_reason` on each top retainer and
+  histogram row: where the object's type is defined. A location is `location`
+  (`file:line`, `file:~line` for a class, which is located near its first
+  method; the class statement is at or before that line), `file`, `line`,
+  `exact` and `via`. The reason says why it is `null`, e.g.
+  `type_not_in_snapshot` for C types such as `builtins.dict`.
+- `source_locations` on each path: at most 5 locations, the target's type
+  first (`of: "type"`), then functions, classes, code objects and modules on
+  the path from the target back to the root (`of: "hop"`, with the hop's
+  `type`, `address` and `edge`).
+
+`file` is the path the target process recorded, which can be outside the
+repository or on another machine. To read the code, pass the type's name to
+`map_to_source` with the snapshot.
+
+With a heapspy without these fields, the summaries are as before: no
+`type_location` and no `source_locations` keys.
+
 ### `retaining_path(snapshot, address? | type?, max_paths=3, max_targets=3)`
 
 With `address`, runs `heapspy query --retaining-path`. With `type`, runs
 `heapspy query --type` and then traces the `max_targets` largest instances.
-Each target has `reachable` and up to `max_paths` paths, each with `rendered`,
-`hops` (root first), `direct_holder` and `source_hints`.
+Each target has `reachable`, `type_location` and up to `max_paths` paths,
+each with `rendered`, `hops` (root first; a hop with a recorded location has
+`source_loc`), `direct_holder`, `source_hints` and `source_locations`.
 
 ### `type_detail(snapshot, type, top=10, allocations?)`
 
-Runs `heapspy query --type`. Returns `matched_types`, `instances`, shallow and
-retained totals, `top_instances` with their paths, `holders` (referrer type and
-generalised edge, with a count) and `notes`. With `allocations`, each instance
+Runs `heapspy query --type`. Returns `matched_types`, `type_locations` (the
+`type_location` of each matched type), `instances`, shallow and
+retained totals, `top_instances` with their paths (and `source_loc` for an
+instance that is itself a function, class or module), `holders` (referrer type
+and generalised edge, with a count) and `notes`. With `allocations`, each instance
 gets `allocated_at` as in `heap_summary` (`top_stack_rank` is always `null`
 here), and the result gets `allocations` with the notes and caveats.
 

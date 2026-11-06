@@ -223,7 +223,10 @@ def build_server(config: Config) -> MCPServer:
         description=(
             "Summarize a snapshot: the objects that retain the most memory (with the root path "
             "holding each one and source_hints for map_to_source), the type histogram by "
-            "retained size, and memory accounting (RSS vs. bytes in the object graph). Start "
+            "retained size, and memory accounting (RSS vs. bytes in the object graph). Retainers "
+            "and histogram rows have type_location: where the type is defined, as recorded in "
+            "the snapshot (file:line; file:~line for a class, located near its first method), "
+            "and paths have source_locations. Start "
             "here after capture_snapshot. If memory.outside_graph_pct is high, most memory is "
             "native or untracked and the object graph cannot explain it. The report shows what "
             "is retained now. With allocations (a .hpya profile), each retainer also gets "
@@ -255,8 +258,10 @@ def build_server(config: Config) -> MCPServer:
             "Show why an object is alive: the labelled chain of references from a GC root "
             "(module global, thread, frame local) to the object, root first. Give address "
             "(from heap_summary or type_detail) or type (e.g. app.session.Session; the "
-            "largest instances are traced). Each path has rendered text, hops, and "
-            "source_hints: module.qualname names to pass to map_to_source. The edge just "
+            "largest instances are traced). Each path has rendered text, hops, "
+            "source_hints (module.qualname names to pass to map_to_source) and "
+            "source_locations (file:line recorded in the snapshot for the target's type and "
+            "for functions, classes and modules on the path). The edge just "
             "before the target (direct_holder) is usually the reference to remove."
         ),
     )
@@ -337,8 +342,10 @@ def build_server(config: Config) -> MCPServer:
         description=(
             "Detail for one type: instance count, total shallow and retained size, the largest "
             "instances with their root paths, and holders (which container types and edges "
-            "reference the instances, grouped, e.g. builtins.dict [<key>] x 400000). Accepts a "
-            "full name (app.session.Session) or an unqualified one (Session). Use it to judge "
+            "reference the instances, grouped, e.g. builtins.dict [<key>] x 400000), and "
+            "type_locations: where each matched type is defined, as recorded in the snapshot. "
+            "Accepts a full name (app.session.Session) or an unqualified one (Session). Use it "
+            "to judge "
             "whether a type is leaking and who is accumulating it. With allocations (a .hpya "
             "profile), each instance gets allocated_at: the sampled stacks that allocated it "
             "and what it retains."

@@ -14,7 +14,8 @@ Environment:
                            hangs), dump_truncated, dump_no_json (exit 0, no
                            document), dump_usage (usage error naming --json in its
                            Usage line), old_binary (a heapspy without dump --json,
-                           --allocations or flamegraph);
+                           --allocations, flamegraph, query --locate or the source
+                           location fields in its reports);
                            with --allocations also alloc_not_linked (a profile from
                            another pid); a profile path containing "corrupt" fails with
                            invalid_allocations, a missing one with io
@@ -99,6 +100,27 @@ def big_analyze() -> dict:
     ]
     doc["notes"] = [{"code": "x", "message": "m" * 5000}] * 100
     return doc
+
+
+LOCATION_FIELDS = (
+    "source_loc",
+    "source_loc_reason",
+    "type_location",
+    "type_location_reason",
+    "matched_type_locations",
+)
+
+
+def strip_locations(value: object) -> None:
+    """Remove the source location fields, as a heapspy from before them prints."""
+    if isinstance(value, dict):
+        for key in LOCATION_FIELDS:
+            value.pop(key, None)
+        for v in value.values():
+            strip_locations(v)
+    elif isinstance(value, list):
+        for v in value:
+            strip_locations(v)
 
 
 def usage_error(flag: str, usage: str) -> None:
@@ -343,6 +365,8 @@ def main() -> None:
     else:
         sys.exit(2)
 
+    if MODE == "old_binary":
+        strip_locations(doc)
     if MODE == "bad_schema":
         doc["schema_version"] = 2
     if MODE == "wrong_kind":
