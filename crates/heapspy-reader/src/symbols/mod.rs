@@ -6,31 +6,43 @@
 //! Ubuntu's `/usr/bin/python3.X` are). [`find_python_module`] picks the
 //! candidate; [`find_exported`] resolves a name in it.
 //!
-//! [`find_exported`] is the default for [`MemorySource::find_symbol`]. It is a
-//! **stub**. The planned implementation reads only from target memory:
+//! [`find_exported`] is the default for [`MemorySource::find_symbol`]. It
+//! reads the module's first bytes and dispatches on the image magic:
 //!
-//! - ELF: read the ELF header at `module.base`, the program headers, then the
-//!   `PT_DYNAMIC` segment for `DT_SYMTAB`, `DT_STRTAB`, `DT_GNU_HASH` /
-//!   `DT_HASH`. Use the hash table to find the symbol (the symbol count is
-//!   not stored directly). Addresses in the dynamic section may be absolute
-//!   or base-relative depending on the loader; check against the module range.
-//! - PE: `MZ` header at `module.base`, `e_lfanew`, optional header data
+//! - ELF (`\x7fELF`): [`elf::find_exported`], which reads the ELF header at
+//!   `module.base`, the program headers, then the `PT_DYNAMIC` segment for
+//!   `DT_SYMTAB`, `DT_STRTAB`, `DT_GNU_HASH` / `DT_HASH`, and looks the name
+//!   up through the hash table. [`elf::find_in_file`] does the same from the
+//!   file on disk and also searches `.symtab` and the `.PyRuntime` section;
+//!   the ELF core and live Linux backends use it as a fallback.
+//! - PE (`MZ`): not implemented yet. The planned implementation reads the
+//!   `MZ` header at `module.base`, `e_lfanew`, optional header data
 //!   directory 0 (export table), then the name pointer / ordinal / function
 //!   RVA arrays. Result is `base + rva`. Forwarded exports are not needed.
 
 use crate::error::{Error, Result};
-use crate::source::{MemorySource, Module};
+use crate::source::{MemorySource, MemorySourceExt, Module};
+
+pub mod elf;
 
 /// Resolve `name` in the dynamic symbol table / export directory of `module`
-/// by reading the image out of `src`. **Stub**: returns `Error::Unimplemented`.
+/// by reading the image out of `src`, dispatching on the image magic.
 pub fn find_exported<S: MemorySource + ?Sized>(
-    _src: &S,
-    _module: &Module,
-    _name: &str,
+    src: &S,
+    module: &Module,
+    name: &str,
 ) -> Result<Option<u64>> {
-    Err(Error::Unimplemented(
-        "exported symbol lookup (ELF .dynsym / PE exports)",
-    ))
+    let magic = src.read_array::<4>(module.base)?;
+    if magic == elf::ELF_MAGIC {
+        elf::find_exported(src, module, name)
+    } else if magic[..2] == *b"MZ" {
+        Err(Error::Unimplemented("PE export lookup"))
+    } else {
+        Err(Error::Format(format!(
+            "unknown image format at {:#x} ({})",
+            module.base, module.name
+        )))
+    }
 }
 
 /// Pick the module most likely to contain `_PyRuntime`, in this order:

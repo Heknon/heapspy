@@ -178,14 +178,20 @@ fn bad_inputs_have_specific_codes() {
 }
 
 #[test]
-fn dump_is_unimplemented_and_fails() {
+fn dump_of_missing_core_fails_without_output() {
     let dir = tempfile::tempdir().unwrap();
+    let core = dir.path().join("core.1");
     let out_path = dir.path().join("o.hpy");
-    let out = heapspy(&["dump", "--core", "core.1", "-o", out_path.to_str().unwrap()]);
+    let out = heapspy(&[
+        "dump",
+        "--core",
+        core.to_str().unwrap(),
+        "-o",
+        out_path.to_str().unwrap(),
+    ]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8(out.stderr)
-        .unwrap()
-        .contains("not implemented yet"));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("cannot open core"), "stderr: {stderr}");
     assert!(!out_path.exists());
 }
 
