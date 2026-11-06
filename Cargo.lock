@@ -172,6 +172,9 @@ name = "heapspy-reader"
 version = "0.1.0"
 dependencies = [
  "heapspy-snapshot",
+ "libc",
+ "memmap2",
+ "object",
  "tempfile",
  "thiserror",
 ]
@@ -228,6 +231,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
