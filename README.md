@@ -4,7 +4,7 @@ Read the object graph of a running Python process from the outside, and find out
 
 py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
 
-> **Status: early development.** `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query` and `diff` work on them. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). Packaging and the MCP server are still planned.
+> **Status: early development.** `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query`, `diff` and `flamegraph` work on them. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). Packaging and the MCP server are still planned.
 
 ## What it answers, and what it doesn't
 
@@ -100,6 +100,46 @@ heapspy diff before.hpy after.hpy
 
 `diff` reports growth by type and by retaining site. Object addresses change between dumps, so matching individual objects across snapshots is approximate. The output says so and reports aggregates.
 
+### Retention flame graph
+
+```sh
+heapspy flamegraph app.hpy -o app.svg
+```
+
+![Retention flame graph of a process with a growing session cache and a listener list](docs/images/flamegraph.png)
+
+A retention flame graph shows the dominator tree. A snapshot has no call stacks, so a frame is not a function. Each frame is one hop of a retaining path, and its width is the bytes it retains: the objects in that frame and everything only reachable through them. The bottom row holds the roots (`sys.modules['__main__']`, frame locals, thread state). Each row above it names the reference that holds the next object. To find a leak, look for the widest frame you did not expect and read down to its root. In the image above, `.cell_contents bytearray` under `BUS.listeners` holds 70% of the heap: closures registered as listeners keep their buffers alive. `['SESSIONS'] dict` holds most of the rest.
+
+A CPU flame graph is different. Its widths count samples of time, and its frames are call stacks. An allocation flame graph (memray, tracemalloc) counts bytes allocated by each call stack, including memory freed long ago. A retention flame graph counts only memory that is alive in the snapshot, grouped by what keeps it alive, not by where it was allocated.
+
+Frame format:
+
+| object | frame text | example |
+|---|---|---|
+| root object | its root label | `sys.modules['__main__']` |
+| other object | label of the edge into it, a space, its type (`builtins.` dropped) | `['SESSIONS'] dict`, `.listeners list`, `.__closure__[0] cell`, `.cell_contents bytearray` |
+| reached through objects its dominator owns | `...` before the edge label | `...[<index>] bytes` |
+| dominated only by the super-root, not a root itself (shared by several roots) | a top-level frame with `...` | `...['SHARED'] list` |
+| folded objects | `[other]` | |
+
+The edge is the one breadth-first search entered the object through, as for `diff` sites ([docs/json-schema.md](docs/json-schema.md)). A `;` inside a label is written as `:`.
+
+Merge rules: siblings with the same frame text become one frame. List and tuple indices are written `[<index>]`, so all items of a list merge. Without `--capture-contents`, dict keys are placeholders such as `[<str len=9>]`, so all values whose keys have the same type and length merge. Merged frames merge their children too, so a cache of 100,000 sessions is one wide `['CACHE'] dict` frame with one `[<str len=N>] Session` frame per key length above it. A frame's self bytes are the shallow sizes of the objects merged into it, and its width (self plus everything above it) equals their total retained size.
+
+Cutoffs keep the output small on large heaps. Objects more than `--max-depth` levels (default 32) below a root are counted in an `[other]` frame at that depth. A frame narrower than `--min-pct` percent of the reachable bytes (default 0.01) or `--min-bytes N` is folded, with everything above it, into an `[other]` frame beside it. Folding never changes the width of the frames that remain.
+
+```sh
+# Folded stacks (`frame;frame;frame bytes`) for other tools, on stdout
+heapspy flamegraph app.hpy --folded --min-bytes 0 > app.folded
+
+# Differential: red frames grew, blue frames shrank, width is AFTER
+heapspy flamegraph --diff before.hpy after.hpy -o diff.svg
+```
+
+![Differential retention flame graph; the listener buffers grew](docs/images/flamegraph-diff.png)
+
+The differential graph matches frames between the two dumps by frame text, not by object identity, so the matching is approximate in the same way as `diff`. For example, sessions whose keys got one character longer show up as a new frame. `--diff ... --folded` writes `stack before after` lines, the input format of inferno's and FlameGraph's differential mode. The cutoff applies to the wider of the two sides, so a frame is folded in both snapshots or in neither.
+
 ### Record where memory is allocated (M7, in progress)
 
 ```sh
@@ -113,7 +153,7 @@ heapspy analyze app.hpy --allocations app.hpya
 
 ### JSON output
 
-Every analysis command takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it.
+Every analysis command except `flamegraph` takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it.
 
 ```sh
 heapspy analyze app.hpy --json | jq '.top_retainers[0]'
