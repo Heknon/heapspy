@@ -30,8 +30,26 @@ Once a label is on a PR, later pushes to that PR run the labelled jobs again.
 Remove the label to stop that. Pushes to `master` do not run CI. Changes that
 touch only Markdown files or `docs/` do not trigger a PR run.
 
-End-to-end jobs (fixture Python processes, core dumps, minidumps) will be added
-later. They will run on a `ci:e2e` label and on tag pushes.
+End-to-end tests (`.github/workflows/e2e.yml`) run heapspy against real
+CPython processes on Linux and Windows, for Python 3.12, 3.13 and 3.14:
+
+| Trigger | What runs |
+|---|---|
+| PR label `ci:e2e` | the Linux and Windows e2e matrices |
+| tag push matching `v*` | both |
+| manual dispatch (Actions tab) | both; `mcp_ref` also smoke-tests heapspy-mcp from that ref |
+
+Run them locally before adding the label (Linux, needs ptrace permission and
+gdb for `gcore`):
+
+```sh
+cargo build --release
+HEAPSPY_BIN=target/release/heapspy uv run --project tests/e2e pytest tests/e2e
+uvx ruff check tests/e2e && uvx ruff format --check tests/e2e
+```
+
+See [tests/e2e/README.md](tests/e2e/README.md) for choosing interpreters and
+adding a fixture.
 
 ## Commits
 
