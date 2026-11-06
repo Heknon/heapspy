@@ -22,6 +22,11 @@ EXPECTED_TOOLS = {
     "snapshot_process_metrics",
     "compare_process_snapshots",
     "diagnose_process_cpu",
+    # CPU tools (py-spy)
+    "cpu_stacks",
+    "cpu_profile",
+    "cpu_top",
+    "cpu_flamegraph",
 }
 
 
@@ -31,7 +36,7 @@ async def test_all_tools_are_listed(make_config) -> None:
         tools = {t.name: t for t in (await client.list_tools()).tools}
     assert set(tools) == EXPECTED_TOOLS
     read_only = {name for name, t in tools.items() if t.annotations.read_only_hint}
-    assert read_only == EXPECTED_TOOLS - {"capture_snapshot"}
+    assert read_only == EXPECTED_TOOLS - {"capture_snapshot", "cpu_flamegraph"}
 
 
 async def test_workflow_resource_and_prompt(make_config) -> None:

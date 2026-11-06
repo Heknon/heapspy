@@ -93,6 +93,77 @@ def resolve_binary(flag_value: str | None, env: dict[str, str] | None = None) ->
     return Path(found).resolve() if found else None
 
 
+# --- CPU profiling (py-spy) ------------------------------------------------------
+# Kept in one block so it merges cleanly with other additions to this module.
+
+ENV_PY_SPY_BIN = "PY_SPY_BIN"
+ENV_CPU_MAX_DURATION = "HEAPSPY_MCP_CPU_MAX_DURATION"
+DEFAULT_CPU_MAX_DURATION = 30
+CPU_MAX_DURATION_LIMIT = 3600
+
+
+def resolve_py_spy(flag_value: str | None, env: dict[str, str] | None = None) -> Path | None:
+    """Find the py-spy executable.
+
+    Order: ``--py-spy-bin``, then ``$PY_SPY_BIN``, then ``py-spy`` on PATH, then
+    ``py-spy`` next to the running interpreter (where ``pip install
+    heapspy-mcp[pyspy]`` puts it, even when that directory is not on PATH).
+    An explicitly configured value that is not executable is a
+    :class:`ConfigError`; ``None`` means py-spy is not available, and the CPU
+    tools return ``py_spy_not_found``.
+    """
+    env = os.environ if env is None else env
+    for origin, value in (("--py-spy-bin", flag_value), (ENV_PY_SPY_BIN, env.get(ENV_PY_SPY_BIN))):
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if candidate.parent == Path(".") and not candidate.exists():
+            found = shutil.which(value)
+            if found:
+                return Path(found).resolve()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+        raise ConfigError(f"{origin}={value!r} is not an executable file")
+    found = shutil.which("py-spy")
+    if found:
+        return Path(found).resolve()
+    beside = Path(sys.executable).parent / ("py-spy.exe" if sys.platform == "win32" else "py-spy")
+    if beside.is_file() and os.access(beside, os.X_OK):
+        return beside.resolve()
+    return None
+
+
+def load_cpu_settings(
+    config: Config,
+    *,
+    py_spy_bin: str | None = None,
+    cpu_max_duration: int | None = None,
+    env: dict[str, str] | None = None,
+) -> Config:
+    """Fill the CPU profiling fields of ``config`` from flags and environment."""
+    env = dict(os.environ) if env is None else env
+    config.py_spy_bin = resolve_py_spy(py_spy_bin, env)
+    if cpu_max_duration is None:
+        text = env.get(ENV_CPU_MAX_DURATION)
+        if text:
+            try:
+                cpu_max_duration = int(text)
+            except ValueError as e:
+                raise ConfigError(
+                    f"{ENV_CPU_MAX_DURATION}={text!r} is not a whole number of seconds"
+                ) from e
+    if cpu_max_duration is not None:
+        if not 1 <= cpu_max_duration <= CPU_MAX_DURATION_LIMIT:
+            raise ConfigError(
+                f"the CPU profile duration limit must be 1 to {CPU_MAX_DURATION_LIMIT} seconds"
+            )
+        config.cpu_max_duration = cpu_max_duration
+    return config
+
+
+# --- end CPU profiling -----------------------------------------------------------
+
+
 @dataclass
 class Config:
     heapspy_bin: Path | None
@@ -104,6 +175,11 @@ class Config:
     capture_timeout: float = DEFAULT_CAPTURE_TIMEOUT
     # process diagnostics (heapspy_mcp.system)
     diagnostics: DiagnosticsConfig = field(default_factory=lambda: DiagnosticsConfig())
+
+    # --- CPU profiling (py-spy); set by load_cpu_settings() above ---
+    py_spy_bin: Path | None = None
+    cpu_max_duration: int = DEFAULT_CPU_MAX_DURATION
+    # --- end CPU profiling ---
 
     @classmethod
     def from_sources(

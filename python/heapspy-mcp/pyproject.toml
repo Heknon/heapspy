@@ -13,6 +13,11 @@ dependencies = [
 [project.scripts]
 heapspy-mcp = "heapspy_mcp.__main__:main"
 
+[project.optional-dependencies]
+pyspy = [
+    "py-spy>=0.4",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -31,6 +36,9 @@ dev = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "pyspy_integration: runs the real py-spy against real Python processes (HEAPSPY_MCP_PYSPY_TESTS=1)",
+]
 
 [tool.ruff]
 line-length = 100

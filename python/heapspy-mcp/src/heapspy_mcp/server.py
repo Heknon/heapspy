@@ -13,6 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import capture as capture_mod
+from . import cpu as cpu_tools
 from . import processes, source_map
 from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
@@ -386,4 +387,5 @@ def build_server(config: Config) -> MCPServer:
         return lead + WORKFLOW
 
     register_process_diagnostics(server, config)
+    cpu_tools.register(server, config)
     return server

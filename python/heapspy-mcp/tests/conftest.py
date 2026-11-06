@@ -105,3 +105,35 @@ def child_python() -> Iterator[subprocess.Popen[bytes]]:
     finally:
         proc.kill()
         proc.wait()
+
+
+# --- CPU profiling (py-spy) ---------------------------------------------------------
+
+
+@pytest.fixture
+def fake_pyspy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An executable fake py-spy that runs tests/fake_pyspy.py with this interpreter."""
+    if sys.platform == "win32":
+        pytest.skip("the fake py-spy executable uses a shebang")
+    script = (HERE / "fake_pyspy.py").read_text()
+    exe = tmp_path / "pyspy-bin" / "py-spy"
+    exe.parent.mkdir()
+    exe.write_text(f"#!{sys.executable}\n{script}")
+    exe.chmod(0o755)
+    monkeypatch.setenv("FAKE_PYSPY_LOG", str(tmp_path / "pyspy-argv.log"))
+    monkeypatch.delenv("FAKE_PYSPY_MODE", raising=False)
+    return exe
+
+
+@pytest.fixture
+def pyspy_argv(tmp_path: Path):
+    def read() -> list[list[str]]:
+        path = tmp_path / "pyspy-argv.log"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    return read
+
+
+# --- end CPU profiling --------------------------------------------------------------
