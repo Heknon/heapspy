@@ -6,7 +6,8 @@
 use std::fmt::Write as _;
 
 use crate::report::{
-    AnalyzeReport, DiffReport, Note, PathHop, RetainingPathReport, TypeQueryReport,
+    AllocatedAt, Allocations, AnalyzeReport, DiffReport, Note, PathHop, RetainingPathReport,
+    StackFrame, TypeQueryReport,
 };
 use crate::{root_path_string, Result};
 
@@ -46,6 +47,192 @@ fn table(out: &mut String, header: &[&str], rows: &[Vec<String>], right: &[usize
     line(out, &mut header.iter().copied());
     for r in rows {
         line(out, &mut r.iter().map(String::as_str));
+    }
+}
+
+/// [`table`], with `extra[i]` (already indented, newline-terminated) printed
+/// under row `i`.
+fn table_with_extra(
+    out: &mut String,
+    header: &[&str],
+    rows: &[Vec<String>],
+    right: &[usize],
+    extra: &[String],
+) {
+    let mut t = String::new();
+    table(&mut t, header, rows, right);
+    for (i, line) in t.lines().enumerate() {
+        out.push_str(line);
+        out.push('\n');
+        if let Some(e) = i.checked_sub(1).and_then(|r| extra.get(r)) {
+            out.push_str(e);
+        }
+    }
+}
+
+/// Frames shown per stack in the "Allocated by" section.
+const SECTION_FRAMES: usize = 12;
+/// Frames shown in a one-line stack under a retainer or instance.
+const LINE_FRAMES: usize = 3;
+/// Stacks shown under each retainer or instance.
+const LINE_STACKS: usize = 2;
+
+/// `Cache.load (app/cache.py:12)`, with ` ~` for an approximate frame.
+fn frame_text(f: &StackFrame) -> String {
+    let mut s = format!("{} ({})", f.function, f.location);
+    if f.approximate {
+        s.push_str(" ~");
+    }
+    s
+}
+
+/// A stack on one line, innermost first: `a (x:1) <- b (y:2) <- ...`.
+fn stack_line(frames: &[StackFrame], max: usize) -> String {
+    if frames.is_empty() {
+        return "(no Python frames)".to_string();
+    }
+    let mut parts: Vec<String> = frames.iter().take(max).map(frame_text).collect();
+    if frames.len() > max {
+        parts.push(format!("... {} more", frames.len() - max));
+    }
+    parts.join(" <- ")
+}
+
+/// How a link was made: `exact` (large-object samples), `approx` (arena
+/// and pool samples), or `partly exact`.
+fn link_kind(linked: u64, exact: u64) -> &'static str {
+    if exact >= linked {
+        "exact"
+    } else if exact == 0 {
+        "approx"
+    } else {
+        "partly exact"
+    }
+}
+
+/// The top stacks of one `allocated_at`, one line each.
+fn allocated_at_lines(at: &AllocatedAt, indent: &str) -> String {
+    let mut out = String::new();
+    if at.stacks.is_empty() {
+        let _ = writeln!(out, "{indent}allocated at: no sampled allocation in it");
+        return out;
+    }
+    for s in at.stacks.iter().take(LINE_STACKS) {
+        let rank = s
+            .top_stack_rank
+            .map(|r| format!(", stack #{r}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{indent}allocated at: {} ({}{rank}) {}",
+            format_bytes(s.linked_bytes),
+            link_kind(s.linked_bytes, s.exact_linked_bytes),
+            stack_line(&s.frames, LINE_FRAMES)
+        );
+    }
+    out
+}
+
+/// `60.0 s`, `1.5 s`, `250 ms`.
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
+}
+
+/// The "Allocated by" section of `analyze --allocations`.
+fn allocations_section(out: &mut String, a: &Allocations) {
+    out.push_str("\nAllocated by (sampled while recording)\n\n");
+    let mechanisms = if a.mechanisms.is_empty() {
+        "no mechanism recorded".to_string()
+    } else {
+        a.mechanisms.join(", ")
+    };
+    let _ = writeln!(
+        out,
+        "  {} samples over {} ({}; events: {}), {} estimated allocated.",
+        a.samples,
+        format_duration_ms(a.duration_ms),
+        mechanisms,
+        a.sampling.events.join(", "),
+        format_bytes(a.estimated_bytes)
+    );
+    out.push_str(
+        "  This covers only allocations made while recording. Memory allocated before\n  \
+         recording started has no stack. Arena and pool links are approximate: they name\n  \
+         the most recent growth event that created the memory, not necessarily the call\n  \
+         that allocated each object. Large-object links are exact.\n",
+    );
+    let c = &a.coverage;
+    let _ = writeln!(
+        out,
+        "  Linked {} reachable objects ({}, {:.1}% of reachable bytes) to samples, {} of it exactly.",
+        c.linked_objects,
+        format_bytes(c.linked_bytes),
+        c.linked_pct,
+        format_bytes(c.exact_linked_bytes)
+    );
+    if a.truncated {
+        out.push_str(
+            "  The recording stopped early or lost samples; the numbers are lower bounds.\n",
+        );
+    }
+    if a.overhead.samples_dropped > 0 {
+        let _ = writeln!(
+            out,
+            "  {} samples were dropped while recording.",
+            a.overhead.samples_dropped
+        );
+    }
+    if a.approximate {
+        out.push_str(
+            "  Frames marked ~ were matched to the event by time (ETW) and may be off by a call.\n",
+        );
+    }
+    if a.top_stacks.is_empty() {
+        out.push_str("\n  (no samples)\n");
+    }
+    for t in &a.top_stacks {
+        let _ = writeln!(
+            out,
+            "\n  #{}  {} estimated, {} linked ({}), {} samples ({})",
+            t.rank,
+            format_bytes(t.estimated_bytes),
+            format_bytes(t.linked_bytes),
+            link_kind(t.linked_bytes, t.exact_linked_bytes),
+            t.samples,
+            t.events.join(", ")
+        );
+        if t.frames.is_empty() {
+            out.push_str("      (no Python frames)\n");
+            continue;
+        }
+        let shown = &t.frames[..t.frames.len().min(SECTION_FRAMES)];
+        let w = shown
+            .iter()
+            .map(|f| f.function.chars().count())
+            .max()
+            .unwrap_or(0);
+        for f in shown {
+            let pad = w - f.function.chars().count();
+            let mark = if f.approximate { " ~" } else { "" };
+            let _ = writeln!(
+                out,
+                "      {}{}  {}{mark}",
+                f.function,
+                " ".repeat(pad),
+                f.location
+            );
+        }
+        if t.frames.len() > SECTION_FRAMES {
+            let _ = writeln!(
+                out,
+                "      ... {} more frames",
+                t.frames.len() - SECTION_FRAMES
+            );
+        }
     }
 }
 
@@ -116,12 +303,27 @@ pub fn analyze(r: &AnalyzeReport) -> Result<String> {
                 ]
             })
             .collect();
-        table(
+        let extra: Vec<String> = r
+            .top_retainers
+            .iter()
+            .map(|x| {
+                x.allocated_at
+                    .as_ref()
+                    .map(|at| allocated_at_lines(at, "      "))
+                    .unwrap_or_default()
+            })
+            .collect();
+        table_with_extra(
             &mut out,
             &["retained", "%", "shallow", "type", "root path"],
             &rows,
             &[0, 1, 2],
+            &extra,
         );
+    }
+
+    if let Some(a) = &r.allocations {
+        allocations_section(&mut out, a);
     }
 
     out.push_str("\nTypes by retained size\n\n");
@@ -171,7 +373,8 @@ pub fn analyze(r: &AnalyzeReport) -> Result<String> {
     let rest: Vec<Note> = r
         .notes
         .iter()
-        .filter(|n| n.code != "outside_graph")
+        // The allocation caveat is part of the "Allocated by" section.
+        .filter(|n| n.code != "outside_graph" && n.code != "allocations_sampled")
         .cloned()
         .collect();
     notes(&mut out, &rest);
@@ -226,11 +429,22 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
             ]
         })
         .collect();
-    table(
+    let extra: Vec<String> = r
+        .top_instances
+        .iter()
+        .map(|i| {
+            i.allocated_at
+                .as_ref()
+                .map(|at| allocated_at_lines(at, "      "))
+                .unwrap_or_default()
+        })
+        .collect();
+    table_with_extra(
         &mut out,
         &["retained", "shallow", "len", "address", "root path"],
         &rows,
         &[0, 1, 2],
+        &extra,
     );
     out.push_str("\nHeld by\n\n");
     if r.holders.is_empty() {

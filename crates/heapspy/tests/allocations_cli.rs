@@ -233,10 +233,45 @@ fn matching_allocations_are_accepted() {
     let _: DiffReport = serde_json::from_slice(&out.stdout).unwrap();
     assert!(stderr(&out).contains("not used by diff"));
 
-    // Text output works too.
+    // Text output.
     let out = heapspy(&["analyze", s, "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Top retainers"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    println!("{text}");
+    assert!(text.contains("Top retainers"));
+    assert!(
+        text.contains("Allocated by (sampled while recording)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("only allocations made while recording"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Arena and pool links are approximate"),
+        "{text}"
+    );
+    assert!(
+        text.contains("allocated at: 4.0 KiB (exact, stack #1) fill (app.py:4)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("#1  4.0 KiB estimated, 4.0 KiB linked (exact)"),
+        "{text}"
+    );
+    assert!(text.contains("      fill  app.py:4"), "{text}");
+    // The caveat is in the section, not repeated as a note.
+    assert!(!text.contains("note: Allocation stacks cover"), "{text}");
+
+    let out = heapspy(&["query", s, "--type", "bytes", "--allocations", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    println!("{text}");
+    assert!(
+        text.contains("allocated at: 4.0 KiB (exact) fill (app.py:4)"),
+        "{text}"
+    );
+    assert!(text.contains("note: Allocation stacks cover only allocations made while recording"));
 }
 
 #[test]
