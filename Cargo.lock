@@ -227,6 +227,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "heapspy-record"
+version = "0.1.0"
+dependencies = [
+ "heapspy-alloc",
+ "heapspy-reader",
+ "heapspy-snapshot",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "heapspy-snapshot"
 version = "0.1.0"
 dependencies = [

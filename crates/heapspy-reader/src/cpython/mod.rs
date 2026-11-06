@@ -25,6 +25,10 @@
 //! set of emitted untracked addresses, and a type cache.
 //!
 //! The per-version layouts are documented in `docs/cpython-internals.md`.
+//!
+//! [`frames`] exposes the subset of those layouts that allocation recorders
+//! need to read Python stacks of a running target ([`frames::FrameOffsets`]),
+//! with reference readers that work on any [`MemorySource`].
 
 use heapspy_snapshot::{PythonVersion, SnapshotWriter};
 
@@ -33,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::source::{MemorySource, MemorySourceExt, Module};
 use crate::symbols;
 
+pub mod frames;
 pub mod offsets;
 mod pagecache;
 pub mod text;
@@ -41,6 +46,7 @@ mod walker;
 #[cfg(test)]
 mod tests;
 
+pub use frames::{frame_offsets, FrameOffsets};
 pub use offsets::Offsets;
 
 /// Where the runtime lives and which version it is.

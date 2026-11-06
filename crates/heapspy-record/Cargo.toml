@@ -1,0 +1,17 @@
+[package]
+name = "heapspy-record"
+description = "heapspy record: sample allocations of a running CPython process with their Python stacks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+heapspy-alloc.workspace = true
+heapspy-reader.workspace = true
+heapspy-snapshot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

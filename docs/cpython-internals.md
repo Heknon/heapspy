@@ -204,8 +204,10 @@ sign in `lv_tag & 3` (2 = negative), 30-bit digits.
 | `co_firstlineno`, `co_nlocalsplus`, `co_framesize` (int) | 68, 72, 76 | same | same |
 | `co_localsplusnames`, `co_localspluskinds` | 96, 104 | same | same |
 | `co_filename`, `co_name`, `co_qualname`, `co_linetable` | 112, 120, 128, 136 | same | same |
+| `co_code_adaptive` (bytecode start, `type(code).__basicsize__`) | 192 | 200 | 208 |
 | `_PyInterpreterFrame.f_code` / `f_executable` | 0 | 0 | 0 (`_PyStackRef`) |
 | `.previous`, `.f_funcobj`, `.f_globals`, `.f_builtins`, `.f_locals` | 8, 16, 24, 32, 40 | same | same |
+| `.prev_instr` (3.12) / `.instr_ptr` (3.13+) | 56 | 56 | 56 |
 | `.stacktop` (int, index) / `.stackpointer` (pointer) | 64 | 64 | 64 (pointer) |
 | `.owner` (u8) | 70 | 70 | 74 |
 | `.localsplus` | 72 | 72 | 80 |
@@ -223,6 +225,25 @@ On 3.14 frame slots and `f_executable` are `_PyStackRef`: tagged pointers.
 
 Local names come from `co_localsplusnames[i]` for `i < co_nlocalsplus`;
 slots from `co_nlocalsplus` up to the stack top are value-stack entries.
+
+## Stacks for allocation recorders
+
+`heapspy record` (M7) reads each allocating thread's Python stack as
+(code object address, instruction offset) pairs.
+`cpython::frames::FrameOffsets` is the subset of the table it needs, with
+`_Py_DebugOffsets` applied on 3.13+ (which now also overrides
+`instr_ptr`, `co_linetable` and `co_code_adaptive`: debug-offset slots
+248, 304, 344 on 3.13 and 272, 344, 384 on 3.14).
+
+The instruction offset is `instr_ptr - (code + co_code_adaptive)` in bytes
+(`prev_instr` on 3.12). That is the frame's `f_lasti` on every version,
+which is what `PyCode_Addr2Line` takes, so the code object's `co_linetable`
+maps it to a line. On 3.12 a frame that has not started has `prev_instr`
+one code unit before the code; the offset is then unknown and resolves to
+`co_firstlineno`, as CPython reports it. `cpython::frames::read_stack` is the
+user-space reference walk; an ignored test in
+`crates/heapspy-record/tests/live_stack.rs` checks it against running
+3.12, 3.13 and 3.14 processes.
 
 ## Shallow sizes
 
