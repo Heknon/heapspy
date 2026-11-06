@@ -39,6 +39,8 @@ class ThreadSample:
     migrations: int | None
     processor: int | None
     blkio_ticks: int | None
+    slice_ns: int | None = None
+    cpus_allowed: str | None = None
 
 
 @dataclass
@@ -63,6 +65,7 @@ def _read_thread(task_dir: Path, tid: int) -> ThreadSample | None:
     status = pf.parse_pid_status(pf.read_text(task_dir / "status") or "")
     sched_text = pf.read_text(task_dir / "schedstat")
     mig_text = pf.read_text(task_dir / "sched")
+    fields = pf.parse_pid_sched(mig_text) if mig_text else {}
     return ThreadSample(
         tid=tid,
         comm=st.comm,
@@ -72,9 +75,11 @@ def _read_thread(task_dir: Path, tid: int) -> ThreadSample | None:
         voluntary=status.get("voluntary_ctxt_switches"),
         nonvoluntary=status.get("nonvoluntary_ctxt_switches"),
         sched=pf.parse_pid_schedstat(sched_text) if sched_text else None,
-        migrations=pf.parse_pid_sched_migrations(mig_text) if mig_text else None,
+        migrations=int(fields["se.nr_migrations"]) if "se.nr_migrations" in fields else None,
         processor=st.processor,
         blkio_ticks=st.delayacct_blkio_ticks,
+        slice_ns=pf.sched_slice_ns(fields),
+        cpus_allowed=status.get("Cpus_allowed_list"),
     )
 
 
@@ -136,8 +141,16 @@ class TickAccumulator:
     wchans: Counter[str] = field(default_factory=Counter)
     procs_running: list[int] = field(default_factory=list)
     threads_sampled: int = 0
+    cpu_s: float = 0.0
 
     def tick(self, host: bool) -> None:
+        c0 = time.process_time()
+        try:
+            self._tick(host)
+        finally:
+            self.cpu_s += time.process_time() - c0
+
+    def _tick(self, host: bool) -> None:
         self.ticks += 1
         base = self.proc_root / str(self.pid) / "task"
         tids = list_tids(self.proc_root, self.pid)[:MAX_WAIT_SITE_THREADS]

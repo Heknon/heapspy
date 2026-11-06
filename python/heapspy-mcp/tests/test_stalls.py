@@ -265,6 +265,7 @@ async def test_diagnose_process_focus_and_alias(call, child_python) -> None:
     assert out["measurement"]["stall_sampling"]["rate_hz"] == 10.0
     err, alias = await call("diagnose_process_cpu", args, **allow)
     assert not err, alias
-    assert alias["focus"] == "all" and len(alias["hypotheses"]) == 9
+    assert alias["focus"] == "all" and len(alias["hypotheses"]) == 10
+    assert alias["colocation"]["targets"]["tasks"] == 1
     err, bad = await call("diagnose_process", {**args, "focus": "disk"}, **allow)
     assert err and bad["error"]["reason"] == "invalid_argument"

@@ -655,6 +655,7 @@ def build_rows(
     cgroups: dict[str, CgroupCounters],
     proc_root: Path,
     delayacct: bool | None,
+    cmdline_max_chars: int = MAX_CMDLINE,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     hz = pf.USER_HZ
     uptime_text = pf.read_text(proc_root / "uptime")
@@ -722,7 +723,7 @@ def build_rows(
                 "ppid": s.ppid,
                 "comm": s.comm,
                 "exe": s.exe,
-                "cmdline": redact_cmdline(s.cmdline, MAX_CMDLINE),
+                "cmdline": redact_cmdline(s.cmdline, cmdline_max_chars),
                 "user": _user_name(s.uid, users),
                 "uid": s.uid,
                 "state": s.state,
@@ -793,6 +794,7 @@ async def find_processes(
     window_s: float,
     window_cap: float,
     cgroup_root: Path | None,
+    cmdline_max_chars: int = MAX_CMDLINE,
 ) -> dict[str, Any]:
     if sort_by is not None and sort_by not in METRICS:
         raise SearchError(f"sort_by must be one of {', '.join(METRICS)}")
@@ -803,7 +805,9 @@ async def find_processes(
     cgroups = await sample_all(
         proc_root, pids, w, state, want_cgroups=True, cgroup_root=cgroup_root
     )
-    rows, reasons = build_rows(state, cgroups, proc_root, pf.read_task_delayacct(proc_root))
+    rows, reasons = build_rows(
+        state, cgroups, proc_root, pf.read_task_delayacct(proc_root), cmdline_max_chars
+    )
     if w == 0:
         for name, is_rate in METRICS.items():
             if is_rate:
@@ -833,7 +837,7 @@ def _compact(row: dict[str, Any], metric: str) -> dict[str, Any]:
         "pid": row["pid"],
         "comm": row["comm"],
         "value": row["metrics"][metric],
-        "cmdline": row["cmdline"][:120],
+        "cmdline": row["cmdline"],
         "cgroup": row["cgroup"],
         "pod_uid": k8s.get("pod_uid"),
         "container_id": (k8s.get("container_id") or "")[:12] or None,
@@ -850,6 +854,7 @@ async def scan_processes(
     include_kernel_threads: bool,
     cgroup_root: Path | None,
     major_fault_threshold_per_s: float = DEFAULT_MAJOR_FAULT_THRESHOLD_PER_S,
+    cmdline_max_chars: int = MAX_CMDLINE,
 ) -> dict[str, Any]:
     w = _window(window_s, window_cap)
     if w <= 0:
@@ -862,7 +867,9 @@ async def scan_processes(
     cgroups = await sample_all(
         proc_root, pids, w, state, want_cgroups=True, cgroup_root=cgroup_root
     )
-    rows, reasons = build_rows(state, cgroups, proc_root, pf.read_task_delayacct(proc_root))
+    rows, reasons = build_rows(
+        state, cgroups, proc_root, pf.read_task_delayacct(proc_root), cmdline_max_chars
+    )
     by_metric: dict[str, list[dict[str, Any]]] = {}
     for metric in METRICS:
         ranked = sorted(

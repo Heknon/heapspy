@@ -25,6 +25,11 @@ EXPECTED_TOOLS = {
     "diagnose_process_cpu",
     "diagnose_process",
     "watch_process_stalls",
+    "cpu_colocation",
+    "group_cpu",
+    "snapshot_group_metrics",
+    "fit_per_slice_cost",
+    "cache_sensitivity_probe",
     # CPU tools (py-spy)
     "cpu_stacks",
     "cpu_profile",
@@ -39,7 +44,12 @@ async def test_all_tools_are_listed(make_config) -> None:
         tools = {t.name: t for t in (await client.list_tools()).tools}
     assert set(tools) == EXPECTED_TOOLS
     read_only = {name for name, t in tools.items() if t.annotations.read_only_hint}
-    assert read_only == EXPECTED_TOOLS - {"capture_snapshot", "cpu_flamegraph"}
+    # cache_sensitivity_probe starts processes that add CPU load.
+    assert read_only == EXPECTED_TOOLS - {
+        "capture_snapshot",
+        "cpu_flamegraph",
+        "cache_sensitivity_probe",
+    }
 
 
 async def test_workflow_resource_and_prompt(make_config) -> None:

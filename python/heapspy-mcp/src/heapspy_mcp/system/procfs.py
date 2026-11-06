@@ -160,6 +160,164 @@ def parse_pid_sched_migrations(text: str) -> int | None:
     return None
 
 
+def parse_pid_sched(text: str) -> dict[str, float]:
+    """Every numeric ``name : value`` line of ``/proc/<pid>/sched`` (CONFIG_SCHED_DEBUG).
+
+    Times are as the kernel prints them: ``se.slice`` in nanoseconds, the
+    ``se.sum_exec_runtime`` and ``se.statistics.*`` / ``sum_sleep_runtime`` style
+    fields in milliseconds. Fields differ between kernels; callers look up the
+    ones they need and treat a missing one as unavailable.
+    """
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key or " " in key:
+            continue
+        try:
+            out[key] = float(value.strip())
+        except ValueError:
+            continue
+    return out
+
+
+def sched_slice_ns(fields: dict[str, float]) -> int | None:
+    """``se.slice`` (EEVDF, kernels 6.6+): the task's requested slice in nanoseconds."""
+    v = fields.get("se.slice")
+    return int(v) if v is not None and v > 0 else None
+
+
+def parse_cpu_list(text: str | None) -> list[int] | None:
+    """A kernel CPU list such as ``0-3,8,10-11`` (``Cpus_allowed_list``, sysfs
+    ``shared_cpu_list``, ``cpuset.cpus``) to sorted CPU numbers; None if malformed."""
+    if text is None:
+        return None
+    out: set[int] = set()
+    for part in text.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        try:
+            if sep:
+                a, b = int(lo), int(hi)
+                if b < a or b - a > 65536:
+                    return None
+                out.update(range(a, b + 1))
+            else:
+                out.add(int(lo))
+        except ValueError:
+            return None
+    return sorted(out)
+
+
+# --- CPU cache topology (sysfs) ---------------------------------------------------
+
+_SIZE_SUFFIX = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
+
+
+def parse_cache_size(text: str | None) -> int | None:
+    """sysfs cache ``size`` (``48K``, ``2048K``, ``32M``) to bytes."""
+    if not text:
+        return None
+    t = text.strip().upper()
+    unit = t[-1] if t and t[-1] in "KMG" else ""
+    num = t[:-1] if unit else t
+    try:
+        return int(num) * _SIZE_SUFFIX[unit]
+    except ValueError:
+        return None
+
+
+def read_cache_topology(sys_root: Path = Path("/sys"), cpu: int = 0) -> list[dict[str, Any]]:
+    """Caches of one CPU from ``/sys/devices/system/cpu/cpu<N>/cache/index*``: level,
+    type (Data, Instruction, Unified), size, line size and the CPUs sharing it.
+    Empty when sysfs does not expose them."""
+    base = sys_root / "devices" / "system" / "cpu" / f"cpu{cpu}" / "cache"
+    try:
+        dirs = sorted(d for d in base.iterdir() if d.name.startswith("index"))
+    except OSError:
+        return []
+    out = []
+    for d in dirs:
+        level = (read_text(d / "level") or "").strip()
+        if not level.isdigit():
+            continue
+        line = (read_text(d / "coherency_line_size") or "").strip()
+        shared = (read_text(d / "shared_cpu_list") or "").strip()
+        out.append(
+            {
+                "level": int(level),
+                "type": (read_text(d / "type") or "").strip() or None,
+                "size_bytes": parse_cache_size(read_text(d / "size")),
+                "line_size_bytes": int(line) if line.isdigit() else None,
+                "shared_cpu_list": shared or None,
+                "shared_cpu_count": len(parse_cpu_list(shared) or []) or None,
+            }
+        )
+    return out
+
+
+def cache_size(topology: list[dict[str, Any]], level: int) -> int | None:
+    """Size of the data or unified cache at ``level``, or None."""
+    for c in topology:
+        if c["level"] == level and c["type"] in ("Data", "Unified"):
+            return c["size_bytes"]
+    return None
+
+
+# --- scheduler slice default ------------------------------------------------------
+
+EEVDF_BASE_SLICE_NS = 750_000
+EEVDF_BASE_SLICE_NS_6_12 = 700_000  # lowered in Linux 6.12
+
+
+def _kernel_at_least(release: str, major: int, minor: int) -> bool:
+    parts = release.split(".")
+    try:
+        return (int(parts[0]), int("".join(c for c in parts[1] if c.isdigit()) or 0)) >= (
+            major,
+            minor,
+        )
+    except (IndexError, ValueError):
+        return False
+
+
+def default_base_slice(
+    proc_root: Path, sys_root: Path, ncpus: int, release: str | None = None
+) -> dict[str, Any]:
+    """The scheduler's base slice, from the first source that exists:
+
+    1. ``/sys/kernel/debug/sched/base_slice_ns`` (EEVDF, 6.6+, debugfs mounted)
+    2. ``/proc/sys/kernel/sched_base_slice_ns`` (some distribution kernels)
+    3. ``/sys/kernel/debug/sched/min_granularity_ns`` or
+       ``/proc/sys/kernel/sched_min_granularity_ns`` (CFS before 6.6)
+    4. the EEVDF default, 0.7 ms (0.75 ms before 6.12) x (1 + log2(min(CPUs, 8))),
+       marked as an estimate
+    """
+    for path, kind in (
+        (sys_root / "kernel" / "debug" / "sched" / "base_slice_ns", "base_slice_ns"),
+        (proc_root / "sys" / "kernel" / "sched_base_slice_ns", "base_slice_ns"),
+        (sys_root / "kernel" / "debug" / "sched" / "min_granularity_ns", "min_granularity_ns"),
+        (proc_root / "sys" / "kernel" / "sched_min_granularity_ns", "min_granularity_ns"),
+    ):
+        text = (read_text(path) or "").strip()
+        if text.isdigit() and int(text) > 0:
+            return {"slice_ns": int(text), "source": str(path), "kind": kind, "estimate": False}
+    factor = max(min(ncpus, 8), 1).bit_length()  # 1 + floor(log2(n))
+    rel = release if release is not None else platform.release()
+    base = EEVDF_BASE_SLICE_NS_6_12 if _kernel_at_least(rel, 6, 12) else EEVDF_BASE_SLICE_NS
+    return {
+        "slice_ns": base * factor,
+        "source": f"EEVDF default {base / 1e6:g} ms x (1 + log2(min(CPUs, 8))) for kernel "
+        f"{rel}; no sysctl or debugfs value was readable",
+        "kind": "base_slice_ns",
+        "estimate": True,
+    }
+
+
 # --- /proc/stat ---------------------------------------------------------------
 
 

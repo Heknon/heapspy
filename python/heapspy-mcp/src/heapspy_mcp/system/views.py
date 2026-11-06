@@ -27,7 +27,11 @@ from .sampling import (
     sample_process,
 )
 
-TICKS = 4
+TICKS = 4  # host samples (runnable count) inside the window
+DEFAULT_WAIT_RATE_HZ = 50.0
+# Thread samples per second the wait-site sampler may take (threads x rate); with
+# more threads the rate is lowered to stay under it, and the result says so.
+MAX_THREAD_SAMPLES_PER_S = 5000.0
 MAX_TOP_THREADS = 20
 MAX_CPU_ROWS = 64
 
@@ -66,10 +70,28 @@ class Measurement:
     delayacct: bool | None
     hw: dict[str, Any] | None = None
     notes: list[str] = field(default_factory=list)
+    sampling: dict[str, Any] = field(default_factory=dict)
+    proc_root: Path = Path("/proc")
 
     @property
     def window_s(self) -> float:
         return max(self.b.t - self.a.t, 1e-9)
+
+
+def effective_rate(rate_hz: float, cap_hz: float, threads: int) -> tuple[float, str | None]:
+    """The wait-site sampling rate after the server cap and the thread-sample budget."""
+    rate = max(1.0, min(rate_hz, cap_hz))
+    note = None
+    if rate < rate_hz:
+        note = f"rate capped at the server's --max-stall-rate ({cap_hz:g} Hz)"
+    budget = MAX_THREAD_SAMPLES_PER_S / max(threads, 1)
+    if budget < rate:
+        rate = max(1.0, budget)
+        note = (
+            f"rate lowered to {rate:g} Hz so that {threads} threads stay within "
+            f"{MAX_THREAD_SAMPLES_PER_S:g} thread samples per second"
+        )
+    return rate, note
 
 
 async def measure(
@@ -80,8 +102,11 @@ async def measure(
     host: bool,
     cgroup_root: Path | None,
     hw_session: Any | None = None,
+    wait_rate_hz: float = DEFAULT_WAIT_RATE_HZ,
+    rate_cap_hz: float = 100.0,
 ) -> Measurement:
-    """Sample at the start, ``TICKS`` times inside, and at the end of the window."""
+    """Sample at the start and the end of the window, and inside it: thread states and
+    wait sites at ``wait_rate_hz`` (capped), the host's runnable count ``TICKS`` times."""
     loc, cg_reason = locate_cgroup(proc_root, pid, cgroup_root)
     host_a = sample_host(proc_root) if host else None
     cg_a = sample_cgroup(loc) if loc else None
@@ -89,11 +114,22 @@ async def measure(
         hw_session.start()
     a = sample_process(proc_root, pid)
     ticks = TickAccumulator(proc_root, pid)
-    step = window_s / (TICKS + 1)
-    for _ in range(TICKS):
-        await anyio.sleep(step)
-        ticks.tick(host)
-    await anyio.sleep(step)
+    rate, note = effective_rate(wait_rate_hz, rate_cap_hz, min(len(a.threads), 256))
+    n = max(TICKS, int(window_s * rate))
+    period = window_s / (n + 1)
+    host_at = {round((i + 1) * (n + 1) / (TICKS + 1)) - 1 for i in range(TICKS)}
+    t0 = anyio.current_time()
+    late = 0
+    for k in range(n):
+        delay = t0 + (k + 1) * period - anyio.current_time()
+        if delay > 0:
+            await anyio.sleep(delay)
+        else:
+            late += 1
+        ticks.tick(host and k in host_at)
+    delay = t0 + window_s - anyio.current_time()
+    if delay > 0:
+        await anyio.sleep(delay)
     b = sample_process(proc_root, pid)
     hw = hw_session.stop() if hw_session is not None else None
     host_b = sample_host(proc_root) if host else None
@@ -111,6 +147,15 @@ async def measure(
         cg_reason=cg_reason,
         delayacct=pf.read_task_delayacct(proc_root),
         hw=hw,
+        proc_root=proc_root,
+        sampling={
+            "rate_hz_requested": wait_rate_hz,
+            "rate_hz": round(rate, 2),
+            "samples": ticks.ticks,
+            "late_samples": late,
+            "sampler_cpu_seconds": round(ticks.cpu_s, 4),
+            **({"rate_note": note} if note else {}),
+        },
     )
 
 
@@ -205,6 +250,7 @@ def process_view(m: Measurement, top_n: int = 5) -> dict[str, Any]:
             "runqueue_wait_seconds",
             "runqueue_wait_ratio",
             "runqueue_wait_seconds_per_s",
+            "on_cpu_seconds_per_s",
             "timeslices_per_s",
         ):
             sched[k] = None
@@ -216,7 +262,9 @@ def process_view(m: Measurement, top_n: int = 5) -> dict[str, Any]:
         if run <= 0:
             unavailable["runqueue_wait_ratio"] = "no on-CPU time in the window"
         sched["runqueue_wait_seconds_per_s"] = r(wait / 1e9 / w)
+        sched["on_cpu_seconds_per_s"] = r(run / 1e9 / w)
         sched["timeslices_per_s"] = r(slices / w, 1) if slices is not None else None
+    sched.update(_slice_fields(m, run, slices, vol, nonvol, unavailable))
     if mig is None:
         sched["cpu_migrations_per_s"] = None
         unavailable["cpu_migrations_per_s"] = (
@@ -285,6 +333,7 @@ def process_view(m: Measurement, top_n: int = 5) -> dict[str, Any]:
         },
         "wait_sites": {
             "samples": m.ticks.ticks,
+            "rate_hz": m.sampling.get("rate_hz"),
             "thread_samples": tick_total,
             "sleeping_thread_samples": wait_total,
             "samples_by_site": dict(m.ticks.wait_sites.most_common()),
@@ -295,7 +344,8 @@ def process_view(m: Measurement, top_n: int = 5) -> dict[str, Any]:
                 {"wchan": k, "samples": v} for k, v in m.ticks.wchans.most_common(5)
             ],
             "note": "kernel functions sleeping threads were blocked in, sampled "
-            f"{m.ticks.ticks} times; futex covers locks, condition variables and the GIL",
+            f"{m.ticks.ticks} times at {m.sampling.get('rate_hz')} Hz; futex covers locks, "
+            "condition variables and the GIL",
         },
         "top_threads": {
             "by_cpu_seconds": top("cpu_seconds"),
@@ -305,6 +355,46 @@ def process_view(m: Measurement, top_n: int = 5) -> dict[str, Any]:
         },
         "unavailable": unavailable,
     }
+
+
+def _slice_fields(
+    m: Measurement,
+    run: int | None,
+    slices: int | None,
+    vol: int | None,
+    nonvol: int | None,
+    unavailable: dict[str, str],
+) -> dict[str, Any]:
+    """Average timeslice over the window and the scheduler's slice for these threads."""
+    out: dict[str, Any] = {}
+    if run is not None and slices:
+        out["avg_timeslice_us"] = r(run / slices / 1000, 1)
+        out["avg_timeslice_source"] = "schedstat on-CPU time / timeslices (pcount)"
+    elif run is not None and vol is not None and nonvol is not None and vol + nonvol:
+        out["avg_timeslice_us"] = r(run / (vol + nonvol) / 1000, 1)
+        out["avg_timeslice_source"] = (
+            "schedstat on-CPU time / (voluntary + non-voluntary switches): no timeslice count"
+        )
+    else:
+        out["avg_timeslice_us"] = None
+        unavailable["avg_timeslice_us"] = (
+            "no timeslices in the window" if run is not None else "schedstat missing"
+        )
+    slices_ns = sorted(t.slice_ns for t in m.b.threads.values() if t.slice_ns)
+    if slices_ns:
+        out["sched_slice_us"] = r(slices_ns[len(slices_ns) // 2] / 1000, 1)
+        out["sched_slice_source"] = "se.slice from /proc/<tid>/sched (median over threads)"
+    else:
+        base = pf.default_base_slice(m.proc_root, Path("/sys"), os.cpu_count() or 1)
+        out["sched_slice_us"] = r(base["slice_ns"] / 1000, 1)
+        out["sched_slice_source"] = base["source"]
+    if out["avg_timeslice_us"] is not None and out["sched_slice_us"]:
+        out["avg_timeslice_to_sched_slice_ratio"] = r(
+            out["avg_timeslice_us"] / out["sched_slice_us"]
+        )
+    else:
+        out["avg_timeslice_to_sched_slice_ratio"] = None
+    return out
 
 
 def _thread_row(row: dict[str, Any], w: float) -> dict[str, Any]:
@@ -537,6 +627,7 @@ def full_view(m: Measurement, top_n: int = 5) -> dict[str, Any]:
             "window_s": r(m.window_s),
             "window_requested_s": m.window_requested_s,
             "in_window_samples": m.ticks.ticks,
+            "wait_site_sampling": m.sampling,
             "started_at_unix": round(m.a.wall, 3),
         },
         **pv,
