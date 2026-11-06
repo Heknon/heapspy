@@ -51,6 +51,10 @@ use super::{
 use crate::error::{Error, Result};
 
 mod parse;
+#[cfg(test)]
+pub(crate) mod synth;
+#[cfg(test)]
+mod tests;
 
 use parse::{bad, cpu, stream, Bytes};
 
