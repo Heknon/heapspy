@@ -18,6 +18,12 @@ the same PSI and fault evidence twice.
 ``deliberately_frozen`` is a fact check, not a hypothesis: when the process is
 in a frozen cgroup or stopped by a signal, every explanation is moot and the
 result says so.
+
+A thread that is runnable but not running is starved, not idle. When the
+run-queue wait or the share of samples in state R says so, the busy and idle
+tests use ``cpu_demand_cores`` (on-CPU time plus run-queue wait, per second)
+instead of ``cpu_cores_used``, and switches that are mostly preemptions are not
+read as the thread blocking on its own.
 """
 
 from __future__ import annotations
@@ -62,6 +68,53 @@ THRESHOLDS: dict[str, tuple[float, str, str]] = {
     "switches_per_cpu_second_low": (50.0, "1/cpu-s", "long uninterrupted runs on CPU"),
     "cpu_cores_used_busy": (0.5, "cores", "at least half a core busy"),
     "cpu_cores_used_idle": (0.2, "cores", "mostly idle"),
+    "runnable_share_starved": (
+        0.9,
+        "ratio",
+        "threads were in state R (running or waiting for a CPU) in nine of ten samples",
+    ),
+    "cpu_demand_cores_busy": (
+        0.5,
+        "cores",
+        "on-CPU time plus run-queue wait is at least half a core: the threads would use "
+        "that much CPU if they got it",
+    ),
+    "cpu_demand_cores_idle": (
+        0.2,
+        "cores",
+        "on-CPU time plus run-queue wait under a fifth of a core: idle even counting wait",
+    ),
+    "preempted_switch_share": (
+        0.5,
+        "ratio",
+        "voluntary share under one half: most switches are preemptions, not the thread "
+        "blocking on its own",
+    ),
+    "timeslice_ratio_very_short": (
+        0.10,
+        "ratio",
+        "average timeslice under a tenth of the scheduler slice",
+    ),
+    "timeslice_ratio_short": (
+        0.25,
+        "ratio",
+        "average timeslice under a quarter of the scheduler slice",
+    ),
+    "timeslice_ratio_full": (
+        0.50,
+        "ratio",
+        "average timeslice at least half the scheduler slice: slices are not cut short",
+    ),
+    "colocated_wakeups_per_s_high": (
+        1000.0,
+        "1/s",
+        "tasks sharing the target's CPUs wake at least 1000 times a second",
+    ),
+    "short_sleeper_wakeup_share_high": (
+        0.50,
+        "ratio",
+        "half of the co-located wakeups come from tasks that sleep under 1 ms at a time",
+    ),
     "user_share_high": (0.90, "ratio", "time is in user space"),
     "gil_cores_ceiling": (1.3, "cores", "a GIL-bound process stays near one core"),
     "gil_cores_exceeded": (1.5, "cores", "well above one core: threads run in parallel"),
@@ -187,11 +240,14 @@ def extract_signals(
     python: dict[str, Any],
     stalls: dict[str, Any] | None = None,
     stalls_reason: str | None = None,
+    colocation: dict[str, Any] | None = None,
+    colocation_reason: str | None = None,
 ):
     """The flat set of numbers the hypotheses read, with a reason for each missing one.
 
     ``stalls`` is a ``watch_process_stalls`` result over the same window, or None
-    (with ``stalls_reason``) when it was not taken.
+    (with ``stalls_reason``) when it was not taken. ``colocation`` is a
+    ``cpu_colocation`` result for the process over the same window, or None.
     """
     env = view.get("environment") or {}
     host = env.get("host")
@@ -243,6 +299,17 @@ def extract_signals(
             unavailable.get("runqueue_wait_ratio"),
         ),
         "runqueue_wait_seconds_per_s": _get(view, "scheduler", "runqueue_wait_seconds_per_s"),
+        "runnable_share": states.get("running_or_runnable") if states else None,
+        "avg_timeslice_us": pick(
+            "avg_timeslice_us",
+            _get(view, "scheduler", "avg_timeslice_us"),
+            unavailable.get("avg_timeslice_us"),
+        ),
+        "sched_slice_us": _get(view, "scheduler", "sched_slice_us"),
+        "sched_slice_source": _get(view, "scheduler", "sched_slice_source"),
+        "avg_timeslice_to_sched_slice_ratio": _get(
+            view, "scheduler", "avg_timeslice_to_sched_slice_ratio"
+        ),
         "mean_runnable_threads": round(states.get("running_or_runnable", 0) * threads, 2)
         if states
         else None,
@@ -301,6 +368,7 @@ def extract_signals(
         "python_free_threaded": python.get("free_threaded"),
     }
     _stall_signals(s, reasons, stalls, stalls_reason)
+    _colocation_signals(s, reasons, colocation, colocation_reason)
     if hw is not None:
         s["ipc"] = hw.get("ipc")
         s["llc_mpki"] = hw.get("llc_mpki")
@@ -373,6 +441,51 @@ def _stall_signals(
         s["disk_wait_share_source"] = "watch_process_stalls block_io category"
 
 
+def _colocation_signals(
+    s: dict[str, Any],
+    reasons: dict[str, str],
+    co: dict[str, Any] | None,
+    co_reason: str | None,
+) -> None:
+    keys = ("colocated_wakeups_per_s", "colocated_short_sleeper_wakeup_share")
+    if co is None:
+        for k in keys:
+            s[k] = None
+            reasons[k] = co_reason or "co-location sampling was not run"
+        return
+    att = co.get("wakeup_preemption_attribution") or {}
+    s["colocated_wakeups_per_s"] = att.get("colocated_wakeups_per_s_on_target_cpus")
+    s["colocated_short_sleeper_wakeup_share"] = att.get(
+        "colocated_short_sleeper_wakeup_share_on_target_cpus"
+    )
+    if s["colocated_short_sleeper_wakeup_share"] is None:
+        reasons["colocated_short_sleeper_wakeup_share"] = "no co-located wakeups"
+
+
+def derive(s: dict[str, Any]) -> dict[str, Any]:
+    """Fill signals that follow from others, for inputs that lack them (older
+    results, synthetic tests): run-queue wait per second from the ratio and CPU
+    used, the runnable share from the mean runnable threads, and CPU demand."""
+    s = dict(s)
+    cores = s.get("cpu_cores_used")
+    ratio = s.get("runqueue_wait_ratio")
+    if s.get("runqueue_wait_seconds_per_s") is None and ratio is not None and cores is not None:
+        # runqueue_wait_ratio is wait / on-CPU time, and on-CPU time per second is
+        # close to cpu_cores_used.
+        s["runqueue_wait_seconds_per_s"] = round(ratio * cores, 4)
+    runnable, threads = s.get("mean_runnable_threads"), s.get("threads")
+    if s.get("runnable_share") is None and runnable is not None and threads:
+        s["runnable_share"] = round(min(runnable / threads, 1.0), 3)
+    rqw = s.get("runqueue_wait_seconds_per_s")
+    s["cpu_demand_cores"] = round(cores + rqw, 3) if cores is not None and rqw is not None else None
+    ratio, share = s.get("runqueue_wait_ratio"), s.get("runnable_share")
+    s["starved"] = bool(
+        (ratio is not None and ratio >= T("runqueue_wait_ratio_high"))
+        or (share is not None and share >= T("runnable_share_starved"))
+    )
+    return s
+
+
 def _ge(h: Hyp, side: str, s: dict, key: str, thr: str, w: int, note: str = "") -> bool:
     v = s.get(key)
     if v is not None and v >= T(thr):
@@ -396,7 +509,11 @@ def _need(h: Hyp, s: dict, reasons: dict, *keys: str) -> None:
 
 
 def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]:
+    s = derive(s)
     hyps: list[Hyp] = []
+    vshare = s.get("voluntary_share")
+    # Switches are mostly preemptions: they say nothing about the thread blocking.
+    preempted = vshare is not None and vshare < T("preempted_switch_share")
 
     h = Hyp(
         "runqueue_contention",
@@ -422,6 +539,15 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
     _ge(h, "for", s, "procs_running_per_core", "procs_running_per_core_high", 1)
     _lt(h, "against", s, "procs_running_per_core", "procs_running_per_core_low", 1)
     _ge(h, "for", s, "psi_cpu_some_window_pct", "psi_cpu_some_window_pct_high", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "runnable_share",
+        "runnable_share_starved",
+        1,
+        "threads were runnable in almost every sample but got little CPU: starved, not idle",
+    )
     ratio = s.get("cfs_throttled_ratio")
     prc = s.get("procs_running_per_core")
     thr = s.get("throttled_seconds_per_s")
@@ -552,7 +678,8 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
         )
     if (s.get("threads") or 0) >= 2:
         _ge(h, "for", s, "futex_wait_share", "futex_wait_share_high", 1)
-    _ge(h, "for", s, "switches_per_cpu_second", "switches_per_cpu_second_high", 1)
+    if not preempted:
+        _ge(h, "for", s, "switches_per_cpu_second", "switches_per_cpu_second_high", 1)
     _lt(h, "against", s, "voluntary_switches_per_s", "voluntary_switches_per_s_low", 2)
     _lt(h, "against", s, "voluntary_share", "voluntary_share_low", 1)
     if (s.get("threads") or 0) < 2:
@@ -583,15 +710,25 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
         ],
         caveat="Counters cannot tell spin-waiting from useful computation; stacks can.",
     )
-    _ge(h, "for", s, "cpu_cores_used", "cpu_cores_used_busy", 1)
+    if s["starved"] and s.get("cpu_demand_cores") is not None:
+        note = (
+            f"cpu_cores_used={s.get('cpu_cores_used')} is low because the threads waited "
+            f"for a CPU (runqueue_wait_ratio={s.get('runqueue_wait_ratio')}, "
+            f"runnable_share={s.get('runnable_share')}); demand counts that wait"
+        )
+        _ge(h, "for", s, "cpu_demand_cores", "cpu_demand_cores_busy", 1, note)
+        _lt(h, "against", s, "cpu_demand_cores", "cpu_demand_cores_idle", 2)
+    else:
+        _ge(h, "for", s, "cpu_cores_used", "cpu_cores_used_busy", 1)
+        _lt(h, "against", s, "cpu_cores_used", "cpu_cores_used_idle", 2)
     _lt(h, "for", s, "switches_per_cpu_second", "switches_per_cpu_second_low", 1)
     _ge(h, "for", s, "user_share", "user_share_high", 1)
     if s.get("ipc") is not None and s["ipc"] >= T("ipc_low"):
         h.add("for", "ipc", s["ipc"], "ipc_low", 1, "IPC is not low")
-    _lt(h, "against", s, "cpu_cores_used", "cpu_cores_used_idle", 2)
     if s.get("ipc") is not None and s["ipc"] < T("ipc_low"):
         h.add("against", "ipc", s["ipc"], "ipc_low", 1)
-    _ge(h, "against", s, "switches_per_cpu_second", "switches_per_cpu_second_high", 1)
+    if not preempted:
+        _ge(h, "against", s, "switches_per_cpu_second", "switches_per_cpu_second_high", 1)
     _need(h, s, reasons, "ipc")
     hyps.append(h)
 
@@ -646,6 +783,84 @@ def evaluate(s: dict[str, Any], reasons: dict[str, str]) -> list[dict[str, Any]]
             h.against.append(
                 {"signal": "threads", "value": s.get("threads"), "note": "one thread", "weight": 2}
             )
+    hyps.append(h)
+
+    h = Hyp(
+        "short_timeslices",
+        "Timeslices are far shorter than the scheduler slice and end in preemption, with "
+        "frequent wakeups of tasks sharing the CPUs: any fixed cost per slice (such as "
+        "refilling caches after other tasks ran) is paid more often per unit of work",
+        [],
+        [],
+        [],
+        [
+            "cpu_colocation(pid) to see which tasks share the CPUs, how often they wake, how "
+            "long they sleep, and how the tasks are placed across CPUs",
+            "Put the co-located short sleepers on a separate cpuset (or this process on its "
+            "own) and compare cpu_seconds_per_unit_work with snapshot_process_metrics or "
+            "snapshot_group_metrics",
+            "Compare CPU per unit of work at different slice lengths: take snapshots at three "
+            "or more settings and run fit_per_slice_cost. Settings that change slice length "
+            "include the number of tasks per CPU, the waking tasks' policy (SCHED_BATCH tasks "
+            "do not preempt on wakeup) and a per-task slice through sched_setattr "
+            "(Linux 6.12+)",
+            "Where hw_counters has no PMU, cache_sensitivity_probe (opt-in) measures how much "
+            "a working set of a given size slows down on this host when time-sliced",
+        ],
+        caveat="Short slices cost more only if each slice pays a fixed cost; a fit across "
+        "settings (fit_per_slice_cost) tests that. Co-located wakeups are attributed by "
+        "rates on the same CPU, not traced.",
+    )
+    if not _lt(
+        h,
+        "for",
+        s,
+        "avg_timeslice_to_sched_slice_ratio",
+        "timeslice_ratio_very_short",
+        3,
+        f"avg_timeslice_us={s.get('avg_timeslice_us')}, sched_slice_us={s.get('sched_slice_us')} "
+        f"({s.get('sched_slice_source')})",
+    ):
+        _lt(
+            h,
+            "for",
+            s,
+            "avg_timeslice_to_sched_slice_ratio",
+            "timeslice_ratio_short",
+            2,
+            f"avg_timeslice_us={s.get('avg_timeslice_us')}, "
+            f"sched_slice_us={s.get('sched_slice_us')}",
+        )
+    _ge(h, "against", s, "avg_timeslice_to_sched_slice_ratio", "timeslice_ratio_full", 2)
+    if preempted:
+        h.add(
+            "for",
+            "voluntary_share",
+            vshare,
+            "preempted_switch_share",
+            1,
+            "slices end in preemption",
+        )
+    if vshare is not None and vshare >= T("voluntary_share_high"):
+        h.add(
+            "against",
+            "voluntary_share",
+            vshare,
+            "voluntary_share_high",
+            2,
+            "slices are short because the threads block on their own, not because they are "
+            "preempted",
+        )
+    _ge(h, "for", s, "colocated_wakeups_per_s", "colocated_wakeups_per_s_high", 1)
+    _ge(
+        h,
+        "for",
+        s,
+        "colocated_short_sleeper_wakeup_share",
+        "short_sleeper_wakeup_share_high",
+        1,
+    )
+    _need(h, s, reasons, "avg_timeslice_to_sched_slice_ratio", "colocated_wakeups_per_s")
     hyps.append(h)
 
     h = Hyp(
@@ -790,6 +1005,7 @@ FOCUS: dict[str, frozenset[str]] = {
             "spin_waiting_or_compute",
             "gil_convoy",
             "steal",
+            "short_timeslices",
         }
     ),
     "memory": frozenset({"memory_thrashing", "cache_or_memory_bound_contention"}),
