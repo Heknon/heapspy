@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
 import psutil
 
+from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
 from .config import Config
 from .processes import describe_cmdline, matches_allowlist
@@ -172,39 +174,75 @@ def capture_snapshot(
     )
     if capture_contents:
         log.warning("capture %s records string and bytes CONTENTS (--capture-contents)", handle)
+    # heapspy writes the snapshot through a temporary file next to its output
+    # (.tmpXXXXXX) and renames it into place. If it is killed, by the capture
+    # timeout for example, that file stays behind, and it can be as large as
+    # the target's heap. So heapspy writes into a private staging directory,
+    # which is removed on every path; only a finished snapshot is moved out.
+    stage = out.parent / f".{handle}.partial"
+    stage.mkdir(mode=0o700)
+    staged = stage / out.name
     try:
-        result = cli.dump(
-            output=out,
-            pid=pid,
-            core=core,
-            minidump=minidump,
-            capture_contents=capture_contents,
-            max_str=max_str,
-        )
-    except Exception as e:
-        log.warning("capture failed: handle=%s error=%s", handle, e)
-        for leftover in (out, out.with_suffix(".hpy.tmp")):
-            leftover.unlink(missing_ok=True)
-        raise
-    if not out.is_file():
-        log.warning("capture failed: handle=%s error=no snapshot file written", handle)
-        raise HeapspyError(
-            "cli_failed", f"heapspy dump exited 0 but did not write {out}", stderr=result.stderr
-        )
+        try:
+            result = cli.dump(
+                output=staged,
+                pid=pid,
+                core=core,
+                minidump=minidump,
+                capture_contents=capture_contents,
+                max_str=max_str,
+            )
+        except Exception as e:
+            log.warning("capture failed: handle=%s error=%s", handle, e)
+            raise
+        if not staged.is_file():
+            log.warning("capture failed: handle=%s error=no snapshot file written", handle)
+            raise HeapspyError(
+                "cli_failed",
+                f"heapspy dump exited 0 but did not write {staged}",
+                stderr=result.stderr,
+            )
+        os.replace(staged, out)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     size = out.stat().st_size
-    log.warning("capture done: handle=%s file=%s size=%s", handle, out, size)
-    return {
+    log.warning(
+        "capture done: handle=%s file=%s size=%s report=%s pause_ms=%s",
+        handle,
+        out,
+        size,
+        result.report,
+        result.pause_ms,
+    )
+    stats: dict[str, Any] = {
+        "objects": result.objects,
+        "edges": result.edges,
+        "types": result.types,
+        "roots": result.roots,
+        "file_bytes": size,
+        "file_human": human_bytes(size),
+        "truncated": result.truncated,
+        "missing_bytes": result.missing_bytes,
+        "read_errors": result.read_errors,
+        "pause_ms": result.pause_ms,
+    }
+    out_doc: dict[str, Any] = {
         "snapshot": handle,
         "path": str(out),
         "target": target,
+        "python_version": result.python_version,
         "contents_captured": capture_contents,
-        "stats": {
-            "objects": result.objects,
-            "edges": result.edges,
-            "roots": result.roots,
-            "file_bytes": size,
-            "file_human": human_bytes(size),
-            "truncated": result.truncated,
-        },
+        "stats": stats,
+        "notes": S.notes(list(result.notes)),
+        # "json": the dump report; "stderr_line": an older heapspy without
+        # `dump --json`, so types, read_errors, missing_bytes, pause_ms and
+        # python_version are null.
+        "report": result.report,
         "next_step": f"Call heap_summary(snapshot={handle!r}) to see the top retainers.",
     }
+    if result.truncated:
+        out_doc["warning"] = (
+            "The snapshot is marked truncated (the walk did not finish, or the image is "
+            "incomplete). Sizes and counts from it are lower bounds."
+        )
+    return out_doc

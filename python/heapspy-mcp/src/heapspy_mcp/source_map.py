@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,23 +137,54 @@ def _module_files(root: Path, base: Path, module_parts: list[str]) -> Iterator[P
             yield real
 
 
-def _main_files(root: Path) -> Iterator[Path]:
-    """Files that may have run as ``__main__``: ``__main__.py`` and scripts with a main guard."""
+_MAIN_GUARD_RE = re.compile(r"""^\s*if\s+__name__\s*==\s*['"]__main__['"]""", re.MULTILINE)
+
+
+@dataclass
+class _MainCandidate:
+    """A file that may have run as ``__main__``, and why it ranks where it does."""
+
+    file: Path
+    evidence: list[str]
+    score: int
+    depth: int
+
+
+@dataclass
+class _MainScan:
+    candidates: list[_MainCandidate]
+    scanned: int
+    limit_reached: bool
+
+
+def _main_candidates(root: Path, name: str | None) -> _MainScan:
+    """Files that may have run as ``__main__`` and bind ``name`` at top level.
+
+    ``__main__`` is whichever script was started, so it cannot be found by
+    module path. Every ``.py`` file in the repository (at most
+    ``MAX_MAIN_SCAN``, skipping virtualenvs, build output and hidden
+    directories, and never leaving the repository through a symlink) is
+    checked for a top-level class, function, assignment or import of
+    ``name``. Without a name, only ``__main__.py`` files and scripts with a
+    main guard qualify. Ranking, best first: a file named ``__main__.py``, a
+    main guard, a ``#!`` line, a definition rather than an import, then
+    shallower paths, then the path.
+    """
+    found: list[_MainCandidate] = []
     scanned = 0
+    limit_reached = False
+    word = re.compile(rf"\b{re.escape(name)}\b") if name else None
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
         for fname in sorted(filenames):
             if not fname.endswith(".py"):
                 continue
+            if scanned >= MAX_MAIN_SCAN:
+                limit_reached = True
+                break
             scanned += 1
-            if scanned > MAX_MAIN_SCAN:
-                return
-            path = Path(dirpath) / fname
-            real = _inside(root, path)
+            real = _inside(root, Path(dirpath) / fname)
             if real is None:
-                continue
-            if fname == "__main__.py":
-                yield real
                 continue
             try:
                 if real.stat().st_size > MAX_FILE_BYTES:
@@ -160,8 +192,42 @@ def _main_files(root: Path) -> Iterator[Path]:
                 text = real.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if "__name__" in text and "__main__" in text:
-                yield real
+            evidence: list[str] = []
+            score = 0
+            if fname == "__main__.py":
+                evidence.append("named __main__.py")
+                score += 8
+            if _MAIN_GUARD_RE.search(text):
+                evidence.append("has an if __name__ == '__main__' guard")
+                score += 4
+            if text.startswith("#!"):
+                evidence.append("starts with a #! line")
+                score += 2
+            if word is None:
+                if score < 4:
+                    continue
+            else:
+                # Cheap text check first; only files that mention the name are parsed.
+                if not word.search(text):
+                    continue
+                try:
+                    tree = ast.parse(text, filename=str(real))
+                except (SyntaxError, ValueError):
+                    continue
+                kinds = {kind for _, kind in _find_in_scope(tree.body, name or "")}
+                if not kinds:
+                    continue
+                if kinds - {"import"}:
+                    evidence.append(f"defines {name} at top level")
+                    score += 1
+                else:
+                    evidence.append(f"imports {name} at top level")
+            depth = len(real.relative_to(root).parts)
+            found.append(_MainCandidate(real, evidence, score, depth))
+        if limit_reached:
+            break
+    found.sort(key=lambda c: (-c.score, c.depth, c.file.relative_to(root).as_posix()))
+    return _MainScan(found, scanned, limit_reached)
 
 
 def _parse(path: Path) -> tuple[ast.Module, list[str]] | None:
@@ -309,7 +375,9 @@ def map_to_source(qualname: str, repo_path: str) -> dict[str, Any]:
     def rel(p: Path) -> str:
         return p.relative_to(root).as_posix()
 
-    def consider(path: Path, module: str, rest: list[str]) -> None:
+    def consider(
+        path: Path, module: str, rest: list[str], extra: dict[str, Any] | None = None
+    ) -> None:
         nonlocal partial
         if len(searched) < MAX_SEARCHED:
             searched.append(rel(path))
@@ -343,12 +411,15 @@ def map_to_source(qualname: str, repo_path: str) -> dict[str, Any]:
                     "module": module,
                     "qualname": ".".join(rest),
                     "excerpt": text,
+                    **(extra or {}),
                 }
             )
 
+    main_scan: _MainScan | None = None
     if parts[0] == "__main__":
-        for path in _main_files(root):
-            consider(path, "__main__", parts[1:])
+        main_scan = _main_candidates(root, parts[1] if len(parts) > 1 else None)
+        for cand in main_scan.candidates:
+            consider(cand.file, "__main__", parts[1:], {"main_evidence": cand.evidence})
     else:
         roots = _search_roots(root, parts[0])
         # Longest module prefix first: app.cache.Session -> module app.cache, name Session.
@@ -368,6 +439,20 @@ def map_to_source(qualname: str, repo_path: str) -> dict[str, Any]:
         "candidates": candidates,
         "searched_files": searched,
     }
+    if main_scan is not None:
+        result["heuristic"] = True
+        result["main_resolution"] = {
+            "note": (
+                "__main__ is whichever script was started, so it cannot be found by module "
+                "path. Candidates are files that bind the name at top level, ranked by "
+                "main_evidence: a file named __main__.py, a main guard, a #! line, a "
+                "definition rather than an import, then shallower paths. Check the "
+                "process's command line (list_python_processes) for the script that ran."
+            ),
+            "files_scanned": main_scan.scanned,
+            "scan_limit_reached": main_scan.limit_reached,
+            "files_matched": len(main_scan.candidates),
+        }
     if not candidates:
         if parts[0] == "builtins":
             result["note"] = "builtins types are implemented in C and have no source in the repo."

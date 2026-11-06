@@ -25,12 +25,12 @@ mod tests {
     use source::mem::MemImage;
 
     #[test]
-    fn dump_reports_unimplemented_and_writes_nothing() {
+    fn dump_of_non_python_image_fails_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("x.hpy");
         let src = MemImage::new(TargetInfo::LINUX_X86_64);
         let err = dump(&src, &DumpOptions::default(), &out).unwrap_err();
-        assert!(matches!(err, Error::Unimplemented(_)), "{err}");
+        assert!(matches!(err, Error::NotPython(_)), "{err}");
         assert!(!out.exists());
     }
 

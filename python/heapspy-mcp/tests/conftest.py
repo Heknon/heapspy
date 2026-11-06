@@ -17,6 +17,8 @@ from heapspy_mcp.server import build_server
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 EXAMPLES = REPO_ROOT / "docs" / "examples"
+# Examples from heapspy branches that are not merged here yet (see its README).
+CLI_FIXTURES = HERE / "fixtures" / "heapspy"
 
 
 @pytest.fixture
@@ -30,6 +32,7 @@ def fake_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     exe.write_text(f"#!{sys.executable}\n{script}")
     exe.chmod(0o755)
     monkeypatch.setenv("FAKE_HEAPSPY_EXAMPLES", str(EXAMPLES))
+    monkeypatch.setenv("FAKE_HEAPSPY_FIXTURES", str(CLI_FIXTURES))
     monkeypatch.setenv("FAKE_HEAPSPY_LOG", str(tmp_path / "argv.log"))
     monkeypatch.delenv("FAKE_HEAPSPY_MODE", raising=False)
     return exe
