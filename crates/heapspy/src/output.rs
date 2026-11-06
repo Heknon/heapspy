@@ -49,8 +49,9 @@ pub fn error_code(err: &anyhow::Error) -> &'static str {
                 heapspy_record::Error::InvalidOption(_) => return "invalid_argument",
                 heapspy_record::Error::Alloc(a) => return alloc_code(a),
                 heapspy_record::Error::Io(_) => return "io",
-                // The source error is next in the chain.
-                heapspy_record::Error::Reader(_) => continue,
+                // `Reader` is transparent: the wrapped error is not a link of
+                // its own in the chain, so map it here.
+                heapspy_record::Error::Reader(r) => return reader_code(r, source),
                 heapspy_record::Error::Unsupported(_) => return "unsupported",
             }
         }
@@ -266,6 +267,55 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("missing 10 bytes"), "{text}");
         assert!(text.contains("not a CPython process"), "{text}");
+    }
+
+    /// `heapspy_record::Error::Reader` is `#[error(transparent)]`, so the
+    /// reader error it wraps is not a separate link in the cause chain.
+    #[test]
+    fn record_errors_have_specific_codes() {
+        use heapspy_record::Error as R;
+        let cases = [
+            (R::Unimplemented("eBPF"), "unimplemented"),
+            (R::Unsupported("eBPF needs Linux".into()), "unsupported"),
+            (R::PermissionDenied("CAP_BPF".into()), "permission_denied"),
+            (R::InvalidOption("duration".into()), "invalid_argument"),
+            (
+                R::Reader(E::NoSuchProcess("pid 1".into())),
+                "no_such_process",
+            ),
+            (
+                R::Reader(E::NotPython("no _PyRuntime".into())),
+                "not_python",
+            ),
+            (
+                R::Reader(E::UnsupportedPython("debug build".into())),
+                "unsupported_python",
+            ),
+            (
+                R::Reader(E::PermissionDenied("ptrace".into())),
+                "permission_denied",
+            ),
+            (R::Reader(E::Unimplemented("live::open")), "unimplemented"),
+            (
+                R::Reader(io(ErrorKind::PermissionDenied)),
+                "permission_denied",
+            ),
+            (
+                R::Alloc(heapspy_alloc::Error::LimitExceeded("samples")),
+                "unsupported",
+            ),
+            (R::Io(std::io::Error::other("disk full")), "io"),
+        ];
+        for (e, code) in cases {
+            let text = e.to_string();
+            let err = Err::<(), _>(e)
+                .context(DumpSource {
+                    kind: SourceKind::Pid,
+                    text: "cannot record pid 1".into(),
+                })
+                .unwrap_err();
+            assert_eq!(error_code(&err), code, "{text}");
+        }
     }
 
     #[test]
