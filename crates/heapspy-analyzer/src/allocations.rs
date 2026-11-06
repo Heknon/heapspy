@@ -51,6 +51,15 @@
 //! its samples' weights (`estimated_bytes`) and the shallow bytes of the
 //! reachable objects linked to its samples (`linked_bytes`). The largest
 //! groups by estimated bytes are `top_stacks`.
+//!
+//! # Per retainer and instance
+//!
+//! The dominator subtree of `v` is exactly the nodes whose dominator-tree
+//! preorder number lies in `tin[v] .. tin[v] + retained_count[v]`. The
+//! reachable linked objects are sorted by `tin` once; each listed object's
+//! subtree is then a contiguous slice found by two binary searches, and
+//! only the linked objects in that slice are visited. Top retainers are
+//! disjoint, so all of them together visit each linked object at most once.
 
 use std::collections::{BinaryHeap, HashMap};
 
@@ -60,13 +69,16 @@ use heapspy_snapshot::{Snapshot, SourceKind};
 use crate::analysis::Analysis;
 use crate::flame::FxMap;
 use crate::report::{
-    AllocationStack, Allocations, AnalyzeReport, Coverage, Note, OverheadInfo, SamplingInfo,
-    StackFrame, TypeQueryReport,
+    AllocatedAt, AllocatedAtStack, AllocationStack, Allocations, AnalyzeReport, Coverage, Note,
+    OverheadInfo, SamplingInfo, StackFrame, TypeQueryReport,
 };
 use crate::{pct, AnalyzeOptions, Error, QueryOptions, Result};
 
 /// "No sample" in the result of [`latest_covering`].
 pub const NO_LINK: u32 = u32::MAX;
+
+/// Most stacks listed in one `allocated_at`.
+pub const ALLOCATED_AT_STACKS: usize = 5;
 
 const NS_PER_S: u64 = 1_000_000_000;
 
@@ -392,17 +404,20 @@ impl Stacks {
 // ---------------------------------------------------------------- the join
 
 /// A profile joined with an analysed snapshot.
-struct Join {
+struct Join<'a, 's> {
+    a: &'a Analysis<'s>,
     stacks: Stacks,
     /// Linked sample per object, or [`NO_LINK`]. Empty when nothing was
     /// linked.
     link: Vec<u32>,
     coverage: Coverage,
     notes: Vec<Note>,
+    /// Reachable linked objects in dominator-tree preorder.
+    by_tin: Vec<u32>,
 }
 
-impl Join {
-    fn new(a: &Analysis, profile: &Profile) -> Result<Join> {
+impl<'a, 's> Join<'a, 's> {
+    fn new(a: &'a Analysis<'s>, profile: &Profile) -> Result<Join<'a, 's>> {
         let snap = a.snap;
         let mut stacks = Stacks::new(profile)?;
         let mut notes = compatibility(snap, profile);
@@ -438,6 +453,13 @@ impl Join {
             exact_linked_objects: 0,
             exact_linked_bytes: 0,
         };
+        // Linked objects scattered to their preorder slot, then compacted:
+        // O(n) instead of a sort by tin.
+        let mut by_tin = if link.is_empty() {
+            Vec::new()
+        } else {
+            vec![NO_LINK; a.order.len()]
+        };
         for (v, &l) in link.iter().enumerate() {
             if l == NO_LINK || !a.reachable(v as u32) {
                 continue;
@@ -454,13 +476,18 @@ impl Join {
                 coverage.exact_linked_objects += 1;
                 coverage.exact_linked_bytes += bytes;
             }
+            by_tin[a.tin[v] as usize] = v as u32;
         }
         coverage.linked_pct = pct(coverage.linked_bytes, a.reachable_bytes());
+        by_tin.retain(|&v| v != NO_LINK);
+        by_tin.shrink_to_fit();
         Ok(Join {
+            a,
             stacks,
             link,
             coverage,
             notes,
+            by_tin,
         })
     }
 
@@ -488,6 +515,55 @@ impl Join {
                 }
             })
             .collect()
+    }
+
+    /// `allocated_at` of node `v`: the linked objects of its dominator
+    /// subtree by stack. `rank_of` gives the `top_stacks` rank of a group.
+    fn allocated_at(&self, v: u32, rank_of: &HashMap<u32, u32>) -> AllocatedAt {
+        let a = self.a;
+        let mut out = AllocatedAt {
+            linked_objects: 0,
+            linked_bytes: 0,
+            exact_linked_bytes: 0,
+            stacks: Vec::new(),
+            approximate: false,
+        };
+        if !a.reachable(v) {
+            return out;
+        }
+        let lo = a.tin[v as usize];
+        let hi = lo + a.retained_count[v as usize];
+        let tin = |x: &u32| a.tin[*x as usize];
+        let start = self.by_tin.partition_point(|x| tin(x) < lo);
+        let end = self.by_tin.partition_point(|x| tin(x) < hi);
+        // group -> (objects, bytes, exact bytes)
+        let mut per: FxMap<u32, (u64, u64, u64)> = FxMap::default();
+        for &x in &self.by_tin[start..end] {
+            let bytes = a.snap.object(x).shallow_size;
+            let packed = self.stacks.of_sample[self.link[x as usize] as usize];
+            let exact = if packed & EXACT_BIT != 0 { bytes } else { 0 };
+            let e = per.entry(packed & !EXACT_BIT).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+            e.2 += exact;
+            out.linked_objects += 1;
+            out.linked_bytes += bytes;
+            out.exact_linked_bytes += exact;
+        }
+        let mut groups: Vec<(u32, (u64, u64, u64))> = per.into_iter().collect();
+        groups.sort_by(|x, y| (y.1 .1, y.1 .0).cmp(&(x.1 .1, x.1 .0)).then(x.0.cmp(&y.0)));
+        groups.truncate(ALLOCATED_AT_STACKS);
+        for (g, (objects, bytes, exact)) in groups {
+            out.approximate |= self.stacks.groups[g as usize].approximate;
+            out.stacks.push(AllocatedAtStack {
+                frames: self.stacks.stack_frames(g),
+                linked_objects: objects,
+                linked_bytes: bytes,
+                exact_linked_bytes: exact,
+                top_stack_rank: rank_of.get(&g).copied(),
+            });
+        }
+        out
     }
 
     fn block(&self, profile: &Profile, path: &str, top: &[u32]) -> Allocations {
@@ -531,7 +607,8 @@ impl Join {
     }
 }
 
-/// [`crate::analyze`] plus the `allocations` block. `profile_path` is the profile's path as given by the
+/// [`crate::analyze`] plus the `allocations` block and per-retainer
+/// `allocated_at`. `profile_path` is the profile's path as given by the
 /// user.
 pub fn analyze_with_allocations(
     snap: &Snapshot,
@@ -541,15 +618,25 @@ pub fn analyze_with_allocations(
     profile_path: &str,
 ) -> Result<AnalyzeReport> {
     let a = Analysis::new(snap)?;
-    let (mut report, _) = crate::analyze_with(&a, path, opts)?;
+    let (mut report, nodes) = crate::analyze_with(&a, path, opts)?;
     let j = Join::new(&a, profile)?;
     let top = j.top(opts.top);
+    let rank_of: HashMap<u32, u32> = top
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| (g, i as u32 + 1))
+        .collect();
+    for (r, &v) in report.top_retainers.iter_mut().zip(&nodes) {
+        r.allocated_at = Some(j.allocated_at(v, &rank_of));
+    }
     report.allocations = Some(j.block(profile, profile_path, &top));
     report.notes.extend(j.notes);
     Ok(report)
 }
 
-/// [`crate::query_type`] plus the profile's notes.
+/// [`crate::query_type`] plus per-instance `allocated_at`.
+/// `top_stack_rank` is always `null` here, since a type query has no
+/// `top_stacks`.
 pub fn query_type_with_allocations(
     snap: &Snapshot,
     path: &str,
@@ -558,8 +645,12 @@ pub fn query_type_with_allocations(
     profile: &Profile,
 ) -> Result<TypeQueryReport> {
     let a = Analysis::new(snap)?;
-    let (mut report, _) = crate::query::query_type(&a, path, type_name, opts)?;
+    let (mut report, nodes) = crate::query::query_type(&a, path, type_name, opts)?;
     let j = Join::new(&a, profile)?;
+    let none = HashMap::new();
+    for (r, &v) in report.top_instances.iter_mut().zip(&nodes) {
+        r.allocated_at = Some(j.allocated_at(v, &none));
+    }
     report.notes.extend(j.notes);
     Ok(report)
 }

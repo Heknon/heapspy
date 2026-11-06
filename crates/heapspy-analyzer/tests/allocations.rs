@@ -250,6 +250,11 @@ fn objects_without_a_covering_sample() {
     assert_eq!(a.coverage.linked_pct, 0.0);
     assert_eq!(a.top_stacks.len(), 1);
     assert_eq!(a.top_stacks[0].samples, 3);
+    for t in &r.top_retainers {
+        let at = t.allocated_at.as_ref().unwrap();
+        assert_eq!(at.linked_objects, 0);
+        assert!(at.stacks.is_empty());
+    }
 }
 
 /// CACHE holds six blocks: four allocated by `fill`, two by `load`.
@@ -266,6 +271,69 @@ fn two_stack_cache() -> (Snapshot, Profile) {
         }
     }
     (s.build(), p.build())
+}
+
+#[test]
+fn allocated_at_splits_a_cache_by_stack() {
+    let (s, p) = two_stack_cache();
+    let r = analyze(&s, &p);
+    let cache = &r.top_retainers[0];
+    assert_eq!(cache.address.0, 0x3000);
+    let at = cache.allocated_at.as_ref().unwrap();
+    assert_eq!(at.linked_objects, 6);
+    assert_eq!(at.linked_bytes, 30_000);
+    assert_eq!(at.exact_linked_bytes, 30_000);
+    assert_eq!(at.stacks.len(), 2);
+    assert_eq!(at.stacks[0].frames[0].function, "fill");
+    assert_eq!(at.stacks[0].linked_objects, 4);
+    assert_eq!(at.stacks[0].linked_bytes, 20_000);
+    assert_eq!(at.stacks[1].frames[0].function, "load");
+    assert_eq!(at.stacks[1].linked_objects, 2);
+    assert_eq!(at.stacks[1].linked_bytes, 10_000);
+    let sum: u64 = at.stacks.iter().map(|s| s.linked_bytes).sum();
+    assert_eq!(sum, at.linked_bytes);
+    assert!(!at.approximate);
+
+    // The same on a type query, per instance.
+    let q = query(&s, &p);
+    assert_eq!(q.top_instances.len(), 6);
+    let fills = q
+        .top_instances
+        .iter()
+        .filter(|i| {
+            let at = i.allocated_at.as_ref().unwrap();
+            at.stacks.len() == 1 && at.stacks[0].frames[0].function == "fill"
+        })
+        .count();
+    assert_eq!(fills, 4);
+    for i in &q.top_instances {
+        let at = i.allocated_at.as_ref().unwrap();
+        assert_eq!(at.linked_objects, 1);
+        assert_eq!(at.stacks[0].top_stack_rank, None);
+    }
+    assert!(codes(&q.notes).contains(&"allocations_sampled"));
+}
+
+#[test]
+fn top_stack_rank_points_into_top_stacks() {
+    let (s, p) = two_stack_cache();
+    let r = analyze(&s, &p);
+    let a = r.allocations.as_ref().unwrap();
+    let at = r.top_retainers[0].allocated_at.as_ref().unwrap();
+    for st in &at.stacks {
+        let rank = st.top_stack_rank.unwrap();
+        assert_eq!(a.top_stacks[rank as usize - 1].frames, st.frames);
+    }
+    assert_eq!(at.stacks[0].top_stack_rank, Some(1));
+    assert_eq!(at.stacks[1].top_stack_rank, Some(2));
+
+    // With --top 1 the second stack is not listed, so it has no rank.
+    let r =
+        analyze_with_allocations(&s, "a.hpy", &AnalyzeOptions { top: 1 }, &p, "a.hpya").unwrap();
+    assert_eq!(r.allocations.as_ref().unwrap().top_stacks.len(), 1);
+    let at = r.top_retainers[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.stacks[0].top_stack_rank, Some(1));
+    assert_eq!(at.stacks[1].top_stack_rank, None);
 }
 
 #[test]
@@ -398,6 +466,7 @@ fn reports_round_trip_through_json() {
         v["allocations"]["top_stacks"][0]["frames"][0]["location"],
         "app.py:4"
     );
+    assert!(v["top_retainers"][0]["allocated_at"]["stacks"][0]["top_stack_rank"].is_u64());
 
     let q = query(&s, &p);
     let back: TypeQueryReport = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();

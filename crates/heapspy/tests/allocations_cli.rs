@@ -197,11 +197,17 @@ fn matching_allocations_are_accepted() {
     assert_eq!(a.coverage.linked_objects, 1);
     assert_eq!(a.coverage.exact_linked_bytes, 4096);
     assert_eq!(a.top_stacks[0].frames[0].location, "app.py:4");
+    let at = r.top_retainers[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.linked_bytes, 4096);
+    assert_eq!(at.stacks[0].top_stack_rank, Some(1));
 
     let out = heapspy(&["query", s, "--type", "bytes", "--json", "--allocations", p]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let r: TypeQueryReport = serde_json::from_slice(&out.stdout).unwrap();
     assert!(notes(&r.notes).contains(&"allocations_sampled"));
+    let at = r.top_instances[0].allocated_at.as_ref().unwrap();
+    assert_eq!(at.stacks[0].frames[0].function, "fill");
+    assert_eq!(at.stacks[0].top_stack_rank, None);
 
     // Without --allocations the fields are null.
     let out = heapspy(&["analyze", s, "--json"]);

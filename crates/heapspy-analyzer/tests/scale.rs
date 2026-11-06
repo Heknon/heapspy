@@ -261,3 +261,154 @@ fn flame_five_million_objects() {
     assert!(f.lines.iter().all(|l| l.stack.split(';').count() <= 33));
     assert!(out.len() < 1 << 20, "folded output should stay small");
 }
+
+/// The allocation join on the generated heap: 10 million objects by default
+/// (`HEAPSPY_SCALE_OBJECTS`) and 1 million samples (`HEAPSPY_SCALE_SAMPLES`).
+/// Run with
+///
+/// ```sh
+/// cargo test --release -p heapspy-analyzer --test scale join -- --ignored --nocapture
+/// ```
+///
+/// Samples: one arena per 1 MiB of the object range (every object is in
+/// one), a pool sample every 64th sample, and large-object samples on
+/// random objects, a tenth of them re-sampling an address already used
+/// (address reuse). 200 stacks of 24 frames.
+#[test]
+#[ignore]
+fn join_ten_million_objects_one_million_samples() {
+    use heapspy_alloc::{
+        linetable, AllocWriter, CodeInput, EventKind, FrameInput, Profile, ProfileInfo, SampleInput,
+    };
+    use heapspy_analyzer::allocations::analyze_with_allocations;
+
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let n = env("HEAPSPY_SCALE_OBJECTS", 10_000_000);
+    let m = env("HEAPSPY_SCALE_SAMPLES", 1_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scale.hpy");
+    let ppath = dir.path().join("scale.hpya");
+    write(n, &path, dir.path());
+
+    // Objects are at 0x1000 + i * 0x40.
+    let lo = 0x1000u64;
+    let hi = 0x1000 + n * 0x40;
+    let mut info = ProfileInfo::new_for_test();
+    info.end_ns = m;
+    let mut w = AllocWriter::with_spill_dir(info, dir.path()).unwrap();
+    let table = linetable::encode_lines(1, &[(64, Some(2))]);
+    let codes: Vec<_> = (0..400u64)
+        .map(|k| {
+            let name = format!("f{k}");
+            let c = CodeInput::new(0x9000_0000 + k * 0x100, &name, "app/mod.py", 1, &table);
+            w.add_code(&c).unwrap()
+        })
+        .collect();
+    let mut rng = Lcg(7);
+    let mut frames = Vec::with_capacity(24);
+    let arenas = (hi - lo).div_ceil(1 << 20);
+    let mut used: Vec<u64> = Vec::new();
+    for t in 0..m {
+        let (kind, address, size) = if t < arenas {
+            (EventKind::Arena, lo + t * (1 << 20), 1u64 << 20)
+        } else if t % 64 == 0 {
+            let p = lo + (rng.next() % (hi - lo)) / 0x4000 * 0x4000;
+            (EventKind::Pool, p, 0x4000)
+        } else if t % 10 == 0 && !used.is_empty() {
+            let a = used[(rng.next() % used.len() as u64) as usize];
+            (EventKind::LargeObject, a, 0x40)
+        } else {
+            let a = lo + (rng.next() % n) * 0x40 - 0x10;
+            if used.len() < 100_000 {
+                used.push(a);
+            }
+            (EventKind::LargeObject, a, 0x40)
+        };
+        let stack = rng.next() % 200;
+        frames.clear();
+        for d in 0..24u64 {
+            frames.push(FrameInput {
+                code: Some(codes[((stack + d * 7) % 400) as usize]),
+                instr_offset: Some(((stack + d) % 32) as u32 * 2),
+                approximate: false,
+            });
+        }
+        let s = SampleInput {
+            timestamp_ns: t,
+            kind,
+            address,
+            size,
+            weight: size,
+            ..SampleInput::default()
+        };
+        w.add_sample(&s, &frames).unwrap();
+    }
+    let stats = w.finish_to_path(&ppath).unwrap();
+    eprintln!(
+        "wrote {n} objects and {} samples ({} frames, {} MiB profile)",
+        stats.samples,
+        stats.frames,
+        stats.bytes_written >> 20
+    );
+
+    let snap = Snapshot::open(&path).unwrap();
+    let prof = Profile::open(&ppath).unwrap();
+
+    // The two join phases on their own.
+    reset_peak();
+    let t = Instant::now();
+    let ranges: Vec<(u64, u64)> = prof
+        .samples()
+        .map(|s| (s.address, s.address + s.size))
+        .collect();
+    let objects = snap.object_count() as u32;
+    let links = heapspy_analyzer::allocations::latest_covering(
+        (0..objects).map(|i| snap.object_addr(i)),
+        &ranges,
+    )
+    .unwrap();
+    let sweep_s = t.elapsed().as_secs_f64();
+    let sweep_peak = rss_kib().map(|r| r.0 >> 10);
+    drop((links, ranges));
+    eprintln!("address sweep {sweep_s:.2}s (peak RSS {sweep_peak:?} MiB, mapped files included)");
+
+    reset_peak();
+    let t = Instant::now();
+    let plain = analyze(&snap, "scale.hpy", &AnalyzeOptions::default()).unwrap();
+    let analyze_s = t.elapsed().as_secs_f64();
+    let analyze_peak = rss_kib().map(|r| r.0 >> 10);
+
+    reset_peak();
+    let t = Instant::now();
+    let opts = AnalyzeOptions::default();
+    let r = analyze_with_allocations(&snap, "scale.hpy", &opts, &prof, "scale.hpya").unwrap();
+    let joined_s = t.elapsed().as_secs_f64();
+    let joined_peak = rss_kib().map(|r| r.0 >> 10);
+    let a = r.allocations.as_ref().unwrap();
+    // Both runs include the whole analysis, which dominates and varies from
+    // run to run; the phase timings above are the join's own cost.
+    eprintln!(
+        "analyze {analyze_s:.2}s (peak RSS {analyze_peak:?} MiB); analyze with allocations \
+         {joined_s:.2}s (peak RSS {joined_peak:?} MiB)"
+    );
+    eprintln!(
+        "linked {} objects ({:.2}% of reachable bytes), {} exact; {} top stacks",
+        a.coverage.linked_objects,
+        a.coverage.linked_pct,
+        a.coverage.exact_linked_objects,
+        a.top_stacks.len()
+    );
+    assert_eq!(a.samples, m);
+    for (x, y) in plain.top_retainers.iter().zip(&r.top_retainers) {
+        assert_eq!(x.address, y.address);
+        assert_eq!(x.retained_bytes, y.retained_bytes);
+    }
+    // Every object is in an arena, so every reachable object is linked.
+    assert_eq!(a.coverage.linked_objects, r.totals.reachable_objects);
+    assert!(a.coverage.exact_linked_objects > 0);
+}
