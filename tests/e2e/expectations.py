@@ -10,8 +10,8 @@ heapspy's shallow size of an instance is ``sys.getsizeof`` plus the
 instance's attribute values array, which ``getsizeof`` leaves out (see
 docs/cpython-internals.md, "Shallow sizes"), so heapspy reads a little high
 for classes with instance dicts: about 2% for the fixtures here. The band
-allows 2% under and 10% over. Missing the entries of a fixture is far
-outside it.
+allows 2% under and 10% over. Counting the churned objects in the deep-chain
+fixture, or missing the entries of any fixture, is far outside it.
 """
 
 from __future__ import annotations
@@ -73,6 +73,26 @@ class Fixture:
     extra: Callable[[dict[str, Any], Info], None] | None = None
 
 
+def _deep_chain_extra(report: dict[str, Any], info: Info) -> None:
+    totals = report["totals"]
+    # About 1 GiB was allocated and dropped. If any of it were counted the
+    # heap would be hundreds of MiB; the whole graph is a few MiB.
+    graph = totals["reachable_bytes"] + totals["unreachable_bytes"]
+    assert graph < info["churned_bytes"] / 50, (graph, info["churned_bytes"])
+    # The deepest frame was walked: its local is a frame-local root.
+    label = "frame __main__:level_10 local 'scratch'"
+    scratch = [t for t in report["top_retainers"] if t["path"][0]["root_label"] == label]
+    assert scratch, [t["path"][0]["root_label"] for t in report["top_retainers"]]
+    s = scratch[0]
+    assert s["path"][0]["root_kind"] == "frame_local"
+    assert s["type"] == "builtins.list"
+    expected = info["scratch_retained"]
+    assert expected * RETAINED_LO <= s["retained_bytes"] <= expected * RETAINED_HI, (
+        s["retained_bytes"],
+        expected,
+    )
+
+
 FIXTURES = [
     Fixture(
         name="unbounded_cache",
@@ -94,6 +114,68 @@ FIXTURES = [
             # Keys are "GET /api/items/NNNNNN" (21 characters), redacted.
             edges=lambda i: [".__dict__", "['CACHE']", "[<str len=21>]"],
             root_path_prefix=f"{MAIN}['CACHE']",
+        ),
+    ),
+    Fixture(
+        name="deep_chain",
+        script="deep_chain.py",
+        top_type="builtins.list",
+        top_root_path=lambda i: f"{MAIN}['KEPT']",
+        top_path_edges=lambda i: [".__dict__", "['KEPT']"],
+        noise_root_paths=[f"{MAIN}['HISTORY']", "frame __main__:level_10 local 'scratch'"],
+        extra=_deep_chain_extra,
+    ),
+    Fixture(
+        name="growing_list",
+        script="growing_list.py",
+        top_type="builtins.list",
+        top_root_path=lambda i: f"{MAIN}['EVENTS']",
+        top_path_edges=lambda i: [".__dict__", "['EVENTS']"],
+        noise_root_paths=[f"{MAIN}['COUNTERS']"],
+        type_query=TypeQuery(
+            type="__main__.Event",
+            instances=lambda i: i["events"] + 20,
+            holders=[
+                Holder("builtins.list", "[<index>]", lambda i: i["events"] + 20),
+            ],
+        ),
+    ),
+    Fixture(
+        name="closure_capture",
+        script="closure_capture.py",
+        top_type="builtins.bytearray",
+        top_root_path=lambda i: f"{MAIN}['HANDLER'].__closure__[{i['cell_index']}].cell_contents",
+        top_path_edges=lambda i: [
+            "['HANDLER']",
+            f".__closure__[{i['cell_index']}]",
+            ".cell_contents",
+        ],
+        noise_root_paths=[f"{MAIN}['FRAMES']", f"{MAIN}['STATIC_BUFFER']"],
+        path_type_query=PathTypeQuery(
+            type="builtins.bytearray",
+            edges=lambda i: [f".__closure__[{i['cell_index']}]", ".cell_contents"],
+            root_path_prefix=f"{MAIN}['HANDLER']",
+            # Only the largest one: the others are the noise buffers.
+            top=1,
+        ),
+    ),
+    Fixture(
+        name="listener_registry",
+        script="listener_registry.py",
+        top_type="builtins.list",
+        top_root_path=lambda i: f"{MAIN}['BUS'].listeners",
+        top_path_edges=lambda i: [".__dict__", "['BUS']", ".listeners"],
+        noise_root_paths=[f"{MAIN}['WIDGET_NAMES']"],
+        type_query=TypeQuery(
+            type="__main__.Listener",
+            instances=lambda i: i["listeners"] + 10,
+            holders=[
+                Holder("builtins.list", "[<index>]", lambda i: i["listeners"] + 10),
+            ],
+        ),
+        path_type_query=PathTypeQuery(
+            type="__main__.Listener",
+            edges=lambda i: ["['BUS']", ".listeners"],
         ),
     ),
 ]
