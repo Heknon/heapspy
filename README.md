@@ -158,12 +158,23 @@ Planned tools:
 
 ## Installation (planned)
 
-heapspy will be a Rust binary distributed as PyPI wheels, the same way py-spy is:
+Nothing has been released yet. Until the first release, the commands below will not find a package. heapspy will be a Rust binary distributed as PyPI wheels, the same way py-spy is. The wheels contain only the binary and work with any Python 3.8 or later:
 
 ```sh
 pip install heapspy
+pipx install heapspy      # or keep it in its own environment
 pip install heapspy-mcp   # optional, for agent integration
 ```
+
+Wheels are planned for Linux x86_64 and aarch64 (glibc), Linux x86_64 (musl) and Windows x86_64. Each GitHub release will also have the bare binaries attached.
+
+To build from source now, with Rust 1.85 or later:
+
+```sh
+cargo install --git https://github.com/Heknon/heapspy heapspy
+```
+
+See [docs/releasing.md](docs/releasing.md) for how releases are built and published.
 
 ## Roadmap
 
@@ -190,6 +201,9 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
+| `docs/releasing.md` | how to cut a release and the one-time PyPI setup |
+| `pyproject.toml` | maturin config that packages the `heapspy` binary as a PyPI wheel |
+| `scripts/check-version.py` | checks that the release tag and package versions agree |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and how CI is run.
 

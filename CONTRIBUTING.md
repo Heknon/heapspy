@@ -51,6 +51,20 @@ uvx ruff check tests/e2e && uvx ruff format --check tests/e2e
 See [tests/e2e/README.md](tests/e2e/README.md) for choosing interpreters and
 adding a fixture.
 
+### Release workflow
+
+`.github/workflows/release.yml` builds the PyPI wheels and sdists and
+publishes them. It also runs only when asked:
+
+| Trigger | What runs |
+|---|---|
+| tag push matching `v*` | version check, all builds, publish to PyPI, GitHub release |
+| manual dispatch, `publish: none` | version check and all builds; artifacts on the run page |
+| manual dispatch, `publish: testpypi` | the same, then upload to TestPyPI |
+
+It has no PR or branch push triggers. A tag push runs both this workflow and
+`ci.yml`. See [docs/releasing.md](docs/releasing.md) for the release steps.
+
 ## Commits
 
 - Imperative subject line, under about 70 characters.
