@@ -148,7 +148,7 @@ heapspy flamegraph --diff before.hpy after.hpy -o diff.svg
 
 The differential graph matches frames between the two dumps by frame text, not by object identity, so the matching is approximate in the same way as `diff`. For example, sessions whose keys got one character longer show up as a new frame. `--diff ... --folded` writes `stack before after` lines, the input format of inferno's and FlameGraph's differential mode. The cutoff applies to the wider of the two sides, so a frame is folded in both snapshots or in neither.
 
-### Record where memory is allocated (M7, in progress)
+### Record where memory is allocated (M7)
 
 ```sh
 # Sample allocations with their Python stacks for 60 s, then take a snapshot
@@ -158,7 +158,14 @@ heapspy analyze app.hpy --allocations app.hpya
 heapspy query app.hpy --type Session --allocations app.hpya
 ```
 
-`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The `.hpya` file format is final for version 1. The recorders are not implemented yet: `record` exits with a "not implemented yet" error (with `--json`, an error document with code `unimplemented`; a PID with no process gives `no_such_process`). The analyzer side works on any `.hpya` file.
+`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The `.hpya` file format is final for version 1.
+
+How it records, without running code in the target:
+- **Linux, eBPF** (default; root or `CAP_BPF` + `CAP_PERFMON`, kernel 5.8+): arenas from `mmap` and sampled large objects from allocator uprobes, each with the Python stack read in the kernel at the event.
+- **Linux, ptrace** (fallback, or `--mechanism ptrace`): arenas only, with exact stacks, stopping at system calls.
+- **Windows** (elevated): arenas from ETW, with approximate frames, and from debugger breakpoints, with exact frames. It is implemented but not yet tested on Windows.
+
+Pools are never recorded, because pool carving is inlined in every build checked. Large objects cost one uprobe trap per allocator call above 512 bytes (about 0.5 µs). On an extreme benchmark that slowed the target by 30-50%; arenas alone cost a few percent. Numbers are in [docs/allocation-sampling.md](docs/allocation-sampling.md#measurements). Ctrl-C ends a recording early with a valid profile flagged truncated.
 
 `analyze --allocations` links snapshot objects to samples by address. Each object gets the latest sample whose range (an arena, a pool, or one large allocation) contains it. It then adds an "Allocated by" section: the stacks that allocated the most during the window, innermost frame first with `file:line`, with estimated bytes allocated and the bytes of live objects linked to each. Under each top retainer it shows the one or two stacks that allocated the memory it retains. `query --type --allocations` shows the same per instance. Read the numbers as an estimate of where growth came from:
 
@@ -268,7 +275,7 @@ See [docs/releasing.md](docs/releasing.md) for how releases are built and publis
 | M4 | Windows minidump backend | done |
 | M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
 | M6 | `heapspy-mcp` | done |
-| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
+| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | Linux done; Windows implemented, untested on Windows |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
 
@@ -280,7 +287,7 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
 | `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
 | `crates/heapspy-alloc` | allocation profile format (`.hpya`): types, streaming writer, mmap reader, line tables, test builder |
-| `crates/heapspy-record` | `heapspy record`: recorder interface and options; eBPF, ptrace and Windows recorders (stubs) |
+| `crates/heapspy-record` | `heapspy record`: recorder interface and options; eBPF (`bpf/` holds the committed BPF object and its source), ptrace and Windows recorders |
 | `crates/heapspy` | the `heapspy` command-line tool |
 | `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |

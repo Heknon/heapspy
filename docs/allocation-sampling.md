@@ -1,6 +1,6 @@
 # Allocation sampling (M7): design
 
-Status: in progress. The shared contracts are in place: the `.hpya` format ([docs/alloc-format.md](alloc-format.md), `crates/heapspy-alloc`), the recorder interface (`crates/heapspy-record`), the frame offsets recorders read stacks with (`heapspy_reader::cpython::frames`), the `record` command and `--allocations` flags, and the report fields ([docs/json-schema.md](json-schema.md#allocations)). The join (M7c) is implemented; the recorders (M7a, M7b) are stubs. [Decisions](#decisions) records what was settled while building the contracts. The spike checklist at the end is still open.
+Status: built. The `.hpya` format ([docs/alloc-format.md](alloc-format.md), `crates/heapspy-alloc`), the recorder interface and recorders (`crates/heapspy-record`), the frame offsets recorders read stacks with (`heapspy_reader::cpython::frames`), the `record` command and `--allocations` flags, the join (M7c) and the report fields ([docs/json-schema.md](json-schema.md#allocations)). The Linux recorders (M7a) are tested against live 3.12, 3.13 and 3.14 processes; the Windows recorder (M7b) is compiled and its logic unit-tested, but has not run on Windows yet ([test plan](windows-record-test-plan.md)). [Decisions](#decisions) records what was settled while building the contracts, [Measurements](#measurements) the overhead, and [Spike results](#spike-results) what the spike found.
 
 ## Why
 
@@ -52,21 +52,36 @@ Code object addresses are turned into `qualname` and `file:line` after recording
 
 ## Linux: eBPF
 
-- **Probes.**
-  - `tracepoint:syscalls:sys_enter_mmap` / `sys_exit_mmap`, filtered by pid and by the arena size, catch arenas.
-  - A uprobe on the pool-carving function catches pools where the symbol exists.
-  - A uprobe on `PyMem_RawMalloc`/`malloc`, with an in-kernel size filter and a byte-interval sampler, catches large objects.
-- **Python stack capture inside the BPF program.**
-  - Find the current thread's `PyThreadState`: walk `interp->threads` comparing `native_thread_id` with the current tid, or read the thread-local `_Py_tss_tstate` through the task's `fsbase` where the TLS offset is known.
-  - Then follow `current_frame` → `previous`, copying `f_executable` and `instr_ptr` per frame.
-  - The offsets come from the same per-version tables (and `_Py_DebugOffsets` on 3.13+) that the snapshot walker uses, passed to the program as a map.
-  - This is the technique Parca and Pyroscope use for Python CPU profiling.
-- **Output.** Samples go out through a ring buffer, and user space writes them to the `.hpya` file.
-- **Crate.** `aya` keeps it in pure Rust with no clang at runtime. Build the BPF object at compile time and embed it.
-- **Permissions.** `CAP_BPF` + `CAP_PERFMON` (or root), and kernel 5.8+ for the ring buffer. In containers this needs the capabilities and access to the host's tracefs.
-- **Fallback when eBPF is unavailable.** A ptrace breakpoint on the arena path only. That event is rare enough to stop the thread for each hit, read the Python stack with `process_vm_readv`, and continue. Slower per event, same output.
+As built (`crates/heapspy-record/src/linux_ebpf.rs` has the details, `bpf/heapspy.bpf.c` the kernel side):
+
+- **Arenas.** Raw tracepoints `sys_enter` / `sys_exit`, filtered in the kernel to the target's tgid and to `mmap(NULL, 1 MiB, ..., MAP_ANONYMOUS, -1, ...)`, enter and exit paired per thread. No symbols, no tracefs.
+- **Pools.** Not recorded: no build tested has an out-of-line pool-carving function. Asked for, they go to meta `heapspy.skipped_events`.
+- **Large objects.** Probes on `_PyMem_RawMalloc`, `_PyMem_RawCalloc` and `_PyMem_RawRealloc` when the interpreter's `.symtab` has them, else libc `malloc`, `calloc` and `realloc` (Debian's 3.12 has only dynamic symbols). pymalloc hands every request above 512 bytes to the raw allocator, so either set sees every large object. `_PyObject_Malloc` is not probed, because it calls the raw allocator and nested probes overwrite each other's pending entry. The size filter (> 512) and the byte-interval sampler (a per-CPU countdown refilled from 256 quantiles of an exponential distribution) run in the kernel.
+  - **Kernel 6.13+:** one *uprobe session* program per function. The entry decides whether the call is sampled and returns non-zero to skip the return probe, so an unsampled call costs one trap, not two.
+  - **Older kernels:** a uprobe and a uretprobe per function, as perf events for the target pid.
+  - Entries and returns are paired by (tid, stack pointer at entry), which is exact under nesting.
+  - A leading `endbr64` (CET builds of glibc) is skipped: the kernel cannot emulate it and single-steps it out of line, which made every libc `malloc` hit cost tens of microseconds (Debian 3.12 ran at 2% of its speed). The next instruction, `push %rbp`, is emulated.
+- **Python stack in the kernel.** The thread state is found by `native_thread_id` (an LRU cache, else a bounded walk of 4 interpreters × 256 threads), then the frame chain is followed exactly like `read_stack`: `cframe` on 3.12, shim frames skipped, `f_executable & ~3` on 3.14. Up to 128 frames are copied (more are marked truncated); user space keeps the frames whose type is `code` and computes instruction offsets. Bounded loops, no `bpf_loop`; the frame count lives in map memory so the verifier prunes loop states (with it in a register, the walk hit the 1M-instruction limit).
+- **Output.** Events are assembled in a per-CPU scratch map and copied to a 16 MiB ring buffer with only the frames used. Reserving fixed-size 3 KiB events dropped about 7% of samples at high rates; this drops none in the benchmark. Times are `CLOCK_MONOTONIC`, converted with an offset measured at start.
+- **Build.** No `aya` and no libbpf: the BPF object is built from C with clang (`bpf/build.sh`, clang 18), committed, and embedded with `include_bytes!`. A ~300-line loader on the `object` crate creates the maps (legacy `maps` section, no BTF) and patches map references. A plain `cargo build` needs no clang, so the manylinux wheel builds need nothing new. After editing `heapspy.bpf.c`, run `bpf/build.sh` and commit the object. `bpf/build.sh --check` (or the ignored test `committed_object_matches_source`) verifies that the committed copy matches the source. x86_64 only.
+- **Cleanup.** Every map, program and attachment is a file descriptor (uprobe perf events or links for the pid, raw tracepoint links). Nothing is registered in tracefs, so the kernel removes everything when heapspy exits, however it exits, SIGKILL included. While probes are attached, the kernel's copy-on-write pages of the target's code hold `int3`s; they are restored when the probes go. The live tests check both.
+- **Permissions.** Root, or `CAP_BPF` + `CAP_PERFMON` and `CAP_SYS_PTRACE` (for reading the target), kernel 5.8+. `auto` falls back to ptrace on `PermissionDenied` or `Unsupported`.
+
+### Fallback: ptrace
+
+Arenas only, with exact stacks (`linux_ptrace.rs`). Every thread is seized with `PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE`, and syscall stops are used: no symbols, and nothing is written into the target. At an arena `mmap`'s exit the thread is still stopped inside the allocating call, so `read_stack` reads exact frames. The tracer waits in `sigtimedwait(SIGCHLD)`, so each stop is handled when it is reported. Group stops are kept with `PTRACE_LISTEN`, and signals are re-injected. Every thread is detached on every exit path; if heapspy is killed, the kernel detaches the tracees.
+
+**Pause per hit.** Every syscall of every thread stops twice, not only `mmap`. Seccomp filtering would avoid that, but it needs code run in the target. The tracer's own handling is about 9 µs per stop (`total_pause_ns` / `probe_hits`), and an arena hit adds the stack read. The full cost includes two context switches per stop: a victim making 25k `stat` calls a second ran 86% slower under ptrace. A victim that makes few syscalls barely notices it (see [Measurements](#measurements)).
 
 ## Windows: ETW plus debugger breakpoints
+
+**As built** (`crates/heapspy-record/src/windows.rs`; compiled and unit-tested on Linux, not yet run on Windows, see [the test plan](windows-record-test-plan.md)):
+- Arenas only, on both paths. Heap tracing applies only to processes started after `TracingFlags` is set in Image File Execution Options, so it cannot attach to a running process. Large objects go to `heapspy.skipped_events`.
+- ETW: the "NT Kernel Logger" with `EVENT_TRACE_FLAG_VIRTUAL_ALLOC`, `PageFault_VirtualAlloc` events of 1 MiB with `MEM_COMMIT | MEM_RESERVE`, no stack walks. A real-time consumer gets FILETIME timestamps. A side thread samples every Python thread's stack every 5 ms. An event takes the same thread's nearest sample within 20 ms (`windows::matcher`), else no frames. Events are held 2 s so that an arena the debugger also saw is written once, with exact frames. `EventsLost` and `RealTimeBuffersLost` count as dropped.
+- Debugger: a breakpoint on `VirtualAlloc` in `kernelbase.dll` (found through the export table, no PDBs). A hit is an arena call when the arguments match and `[rsp]` is in the Python DLL. The stack is read there, and a one-shot breakpoint at the return address gets the result. The event loop is a pure state machine (`windows::debug`) with unit tests. It removes every `int3` and trap flag and drains late hits before `DebugActiveProcessStop`, also on drop.
+- `live::open`: `ReadProcessMemory`, `EnumProcessModulesEx`, a Toolhelp thread snapshot. Nothing is suspended.
+
+The design as first written:
 
 ETW records native stacks with low overhead, but it cannot run code at event time. So it cannot read `PyThreadState` while the allocating thread is still at the allocation site. heapspy uses two mechanisms, each where it is good:
 
@@ -124,7 +139,8 @@ Implemented in `heapspy_analyzer::allocations`. `analyze --allocations`, `query 
 
 **Not built yet.**
 - `diff --allocations` only checks the profile against AFTER. Adding allocating stacks to growth sites needs the diff to keep each site's member objects, so it is left for later.
-- **MCP:** a new `allocation_sites` tool, and `heap_summary` passes `allocated_at` through when a sidecar is given.
+
+**MCP.** The `allocation_sites` tool lists the top stacks, and `heap_summary` passes `allocated_at` through when a sidecar is given. A contract test records a live process and checks that the tool returns the known allocating stack (`python/heapspy-mcp/tests/test_contract_real.py`).
 
 ## Decisions
 
@@ -132,12 +148,12 @@ Settled while building the shared contracts, before the recorders.
 
 **Crates.**
 - `heapspy-alloc` is the format: types, `AllocWriter`, `Profile`, the line-table decoder and `ProfileBuilder` for tests. It depends only on `heapspy-snapshot` (for `PythonVersion`, `Os`, `Arch`), so the analyzer can read profiles without pulling in recorders.
-- `heapspy-record` holds the recorders and what they share: `RecordOptions`, the `Recorder` trait, `Target`, `SampleSink`, and `record` / `record_with`, which own the header, the overhead fields and the file. It depends on `heapspy-reader` and `heapspy-alloc`. Platform crates (`aya`, ETW bindings) go here, behind `cfg`.
+- `heapspy-record` holds the recorders and what they share: `RecordOptions`, the `Recorder` trait, `Target`, `SampleSink`, and `record` / `record_with`, which own the header, the overhead fields and the file. It depends on `heapspy-reader` and `heapspy-alloc`. Platform dependencies go here, behind `cfg`: `libc` and `object` on Linux (no `aya`, see [Linux: eBPF](#linux-ebpf)), `windows-sys` on Windows.
 - The join lives in `heapspy-analyzer::allocations` (`analyze_with_allocations`, `query_type_with_allocations`), next to the dominator tree it needs.
 
 **CPython offsets for recorders.** A recorder calls `Target::locate`, which runs `heapspy_reader::cpython::locate_runtime` and `cpython::frame_offsets` on a reader of the running process. That is the same code and the same per-version tables the snapshot walker uses, with `_Py_DebugOffsets` applied on 3.13+. `FrameOffsets` is the subset needed to go from `_PyRuntime` to each thread state, along the frame chain, and into code objects. It is plain `Copy` data, so the eBPF recorder copies it into a map. `cpython::frames::{thread_states, read_stack, read_code}` are the user-space reference for the same walk; the ptrace, debugger and ETW-sampler paths use them directly. Two fields were added to the offset table for this: `instr_ptr` (`prev_instr` on 3.12, 56 on all three versions) and `co_code_adaptive` (192, 200, 208). An ignored test reads the stack of running 3.12, 3.13 and 3.14 processes and checks every frame's function and line.
 
-**Reading a running process.** `heapspy dump`'s live sources stop the target, which a recorder must not do. `heapspy_record::live::open` is the seam for a reader that never stops it: `process_vm_readv` on Linux, `ReadProcessMemory` on Windows. It is a stub, with notes, for M7a and M7b to fill in.
+**Reading a running process.** `heapspy dump`'s live sources stop the target, which a recorder must not do. `heapspy_record::live::open` is a reader that never stops it: `LiveProcess::open_running` (`process_vm_readv`, no block cache) on Linux, `ReadProcessMemory` on Windows.
 
 **Code objects.**
 - Frames are recorded as (code object address, instruction offset).
@@ -155,19 +171,19 @@ Settled while building the shared contracts, before the recorders.
 - Arena and pool samples weigh their size. Large objects use a Poisson byte sampler: keep with probability `1 - exp(-size / interval)` and weigh `size / p` (`heapspy_alloc::sampled_weight`).
 - Frames are innermost first, with flags for approximate frames (ETW), a truncated stack, and a native thread with no thread state.
 
-**Defaults.** `--events arena,large`, `--interval 512K`, `--max-frames 64` (at most 1024). The interval is provisional until the spike measures the uprobe overhead.
+**Defaults.** `--events arena,large`, `--interval 512K`, `--max-frames 64` (at most 1024; eBPF copies at most 128). The interval stays at 512K after measuring. The overhead is the trap on every allocator call, and it does not depend on the interval (see [Measurements](#measurements)). The interval only sets the sample count, which is the accuracy and the file size: at 512K the benchmark writes about 9,000 samples a second (about 1 MB/s). That is plenty to rank stacks, and a smaller interval buys accuracy at no extra cost to the target.
 
 **Mechanism selection.**
 - `--mechanism auto` on Linux tries eBPF, then ptrace. Each recorder's `probe` returns `Unsupported` or `PermissionDenied` to move on.
 - On Windows, `auto` runs ETW and debugger breakpoints together. `etw` or `debugger` runs one; with `debugger` alone, only arenas are recorded.
 - The ptrace fallback records arenas only. It notes the event kinds it skipped in the `heapspy.skipped_events` meta key instead of failing.
 
-**Failure handling.** A recording that fails writes no file; the writer only renames its temporary file into place on success.
+**Failure handling.** A recording that fails writes no file; the writer only renames its temporary file into place on success. SIGINT and SIGTERM (Ctrl-C, Ctrl-Break on Windows) end the window early: the recorder detaches and writes a valid profile flagged `truncated`. A recording that dropped samples or outlived its target is also flagged `truncated`.
 
 **Joining.**
 - `--allocations` opens and validates the profile. It then checks the profile against the snapshot (`AFTER` for diff): the pid (for live-process snapshots), the CPython version, and that the snapshot was not taken before recording started.
 - A mismatch is a warning on stderr and a note in the report (`allocations_pid_mismatch`, `allocations_python_mismatch`, `allocations_after_snapshot`). A joined report with a mismatch links nothing and adds `allocations_not_linked`.
-- `analyze` and `query --type` join the profile with the snapshot (M7c, see [Joining with a snapshot](#joining-with-a-snapshot)) and add the `allocations_sampled` note. `allocations_not_joined`, the note the stub printed, is no longer emitted. `diff` and `--retaining-path` have no allocation fields and only check the profile.
+- `analyze` and `query --type` join the profile with the snapshot (M7c, see [Joining with a snapshot](#joining-with-a-snapshot)) and add the `allocations_sampled` note. `allocations_not_joined`, the note printed before the join existed, is no longer emitted. `diff` and `--retaining-path` have no allocation fields and only check the profile.
 - A missing profile is error code `io`. A corrupt one is `invalid_allocations`.
 
 **Report fields.** The new fields are always present in new documents (`null` without `--allocations`), as the schema rules require. They deserialize to `null` when missing, so documents from older versions still parse.
@@ -180,7 +196,37 @@ Settled while building the shared contracts, before the recorders.
 | M7b | Windows recorder: ETW session, debugger-breakpoint path, approximate stack correlation |
 | M7c | Analyzer join, report fields, text output, MCP tool, e2e fixtures with a known allocating call chain on both OSes |
 
-## Spike checklist
+## Measurements
+
+Victim: one loop per iteration allocating a 64 KiB `bytes`, eight 2 KiB `bytearray`s and a list of 200 small tuples (about 900,000 allocator calls above 512 bytes per second, an extreme rate). Throughput is the median of 0.5 s windows over 4 s, unrecorded and then recorded, in the same process. Linux 6.18, 4 vCPUs. Unrecorded runs vary by about ±10%, so single-digit differences are noise.
+
+| events, mechanism | 3.12 (Debian, libc probes) | 3.13 (`_PyMem_Raw*`) | 3.14 (`_PyMem_Raw*`) |
+|---|---|---|---|
+| arena, eBPF | 4% | 3% | 6% |
+| large, eBPF, interval 64K | 43% | 49% | 38% |
+| large, eBPF, interval 512K (default) | 45% | 50% | 35% |
+| large, eBPF, interval 4M | 46% | 43% | 29% |
+| arena + large, eBPF, 512K (default) | 44% | 45% | 38% |
+| arena, ptrace | noise | noise | noise |
+
+- **Large objects cost per call, not per sample.** At 64K and at 4M the slowdown is the same. It is the uprobe trap on each of the ~900k calls a second, about 0.5 µs each with uprobe sessions. Before sessions (uprobe + uretprobe on every call), the default cost 56% on 3.13. Before skipping `endbr64`, Debian 3.12's libc probes cost 98%. A process that allocates large objects at a tenth of this rate pays about a tenth of the cost. Record arenas alone (`--events arena`) when that is too much.
+- **Arenas are nearly free with eBPF.** On a leaking victim that maps about 190 arenas a second, arena recording cost about 5%, the same as an unrecorded run drifts.
+- **ptrace costs per syscall.** On the benchmark (few syscalls), ptrace was within noise. With an `os.stat` per iteration (25,000 syscalls a second), it cost 86% (101k stops in 4 s, 0.9 s of tracer handling).
+- **Dropped samples.** With uprobe sessions and the sized ring buffer, none in these runs at any interval.
+
+## Spike results
+
+- **Pool carving.** None of the builds tested (Debian 3.12, python-build-standalone 3.12, 3.13 and 3.14, a local 3.13) has an out-of-line pool-carving function: it is inlined into `pymalloc_alloc`. Pools are not recorded.
+- **Symbols.** All but Debian 3.12 (dynamic symbols only) have `_PyObject_Malloc` and `_PyMem_Raw*` in `.symtab`, and all are statically linked. Debian 3.12 uses the libc probes.
+- **Arenas** are 1 MiB anonymous `mmap`s on every version, with no hugepages.
+- **Large-object uprobe overhead and the default interval:** see [Measurements](#measurements).
+- **Thread state in eBPF.** The walk fits the verifier on 3.12, 3.13 and 3.14 (6.18 kernel) once the frame count is kept in map memory. The ignored tests `crates/heapspy/tests/record_live.rs` check the stacks against known `file:line`s on all three.
+- **Lost uretprobes.** The spike saw entry and return counts disagree in blocks. Two causes: nested probes (`_PyObject_Malloc` over `_PyMem_RawMalloc`) overwriting a tid-keyed pending entry, fixed by not probing both layers and keying by (tid, stack pointer); and returns that never arrived for about 4% of sampled calls on 6.18 while the return program was slow (it reserved and filled a 3 KiB ring buffer record). With the scratch-map program, 1 in 180,000 was lost. With uprobe sessions, none. Lost returns are counted (meta `heapspy.ebpf.orphaned_entries`) as dropped samples.
+- **Still open (Windows):** whether ETW events and 5 ms stack samples land within 20 ms of each other, and whether the debugger path works with Windows Defender and other EDR software running. Both are steps in the [test plan](windows-record-test-plan.md).
+
+## Spike checklist (original)
+
+Answered in [Spike results](#spike-results).
 
 - Find out which builds (Debian, python.org, python-build-standalone, Windows python.org) expose a probe-able pool-carving function, and which inline it.
 - Measure the overhead of the large-object uprobe with the byte sampler on an allocation-heavy benchmark. Pick the default interval.

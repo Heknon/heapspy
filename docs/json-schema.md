@@ -260,21 +260,20 @@ Printed after the allocation profile (and the `--then-dump` snapshot, when
 asked for) has been written. The summary lines on stderr are printed with or
 without `--json`.
 
-The recorders are not implemented yet, so no build prints this document
-today. Every valid request fails: `record --json` prints an
-[error document](#error) and exits with status 1. The checks run in this
-order, and the first that fails gives the code:
+On failure `record --json` prints an [error document](#error) and exits
+with status 1. The checks run in this order, and the first that fails gives
+the code:
 
 1. option values (`--duration 0s`, `--max-frames 0`, `--then-dump` equal to
    `-o`): `invalid_argument`
 2. on Linux, whether a process has the PID: `no_such_process`
 3. the recorders for `--mechanism`, in order: `unsupported` when the
-   mechanism is not available on this OS, otherwise `unimplemented` from
-   the first stub (eBPF on Linux)
+   mechanism is not available here, `permission_denied` when none may run
+   (with `auto`, the first recorder's error is reported)
+4. finding CPython in the target: `not_python`, `unsupported_python`
 
-The target's memory is only read after a recorder has attached, so today a
-PID that is not CPython also fails with `unimplemented`, not `not_python`.
-No profile file is written on failure.
+No profile file is written on failure. Ctrl-C (SIGINT, SIGTERM) ends the
+window early: the profile is written and `truncated` is `true`.
 
 | field | type | meaning |
 |---|---|---|
@@ -717,7 +716,7 @@ status 1. Example: `docs/examples/error.json`.
 
 | code | meaning |
 |---|---|
-| `unimplemented` | the command or feature is not built yet (today every valid `record`, see [`record`](#record)) |
+| `unimplemented` | the command or feature is not built yet |
 | `invalid_argument` | a value on the command line is malformed (e.g. an address without `0x`), or a `record` option is out of range (`--duration 0s`, `--max-frames 0`) |
 | `not_found` | the requested address or type is not in the snapshot |
 | `invalid_snapshot` | the file is not a snapshot, is truncated or corrupt, or has an unsupported format version |
