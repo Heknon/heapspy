@@ -257,6 +257,52 @@ fn memory_accounting_and_notes() {
 }
 
 #[test]
+fn module_dict_shared_through_globals_is_still_a_namespace() {
+    // A running frame holds a function defined in __main__, so the module's
+    // dict is reachable both as sys.modules['__main__'].__dict__ and as the
+    // function's .__globals__; its immediate dominator is the super-root.
+    // It must still not be listed, and the global that holds most of it
+    // (60%, below the wrapper-chain ratio) must be.
+    let mut h = Heap::new();
+    let (_, md) = h.module("__main__");
+    let events = h.obj("builtins.list", 8 * 600 + 56);
+    h.key(md, events, "EVENTS");
+    for i in 0..600u32 {
+        let e = h.obj("builtins.bytes", 1000);
+        h.untracked(e);
+        h.item(events, e, i);
+    }
+    let other = h.obj("builtins.list", 8 * 400 + 56);
+    h.key(md, other, "OTHER");
+    for i in 0..400u32 {
+        let e = h.obj("builtins.bytes", 1000);
+        h.untracked(e);
+        h.item(other, e, i);
+    }
+    let func = h.obj("builtins.function", 160);
+    h.key(md, func, "grow");
+    h.attr(func, md, "__globals__");
+    h.root(
+        func,
+        RootKind::FrameLocal,
+        "frame _victim:serve local 'on_trigger'",
+    );
+    let r = run(&h);
+
+    assert!(
+        r.top_retainers
+            .iter()
+            .all(|t| t.address.0 != md && t.type_name != "builtins.module"),
+        "{:#?}",
+        r.top_retainers
+    );
+    let top = &r.top_retainers[0];
+    assert_eq!(top.address.0, events);
+    assert_eq!(top.retained_bytes, 8 * 600 + 56 + 600 * 1000);
+    assert_eq!(r.top_retainers[1].address.0, other);
+}
+
+#[test]
 fn equally_short_paths_start_at_the_module_root() {
     // DATA is two hops from both sys.modules['__main__'] (via .__dict__) and
     // a frame local holding a __main__ function (via .__globals__). The

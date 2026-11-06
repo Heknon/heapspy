@@ -175,8 +175,9 @@ Retainer (`top_retainers[]`):
 Which objects are listed:
 
 1. Namespaces are never listed: module objects, frame objects, type objects,
-   and the `__dict__` each of them dominates. The variables inside them are
-   listed instead.
+   and the `__dict__` of each, also when something else references that
+   dict (a function's `__globals__` is its module's `__dict__`). The
+   variables inside them are listed instead.
 2. A chain of wrappers that only restate their contents is reported once, at
    the object where the memory accumulates. Starting at an object A, follow
    A's largest dominated child while it still retains at least 90% of A's
@@ -332,6 +333,10 @@ labels so that it can be found again in another dump:
   reached through several objects its dominator owns), the label is written
   as `...` followed by the label of the last edge, e.g.
   `sys.modules['app'].__dict__['PENDING']...[<index>]`.
+- An object that is not a root but is dominated only by the super-root
+  (several roots reach it and none of them owns it, e.g. a list imported
+  into two modules) has no owning site. Its site is `...` followed by the
+  label of the edge it was first reached through, e.g. `...['SHARED']`.
 - List and tuple indices are generalised to `[<index>]`, since positions
   shift as a container changes.
 - Only the first 6 levels of the dominator tree get sites (level 1 is the

@@ -29,7 +29,7 @@ pub enum Error {
     #[error("unsupported CPython: {0}")]
     UnsupportedPython(String),
 
-    #[error("I/O error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
