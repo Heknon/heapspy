@@ -140,9 +140,9 @@ Out of scope for v1: allocation call chains, per-object native or C-extension me
 
 ## Agent integration: heapspy-mcp
 
-A second package, `heapspy-mcp`, will expose heapspy to coding agents over the Model Context Protocol. It shells out to the `heapspy` binary and parses `--json`. The intended loop: capture a snapshot, summarize it, pick a suspect, trace what retains it, map the holder to `file:line` in your repo, read the code, diagnose.
+A second package, `heapspy-mcp` in [`python/heapspy-mcp`](python/heapspy-mcp/README.md), exposes heapspy to coding agents over the Model Context Protocol. It shells out to the `heapspy` binary and parses `--json`. The intended loop: capture a snapshot, summarize it, pick a suspect, trace what retains it, map the holder to `file:line` in your repo, read the code, diagnose. It is built and tested against the documented JSON schema; it becomes useful once `dump` and the analyzer work.
 
-Planned tools:
+Tools:
 
 | Tool | Purpose |
 |---|---|
@@ -185,7 +185,7 @@ See [docs/releasing.md](docs/releasing.md) for how releases are built and publis
 | M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI | passes locally; CI job added (`ci:e2e`), not yet run on GitHub |
 | M4 | Windows minidump backend | done |
 | M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
-| M6 | `heapspy-mcp` | in review on a separate branch |
+| M6 | `heapspy-mcp` | done |
 | M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | designed; not implemented |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
@@ -201,6 +201,7 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
 | `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
+| `python/heapspy-mcp` | the `heapspy-mcp` MCP server (Python) |
 | `docs/releasing.md` | how to cut a release and the one-time PyPI setup |
 | `pyproject.toml` | maturin config that packages the `heapspy` binary as a PyPI wheel |
 | `scripts/check-version.py` | checks that the release tag and package versions agree |
