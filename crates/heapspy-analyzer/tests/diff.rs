@@ -210,6 +210,47 @@ fn list_items_are_generalised_and_indirect_hops_marked() {
 }
 
 #[test]
+fn sites_that_render_alike_are_summed_not_overwritten() {
+    // A list of n items in a module, where one item is also held from native
+    // memory. That item is dominated only by the super-root, so its site is
+    // named by its shortest path: `...['COUNTERS'][<index>]`, the same text
+    // as the site of the n-1 items the list owns. The two must add up, in
+    // both snapshots, or the diff reports the whole list's items as growth.
+    let build = |extra: u32, shared: bool| {
+        let mut h = Heap::new();
+        let (_, m) = h.module("app");
+        let counters = h.obj("builtins.list", 64);
+        h.key(m, counters, "COUNTERS");
+        for i in 0..100 {
+            let x = h.obj("builtins.float", 24);
+            h.item(counters, x, i);
+            if shared && i == 99 {
+                h.root(x, RootKind::Native, "thread 1 stack");
+            }
+        }
+        let (_, m2) = h.module("app2");
+        let events = h.obj("builtins.list", 64);
+        h.key(m2, events, "EVENTS");
+        for i in 0..extra {
+            let x = h.obj("builtins.bytes", 1000);
+            h.item(events, x, i);
+        }
+        h
+    };
+    // Only one snapshot has the stack-held item, as in a real pair of dumps.
+    let r = run(&build(1, true), &build(5, false));
+    assert!(
+        // The one float that changed owner moves 24 bytes; overwriting
+        // made all 100 items' site look new.
+        !r.by_site
+            .iter()
+            .any(|s| s.site.contains("COUNTERS") && s.delta_retained_bytes > 24),
+        "{:?}",
+        r.by_site
+    );
+}
+
+#[test]
 fn object_shared_by_two_roots_gets_a_site_instead_of_panicking() {
     // A list referenced from two modules is dominated only by the super-root,
     // but BFS reaches it through an ordinary edge, not a root entry. Real

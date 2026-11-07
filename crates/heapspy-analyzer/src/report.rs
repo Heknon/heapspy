@@ -272,12 +272,50 @@ pub struct Totals {
     pub reachable_objects: u64,
     /// Sum of shallow sizes of reachable objects.
     pub reachable_bytes: u64,
-    /// Objects not reachable from any root (garbage awaiting collection, or
-    /// objects held only from outside the recorded graph).
+    /// Objects reachable from no root but held from outside the recorded
+    /// graph, as their refcounts show: native code, C globals, memory the
+    /// walker could not lay out. They appear under the root
+    /// `held outside the Python graph`. 0 without refcounts.
+    #[serde(default)]
+    pub external_objects: u64,
+    #[serde(default)]
+    pub external_bytes: u64,
+    /// Objects neither reachable nor held from outside. With refcounts, their
+    /// owners are all each other: cyclic garbage the collector will free.
+    /// Without refcounts, this also holds what `external_*` would have.
     pub unreachable_objects: u64,
     pub unreachable_bytes: u64,
     /// Edges whose target address is not an object in the snapshot.
     pub dangling_edges: u64,
+    /// Whether references were checked against refcounts (snapshots from
+    /// heapspy builds that record them).
+    #[serde(default)]
+    pub refcounts_checked: bool,
+    /// Edges dropped by that check: fields of unknown layout that borrow
+    /// rather than own, and out-of-line pointers that were stale.
+    #[serde(default)]
+    pub borrowed_edges_dropped: u64,
+    #[serde(default)]
+    pub stale_edges_dropped: u64,
+    /// Out-of-line references kept (found in memory an object points at but
+    /// does not lay out, such as a deque's blocks).
+    #[serde(default)]
+    pub out_of_line_edges: u64,
+    /// Native heap blocks recorded (what `malloc` handed out, apart from
+    /// Python objects), and their bytes. 0 when the source could not walk
+    /// its heaps. They are counted in `objects` and `shallow_bytes`, and the
+    /// reachable ones in `reachable_*`.
+    #[serde(default)]
+    pub native_blocks: u64,
+    #[serde(default)]
+    pub native_bytes: u64,
+    /// Native blocks nothing points to: not from a Python object, another
+    /// block, a module's globals or a thread's stack. Memory whose address
+    /// the program no longer has anywhere: leaked. Not in `unreachable_*`.
+    #[serde(default)]
+    pub native_lost_blocks: u64,
+    #[serde(default)]
+    pub native_lost_bytes: u64,
 }
 
 /// Process memory vs. the Python graph (`memory`).
@@ -291,6 +329,26 @@ pub struct MemoryTotals {
     pub outside_graph_bytes: Option<u64>,
     /// `outside_graph_bytes / rss_bytes * 100`. `null` without `rss_bytes`.
     pub outside_graph_pct: Option<f64>,
+    /// What the process's memory is, by kind. Empty if the source had no
+    /// memory map.
+    #[serde(default)]
+    pub breakdown: Vec<MemoryPart>,
+    /// Whether `breakdown` counts resident bytes (`"resident"`) or, where the
+    /// source does not record residency (Windows), committed bytes
+    /// (`"committed"`). Committed memory can be larger than RSS.
+    #[serde(default)]
+    pub breakdown_basis: Option<String>,
+}
+
+/// One line of `memory.breakdown`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPart {
+    /// `images`, `mapped_files`, `stacks`, `python_small_objects`,
+    /// `pymalloc_free`, `python_large_objects`, `native_heap`,
+    /// `native_unknown` (the rest of private memory, when the native heap is
+    /// not split out).
+    pub part: String,
+    pub bytes: u64,
 }
 
 /// One entry of `top_retainers`.

@@ -35,7 +35,9 @@ from tests.contention_workload import Workload, wait_for_stats
 
 pytestmark = [
     pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc"),
-    pytest.mark.skipif(os.geteuid() != 0, reason="root only, as the blind test ran"),
+    pytest.mark.skipif(
+        getattr(os, "geteuid", lambda: -1)() != 0, reason="root only, as the blind test ran"
+    ),
     pytest.mark.skipif(
         shutil.which("gcc") is None and shutil.which("cc") is None, reason="needs a C compiler"
     ),

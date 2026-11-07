@@ -519,7 +519,7 @@ def cgroup_view(m: Measurement, process_cores: float | None) -> dict[str, Any]:
 
     def rel(d: str) -> str:
         try:
-            return "/" + str(Path(d).relative_to(root)) if root else d
+            return "/" + Path(d).relative_to(root).as_posix() if root else d
         except ValueError:
             return d
 

@@ -24,12 +24,13 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT,
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, OpenTraceW, PageFaultGuid, ProcessTrace, QueryAllTracesW,
-    StartTraceW, SystemTraceControlGuid, TraceSetInformation, TraceSystemTraceEnableFlagsInfo,
-    CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_VIRTUAL_ALLOC,
-    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-    EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
+    CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, PageFaultGuid, ProcessTrace,
+    QueryAllTracesW, StartTraceW, SystemTraceControlGuid, TraceSetInformation,
+    TraceSystemTraceEnableFlagsInfo, CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_VIRTUAL_ALLOC, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE,
+    PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+    TRACE_LEVEL_VERBOSE, WNODE_FLAG_TRACED_GUID,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
@@ -427,6 +428,241 @@ impl Drop for EtwSession {
         // SAFETY: stopping the session we started, then joining the consumer
         // before freeing the context it uses.
         unsafe {
+            let mut props = control_buffer();
+            ControlTraceW(
+                self.control,
+                std::ptr::null(),
+                props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                EVENT_TRACE_CONTROL_STOP,
+            );
+            let p = &*(props.as_ptr() as *const EVENT_TRACE_PROPERTIES);
+            self.lost = p.EventsLost as u64 + p.RealTimeBuffersLost as u64;
+            CloseTrace(self.trace);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+            drop(Box::from_raw(self.ctx));
+        }
+    }
+}
+
+// ---- ETW heap tracing -----------------------------------------------------
+
+/// The "HeapTraceProvider" classic provider
+/// (`{222962ab-6180-4b88-a825-346b75f2a24a}`). A process emits its heap
+/// allocations to it only if heap tracing was turned on for the image
+/// before it started (`super::prepare`).
+const HEAP_GUID: windows_sys::core::GUID = windows_sys::core::GUID {
+    data1: 0x2229_62ab,
+    data2: 0x6180,
+    data3: 0x4b88,
+    data4: [0xa8, 0x25, 0x34, 0x6b, 0x75, 0xf2, 0xa2, 0x4a],
+};
+
+/// Heap opcodes we keep. The allocation we record is the block the call
+/// returned: `AllocAddress` for an alloc, `NewAllocAddress` for a realloc.
+const OPCODE_HEAP_ALLOC: u8 = 33;
+const OPCODE_HEAP_REALLOC: u8 = 34;
+
+/// One `RtlAllocateHeap` / `RtlReAllocateHeap` event of the target: the
+/// pointer the call returned and the requested size.
+#[derive(Clone, Copy, Debug)]
+pub struct EtwHeapAlloc {
+    pub ts_ns: u64,
+    pub tid: u32,
+    /// The pointer the allocator returned (inside the block, after the
+    /// header), as the join expects for a `native` sample.
+    pub addr: u64,
+    /// Requested size.
+    pub size: u64,
+}
+
+struct HeapContext {
+    pid: u32,
+    tx: Sender<EtwHeapAlloc>,
+}
+
+unsafe extern "system" fn on_heap_event(rec: *mut EVENT_RECORD) {
+    // SAFETY: ETW passes a valid record; UserContext is our HeapContext,
+    // alive until ProcessTrace returns.
+    unsafe {
+        let r = &*rec;
+        let h = &r.EventHeader;
+        if !same_guid(&h.ProviderId, &HEAP_GUID) {
+            return;
+        }
+        let ctx = &*(r.UserContext as *const HeapContext);
+        if h.ProcessId != ctx.pid || r.UserData.is_null() {
+            return;
+        }
+        let d = std::slice::from_raw_parts(r.UserData as *const u8, r.UserDataLength as usize);
+        let rd = |at: usize| -> Option<u64> {
+            d.get(at..at + 8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        };
+        // 64-bit MOF layouts (confirmed on Windows 11, version 2):
+        // Alloc:   HeapHandle, AllocSize@8, AllocAddress@16, SourceId@24
+        // ReAlloc: HeapHandle, NewAllocAddress@8, OldAllocAddress@16,
+        //          NewAllocSize@24, OldAllocSize@32, SourceId@40
+        let (addr, size) = match h.EventDescriptor.Opcode {
+            OPCODE_HEAP_ALLOC => match (rd(16), rd(8)) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return,
+            },
+            OPCODE_HEAP_REALLOC => match (rd(8), rd(24)) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return,
+            },
+            _ => return,
+        };
+        if addr == 0 || size == 0 {
+            return;
+        }
+        let _ = ctx.tx.send(EtwHeapAlloc {
+            ts_ns: filetime_to_unix_ns(h.TimeStamp as u64),
+            tid: h.ThreadId,
+            addr,
+            size,
+        });
+    }
+}
+
+/// Properties for a private (non-kernel) real-time session that carries one
+/// classic provider. Unlike [`props_buffer`], no system-logger mode and no
+/// kernel `EnableFlags`: the provider is turned on afterwards with
+/// [`EnableTraceEx2`].
+fn heap_props_buffer() -> Vec<u8> {
+    let name_bytes = 1024 * 2;
+    let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes;
+    let mut v = vec![0u8; size];
+    // SAFETY: the buffer is large enough and zeroed.
+    let p = unsafe { &mut *(v.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
+    p.Wnode.BufferSize = size as u32;
+    p.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    p.Wnode.ClientContext = 1; // QPC session clock; consumers get FILETIME
+    p.Wnode.Guid = session_guid();
+    p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    p.BufferSize = 64;
+    p.MinimumBuffers = 16;
+    p.MaximumBuffers = 64;
+    p.FlushTimer = 1;
+    p.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+    v
+}
+
+/// The private heap-tracing session; stopped on drop. Mirrors [`EtwSession`]
+/// but consumes the Heap provider's events instead of kernel VirtualAlloc.
+pub struct HeapEtwSession {
+    pub name: String,
+    control: CONTROLTRACE_HANDLE,
+    trace: PROCESSTRACE_HANDLE,
+    thread: Option<std::thread::JoinHandle<()>>,
+    ctx: *mut HeapContext,
+    pub lost: u64,
+}
+
+impl HeapEtwSession {
+    /// Start `heapspy-heap-<this pid>`, enable the Heap provider for it, and
+    /// consume it on a thread. The target must already have heap tracing on
+    /// (see [`super::prepare`]); this session does not and cannot turn it on
+    /// for an already-running process. Errors: access denied (not elevated),
+    /// or a conflicting session.
+    pub fn start(pid: u32, tx: Sender<EtwHeapAlloc>) -> Result<HeapEtwSession> {
+        let name = format!("heapspy-heap-{}", std::process::id());
+        // Clear a leftover of ours by the same name.
+        stop_session(&name);
+        let mut control = CONTROLTRACE_HANDLE { Value: 0 };
+        let mut props = heap_props_buffer();
+        let w = wide(&name);
+        // SAFETY: props is a properly sized EVENT_TRACE_PROPERTIES block.
+        let e = unsafe {
+            StartTraceW(
+                &mut control,
+                w.as_ptr(),
+                props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+            )
+        };
+        match e {
+            ERROR_SUCCESS => {}
+            ERROR_ACCESS_DENIED => {
+                return Err(Error::PermissionDenied(
+                    "starting the ETW heap session was refused: run heapspy from an elevated prompt"
+                        .into(),
+                ))
+            }
+            ERROR_ALREADY_EXISTS => {
+                return Err(Error::Unsupported(format!(
+                    "the ETW session {name} already exists; stop it (logman stop {name} -ets) and retry"
+                )))
+            }
+            e => return Err(Error::Io(std::io::Error::from_raw_os_error(e as i32))),
+        }
+        // SAFETY: enabling a classic provider on the session we just started.
+        let e = unsafe {
+            EnableTraceEx2(
+                control,
+                &HEAP_GUID,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                TRACE_LEVEL_VERBOSE as u8,
+                u64::MAX,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if e != ERROR_SUCCESS {
+            stop_session(&name);
+            return Err(Error::Io(std::io::Error::from_raw_os_error(e as i32)));
+        }
+        let ctx = Box::into_raw(Box::new(HeapContext { pid, tx }));
+        let mut wname = wide(&name);
+        // SAFETY: zeroed EVENT_TRACE_LOGFILEW, filled as documented.
+        let trace = unsafe {
+            let mut lf: EVENT_TRACE_LOGFILEW = std::mem::zeroed();
+            lf.LoggerName = wname.as_mut_ptr();
+            lf.Anonymous1.ProcessTraceMode =
+                PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+            lf.Anonymous2.EventRecordCallback = Some(on_heap_event);
+            lf.Context = ctx.cast();
+            OpenTraceW(&mut lf)
+        };
+        let mut s = HeapEtwSession {
+            name,
+            control,
+            trace,
+            thread: None,
+            ctx,
+            lost: 0,
+        };
+        if trace.Value == u64::MAX {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        let h = trace.Value;
+        s.thread = Some(std::thread::spawn(move || {
+            let t = PROCESSTRACE_HANDLE { Value: h };
+            // SAFETY: blocks until the session stops or CloseTrace.
+            unsafe { ProcessTrace(&t, 1, std::ptr::null(), std::ptr::null()) };
+        }));
+        Ok(s)
+    }
+}
+
+impl Drop for HeapEtwSession {
+    fn drop(&mut self) {
+        // SAFETY: stop the session, join the consumer, then free its context.
+        unsafe {
+            // Turning the provider off is implied by stopping the session,
+            // but ask explicitly so it stops writing at once.
+            EnableTraceEx2(
+                self.control,
+                &HEAP_GUID,
+                windows_sys::Win32::System::Diagnostics::Etw::EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            );
             let mut props = control_buffer();
             ControlTraceW(
                 self.control,

@@ -104,6 +104,7 @@ Section kinds:
 | 6 | extras | no | always written (may hold 0 records) |
 | 7 | memory_summary | no | only if the source had memory map data |
 | 8 | meta | no | always written (may hold 0 records) |
+| 9 | refcounts | no | written when the walker read refcounts (every dump since it was added) |
 
 Rules for readers:
 
@@ -201,6 +202,7 @@ Object `flags`:
 | 1 | `PARTIAL` | some references could not be read; the edge list is incomplete |
 | 2 | `IMMORTAL` | immortal refcount (3.12+) |
 | 3 | `IS_TYPE` | the object is a type object (its address is also in the types section) |
+| 4 | `NATIVE` | not a Python object: a busy block of a native heap (what `malloc` handed out), recorded when the source could walk its heaps. Its type is `native.heap_block`, `native.large_allocation` (a block with its own mapping) or `native.small_block_container` (a Windows LFH subsegment, its small allocations not listed); `addr` is the block start, `shallow_size` its size less any Python objects inside; it has no refcount. Blocks that are a Python object's own memory are not recorded |
 
 Untracked objects (str, bytes, int, float, and containers the GC untracked)
 appear only when a recorded object references them, and have bit 0 clear.
@@ -215,7 +217,17 @@ Address to index lookup is a binary search on `addr`.
 | 8 | 4 | `label_operand` |
 | 12 | 1 | `label_kind` |
 | 13 | 1 | `label_flags` |
-| 14 | 2 | reserved |
+| 14 | 2 | `edge_flags` |
+
+`edge_flags` bits 0-1 say how the walker knows the edge is a reference.
+Readers that predate them saw these bytes as reserved and zero, and read every
+edge as `exact`:
+
+| value | origin | meaning |
+|---:|---|---|
+| 0 | `exact` | read from a layout the walker knows (a dict entry, a list item, a frame local) |
+| 1 | `scanned` | a field of an object whose layout the walker does not know, that points at an object. Usually an owned reference; a field that only borrows is caught against the target's refcount |
+| 2 | `speculative` | a pointer found in memory an object points at but does not lay out (a `deque` block, an extension's item array). It may be a stale slot, so the analyzer keeps it only if the target has owners nothing else explains |
 
 `target` is an address, not an object index: the target may be missing from
 the dump (an untracked object the walker chose not to record, or a read
@@ -325,6 +337,7 @@ capture.
 | 2 | `thread_locals` | per-thread state (thread dict, current exception) | `thread 4021 dict` |
 | 3 | `frame_local` | the value of a live frame's local variable | `frame worker:run local 'pending'` |
 | 4 | `interp` | interpreter-wide state (builtins, `sys` attributes, caches) | `interp builtins` |
+| 5 | `native` | a native heap block or a mortal Python object pointed at from a loaded module's writable data (C globals) or a thread's stack. The analyzer reaches these after every Python root | `python312.dll globals`, `thread 4021 stack` |
 
 Roots are not sorted and an address may appear more than once with
 different labels. A root address may be missing from the objects section
@@ -397,6 +410,24 @@ Free-form key/value pairs. Keys in use:
 | `heapspy.version` | version of the heapspy that wrote the file |
 | `process.rss_bytes` | process RSS in bytes, decimal |
 | `image.missing_bytes` | bytes of memory the image's headers describe but the file lacks (only written when non-zero), decimal |
+
+On Windows, `process.rss_bytes` is the working set, read when `dump --pid`
+takes the dump. A minidump file does not record residency, so a snapshot
+made with `--minidump` has no RSS.
+
+### Refcounts (kind 9), record_len 8
+
+One `u64` per object, in object order: the object's `ob_refcnt` when it was
+captured, the number of references that own it. On 3.14 the low 32 bits are
+the count, so that is what is stored. `0xFFFF_FFFF_FFFF_FFFF` means the
+header could not be read. For an object flagged `IMMORTAL` the value is the
+interpreter's sentinel, not a count, and is not compared with anything.
+
+The count of exact edges into an object is at most its refcount (the rest of
+its owners are C code, the interpreter, or memory the walker did not lay
+out). The analyzer uses that to check scanned and speculative edges, and to
+tell objects held from outside the graph from cyclic garbage. A reader that
+does not know the section skips it and treats every edge as exact.
 
 ## Validation on open
 

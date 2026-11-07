@@ -196,6 +196,7 @@ fn spill_to_dir_matches_memory() {
             shallow_size: o.shallow_size,
             flags: o.flags,
             extras: s.extras(o.index).unwrap_or_default(),
+            refcount: s.refcount(o.index),
         };
         w.add_object(&input, s.edges(o.index)).unwrap();
     }
@@ -243,6 +244,7 @@ fn invalid_ids_rejected_by_writer() {
     let e = Edge {
         target: 1,
         label: EdgeLabel::Attr(StrId(999)),
+        origin: EdgeOrigin::Exact,
     };
     assert!(matches!(
         w.add_object(&ok, [e]),

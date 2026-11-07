@@ -36,8 +36,10 @@ use crate::{notes, push_edge, snapshot_summary, DiffOptions, Result};
 
 /// Deepest dominator-tree level that gets its own site. Level 1 is the root
 /// objects; `module -> __dict__ -> CACHE -> entry -> entry.__dict__ ->
-/// value` reaches level 6.
-pub const MAX_SITE_DEPTH: u8 = 6;
+/// value` reaches level 6. Leaks often sit deeper than that: an exception
+/// kept in a list holds `traceback -> frame -> local`, level 7 and on, and
+/// that last hop is the one that names what to fix.
+pub const MAX_SITE_DEPTH: u8 = 10;
 
 struct Site {
     parent: u32,
@@ -79,8 +81,10 @@ fn shortest_path_site(a: &Analysis, v: u32) -> Result<String> {
     let mut s = String::new();
     for (i, (_, e)) in a.bfs_chain(v).into_iter().enumerate() {
         if i == 0 {
-            let r = a.g.root_entry(e).expect("a BFS path starts at a root");
-            s.push_str(a.snap.string(r.label)?);
+            let (label, _) =
+                a.g.root_label(a.snap, e)?
+                    .expect("a BFS path starts at a root");
+            s.push_str(&label);
         } else {
             push_edge(
                 &mut s,
@@ -129,8 +133,8 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
         }
         let e = a.via[vi];
         let (parent, label) = if p == root {
-            match a.g.root_entry(e) {
-                Some(r) => (NONE, a.snap.string(r.label)?.to_string()),
+            match a.g.root_label(a.snap, e)? {
+                Some((label, _)) => (NONE, label),
                 // Dominated only by the super-root but reached through an
                 // ordinary edge: the object hangs off several roots and none
                 // of them owns it. Name the site by its shortest path, which
@@ -176,19 +180,35 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
         }
     }
     drop(trie);
-    let mut out = HashMap::with_capacity(sites.len());
+    // Two trie sites can render to the same text: an object several roots
+    // share is named by its shortest path, which can read exactly like the
+    // site of the objects its container owns (`...['CACHE'][<index>]`). They
+    // are the same site to a reader, so they are summed. Overwriting kept
+    // whichever came last, and a diff then saw a whole site appear or vanish.
+    let mut out: HashMap<String, SiteStat> = HashMap::with_capacity(sites.len());
     for (id, s) in sites.iter().enumerate() {
         let key = render_site(&sites, id as u32);
-        out.insert(
-            key,
-            SiteStat {
-                type_name: a.types.names[s.type_group as usize].clone(),
-                bytes: s.bytes,
-                objects: s.objects,
-                members: s.members,
-                parent: (s.parent != NONE).then(|| render_site(&sites, s.parent)),
-            },
-        );
+        match out.entry(key) {
+            Entry::Occupied(mut o) => {
+                let t = o.get_mut();
+                // The type of the bigger contribution names the site.
+                if s.bytes > t.bytes {
+                    t.type_name = a.types.names[s.type_group as usize].clone();
+                }
+                t.bytes += s.bytes;
+                t.objects += s.objects;
+                t.members += s.members;
+            }
+            Entry::Vacant(v) => {
+                v.insert(SiteStat {
+                    type_name: a.types.names[s.type_group as usize].clone(),
+                    bytes: s.bytes,
+                    objects: s.objects,
+                    members: s.members,
+                    parent: (s.parent != NONE).then(|| render_site(&sites, s.parent)),
+                });
+            }
+        }
     }
     Ok(out)
 }

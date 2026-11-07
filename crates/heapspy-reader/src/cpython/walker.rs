@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use heapspy_snapshot::{
-    redacted_key_placeholder, truncate_capture, Edge, EdgeLabel, KeyLabel, ObjectExtras,
-    ObjectFlags, ObjectInput, RootKind, SnapshotWriter, StrId, TypeId,
+    redacted_key_placeholder, truncate_capture, Edge, EdgeLabel, EdgeOrigin, KeyLabel,
+    ObjectExtras, ObjectFlags, ObjectInput, RootKind, SnapshotWriter, StrId, TypeId,
 };
 
 use super::offsets::*;
@@ -13,7 +13,7 @@ use super::text;
 use super::WalkStats;
 use crate::dump::DumpOptions;
 use crate::error::Result;
-use crate::source::{MemorySource, MemorySourceExt};
+use crate::source::{MemorySource, MemorySourceExt, NativeBlock, NativeBlockKind};
 
 /// Hard caps that keep garbage from causing huge allocations or long loops.
 const MAX_ITEMS: u64 = 1 << 28;
@@ -53,6 +53,11 @@ pub(super) enum Kind {
     Type,
     Gen,
     Frame,
+    /// `weakref.ref` and the proxy types. Their referent pointer does not own
+    /// the referent, so they get no edges (see [`Walker::scan_edges`]).
+    WeakRef,
+    /// Any type the walker has no layout for. Its references are found by
+    /// [`Walker::scan_edges`].
     Other,
 }
 
@@ -72,6 +77,9 @@ fn kind_from_static_name(name: &str) -> Kind {
         "generator" | "coroutine" | "async_generator" => Kind::Gen,
         "frame" => Kind::Frame,
         "bytearray" => Kind::ByteArray,
+        "weakref.ReferenceType" | "weakref.ProxyType" | "weakref.CallableProxyType" => {
+            Kind::WeakRef
+        }
         _ => Kind::Other,
     }
 }
@@ -86,6 +94,9 @@ pub(super) struct TypeInfo {
     pub dictoffset: i64,
     /// `__slots__` members of this type and its heap bases: (name, offset).
     pub slots: Vec<(StrId, u64)>,
+    /// Object members from `tp_members` of this type and its bases, static
+    /// types included: (name, offset). Names for scanned fields.
+    pub members: Vec<(StrId, u64)>,
     /// `ht_cached_keys` (shared keys of instance dicts / inline values).
     pub cached_keys: u64,
     /// Name used in redaction placeholders: the qualname for builtins,
@@ -105,6 +116,7 @@ impl TypeInfo {
             heap: false,
             dictoffset: 0,
             slots: Vec::new(),
+            members: Vec::new(),
             cached_keys: 0,
             display: "object".into(),
             qualname: "?".into(),
@@ -195,6 +207,97 @@ pub(super) struct Walker<'a> {
     /// attribute names.
     names: HashMap<u64, Option<StrId>>,
     stats: WalkStats,
+    /// Writable, anonymous memory outside every loaded image, sorted by
+    /// start: where an out-of-line block of an object can be. Pointers
+    /// elsewhere (code, static data, mapped files) are never searched.
+    heap_ranges: Vec<(u64, u64)>,
+    /// Words the out-of-line search may still read in this walk.
+    out_of_line_left: usize,
+    /// Start of the pymalloc pool each emitted object would be in, if it is
+    /// a small object. Checked against the pool headers at the end of the
+    /// walk (see [`Walker::pymalloc_usage`]).
+    pools: HashSet<u64>,
+    /// The source's native heap blocks, sorted by start, if it could walk
+    /// its heaps. Pointers into them become edges (see [`Walker::emit_native`]).
+    native: Vec<NativeBlock>,
+    /// Python objects bigger than a pymalloc block, `(address, size)`: they
+    /// live in native heap blocks, which are then theirs, not native memory.
+    big_objects: Vec<(u64, u64)>,
+    /// Out-of-line storage of Python objects whose layout the walker knows
+    /// (a list's item array, a dict's keys and values, a set's table, a
+    /// bytearray's buffer). Already counted in the owner's size, so the
+    /// native block holding one is the owner's memory too.
+    buffers: Vec<u64>,
+}
+
+/// Words of native heap block contents read in one walk: 2 GiB.
+const NATIVE_SCAN_TOTAL: u64 = 1 << 28;
+/// Words read from one native block at a time.
+const NATIVE_CHUNK_WORDS: u64 = 1 << 16;
+
+/// pymalloc's pool size on 64-bit builds of 3.12 to 3.14 (`POOL_BITS` 14),
+/// and its arena size (`ARENA_BITS` 20). Pools are aligned to their size.
+const POOL_SIZE: u64 = 1 << 14;
+const ARENA_SIZE: u64 = 1 << 20;
+/// `sizeof(struct pool_header)`, already a multiple of the 16-byte alignment.
+const POOL_OVERHEAD: u64 = 48;
+/// Size classes: 16 bytes apart up to `SMALL_REQUEST_THRESHOLD` (512).
+const POOL_SIZE_CLASSES: u32 = 32;
+
+/// What pymalloc holds, from the pools the walk's objects live in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PymallocUsage {
+    /// Pools with at least one recorded object, and their bytes.
+    pub pools: u64,
+    /// Blocks in use in those pools, in bytes (live objects and anything
+    /// else pymalloc handed out, such as small buffers).
+    pub used_bytes: u64,
+    /// Distinct arenas those pools belong to, at 1 MiB each.
+    pub arenas: u64,
+}
+
+impl PymallocUsage {
+    pub fn pool_bytes(&self) -> u64 {
+        self.pools * POOL_SIZE
+    }
+    pub fn arena_bytes(&self) -> u64 {
+        self.arenas * ARENA_SIZE
+    }
+}
+
+/// Words read from one out-of-line block. Larger blocks are reached in
+/// pieces through the pointers inside them, or not at all past the budget.
+const BLOCK_WORDS: usize = 128;
+/// Words read from the blocks one object points at directly. An object that
+/// points into a C library's own memory (a lock, a socket, a database
+/// handle) reads this much of it and no more.
+const OUT_OF_LINE_BUDGET: usize = 1 << 14;
+/// Words read along chains of blocks (each linking back to the one before,
+/// see `search_out_of_line`) in one walk: 1 GiB. A chain is memory the
+/// object owns, so a large `deque` is read to its end; this only bounds a
+/// pathological heap.
+const OUT_OF_LINE_TOTAL: usize = 1 << 27;
+
+/// Writable anonymous ranges outside the loaded images, sorted: see
+/// `Walker::heap_ranges`. Empty if the source cannot list its ranges, which
+/// turns the out-of-line search off rather than letting it read anywhere.
+fn heap_ranges(src: &dyn MemorySource) -> Vec<(u64, u64)> {
+    let images: Vec<(u64, u64)> = src
+        .modules()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| (m.base, m.base.saturating_add(m.size)))
+        .collect();
+    let mut out: Vec<(u64, u64)> = src
+        .mapped_ranges()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.perms.write && !r.perms.exec && r.file.is_none())
+        .map(|r| (r.start, r.start.saturating_add(r.size)))
+        .filter(|&(s, e)| !images.iter().any(|&(b, end)| s < end && b < e))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 fn mask_stackref(o: &Offsets, v: u64) -> Option<u64> {
@@ -217,6 +320,12 @@ impl<'a> Walker<'a> {
         out: &'a mut SnapshotWriter,
     ) -> Self {
         Walker {
+            heap_ranges: heap_ranges(src),
+            out_of_line_left: OUT_OF_LINE_TOTAL,
+            pools: HashSet::new(),
+            native: Vec::new(),
+            big_objects: Vec::new(),
+            buffers: Vec::new(),
             src,
             o,
             opts,
@@ -229,6 +338,55 @@ impl<'a> Walker<'a> {
             names: HashMap::new(),
             stats: WalkStats::default(),
         }
+    }
+
+    /// Whether `addr` is where a native heap block starts: an edge target
+    /// that is native memory, never to be walked as a Python object.
+    fn is_native_start(&self, addr: u64) -> bool {
+        self.native_at(addr)
+            .is_some_and(|b| self.native[b].start == addr)
+    }
+
+    /// Note `buf` as out-of-line storage of the object being described (see
+    /// `buffers`). Only needed when there are native blocks to match.
+    fn own_buffer(&mut self, buf: u64) {
+        if buf != 0 && !self.native.is_empty() {
+            self.buffers.push(buf);
+        }
+    }
+
+    /// Index of the native heap block a pointer `addr` refers to, as a
+    /// program's reference: anywhere in the block but its very start.
+    ///
+    /// The start is where the allocator's own header is, and what its own
+    /// bookkeeping points at: the links that chain the Windows heap's large
+    /// blocks together, glibc's free-list and chunk links. The program is
+    /// handed a pointer past that header, so its references land inside.
+    /// Counting the allocator's links would chain every large block to its
+    /// neighbours, and whichever of them something else held would then
+    /// appear to hold them all.
+    fn native_ref(&self, addr: u64) -> Option<usize> {
+        self.native_at(addr).filter(|&b| {
+            let blk = &self.native[b];
+            // Into the header when the source knows where the data starts
+            // (a Windows large block's header sits at a random offset, and
+            // its list links point into other blocks' headers); otherwise
+            // at the block start itself.
+            addr >= blk.start + blk.data_offset.max(1)
+        })
+    }
+
+    /// Index of the native heap block whose range holds `addr`.
+    fn native_at(&self, addr: u64) -> Option<usize> {
+        let i = self.native.partition_point(|b| b.start <= addr);
+        let b = self.native.get(i.checked_sub(1)?)?;
+        (addr < b.start + b.size).then_some(i - 1)
+    }
+
+    /// Whether `addr` is in memory an out-of-line block can live in.
+    fn in_heap(&self, addr: u64) -> bool {
+        let i = self.heap_ranges.partition_point(|&(s, _)| s <= addr);
+        i > 0 && addr < self.heap_ranges[i - 1].1
     }
 
     // ---- small read helpers -------------------------------------------------
@@ -250,7 +408,11 @@ impl<'a> Walker<'a> {
     fn field(&mut self, out: &mut Out, field: u64, label: EdgeLabel) {
         match self.ptr(field) {
             Ok(0) => {}
-            Ok(t) => out.edges.push(Edge { target: t, label }),
+            Ok(t) => out.edges.push(Edge {
+                target: t,
+                label,
+                origin: EdgeOrigin::Exact,
+            }),
             Err(_) => self.err(out),
         }
     }
@@ -275,6 +437,72 @@ impl<'a> Walker<'a> {
     fn raw_type_flags(&self, addr: u64) -> Option<u64> {
         let t = self.ptr(addr + 8).ok()?;
         self.src.read_u32(t + self.o.tp_flags).ok().map(u64::from)
+    }
+
+    /// Whether `addr` looks like the start of a live object: GC-tracked, or
+    /// its `ob_type` is an object whose own type is a type (a metatype has
+    /// the type-subclass flag). Used to tell pointers from other words when a
+    /// layout is unknown.
+    fn is_object(&self, addr: u64) -> bool {
+        if addr == 0 || addr & 7 != 0 {
+            return false;
+        }
+        if self.is_tracked(addr) {
+            return true;
+        }
+        // A live object's refcount is a small positive number, or an
+        // immortal one (negative as an i32). Freed pymalloc memory keeps its
+        // old type pointer but has a free-list link or zero in that slot, so
+        // without this a stale pointer would pass as a live object.
+        let Ok(refcnt) = self.src.read_u64(addr) else {
+            return false;
+        };
+        let immortal = (refcnt as u32 as i32) < 0;
+        let link = refcnt & 7 == 0 && self.in_heap(refcnt);
+        if !immortal && (refcnt == 0 || refcnt >> 32 != 0 || link) {
+            return false;
+        }
+        let Ok(t) = self.ptr(addr + 8) else {
+            return false;
+        };
+        if t == 0 || t & 7 != 0 {
+            return false;
+        }
+        if !self
+            .raw_type_flags(t)
+            .is_some_and(|f| f & TPFLAGS_TYPE_SUBCLASS != 0)
+        {
+            return false;
+        }
+        self.plausible_type(t)
+    }
+
+    /// Whether `t` looks like a type object beyond its own type pointer: a
+    /// known type, or one whose sizes are sane and whose name is readable
+    /// text. Code and data that merely happen to start with pointers (a
+    /// function's prologue, a table of handles) fail this, where the
+    /// metatype check alone let them through.
+    fn plausible_type(&self, t: u64) -> bool {
+        if let Some(ti) = self.types.get(&t) {
+            return !ti.id.is_unknown();
+        }
+        let o = &self.o;
+        let basic = self.i64(t + o.tp_basicsize).unwrap_or(-1);
+        let item = self.i64(t + o.tp_itemsize).unwrap_or(-1);
+        if !(16..=1 << 20).contains(&basic) || !(0..=1 << 12).contains(&item) {
+            return false;
+        }
+        let Ok(name) = self.ptr(t + o.tp_name) else {
+            return false;
+        };
+        match self.src.read_cstr(name, 128) {
+            Ok(b) => {
+                !b.is_empty()
+                    && b.iter()
+                        .all(|&c| c.is_ascii_alphanumeric() || b"_.<>-".contains(&c))
+            }
+            Err(_) => false,
+        }
     }
 
     /// Text of the str object at `addr` (at most `max` characters) and its
@@ -522,6 +750,45 @@ impl<'a> Walker<'a> {
             }
         }
 
+        // Object members declared in `tp_members` along the base chain, static
+        // types included. `tp_members` sits two pointers before `tp_base` in
+        // every PyTypeObject layout. Only names are taken from here: which
+        // fields are references is decided by `scan_edges`.
+        let mut members = Vec::new();
+        {
+            let mut cur = t;
+            let mut seen = HashSet::new();
+            for _ in 0..MAX_TYPE_CHAIN {
+                if let Ok(defs) = self.ptr(cur + o.tp_base - 16) {
+                    if defs != 0 {
+                        for i in 0..MAX_SLOTS {
+                            let m = defs + i * MEMBERDEF_SIZE;
+                            let Ok(np) = self.ptr(m) else { break };
+                            if np == 0 {
+                                break;
+                            }
+                            let ty = self.src.read_u32(m + MEMBERDEF_TYPE).unwrap_or(0);
+                            let off = self.i64(m + MEMBERDEF_OFFSET).unwrap_or(-1);
+                            if !(ty == T_OBJECT_EX || ty == T_OBJECT) || off <= 0 {
+                                continue;
+                            }
+                            let Ok(nb) = self.src.read_cstr(np, MAX_NAME) else {
+                                continue;
+                            };
+                            if seen.insert(off) {
+                                let id = self.out.intern(&String::from_utf8_lossy(&nb))?;
+                                members.push((id, off as u64));
+                            }
+                        }
+                    }
+                }
+                match self.ptr(cur + o.tp_base) {
+                    Ok(b) if b != 0 => cur = b,
+                    _ => break,
+                }
+            }
+        }
+
         let dictoffset = self.i64(t + o.tp_dictoffset).unwrap_or(0);
         let cached_keys = if heap {
             self.ptr(t + o.ht_cached_keys).unwrap_or(0)
@@ -543,6 +810,7 @@ impl<'a> Walker<'a> {
             heap,
             dictoffset,
             slots,
+            members,
             cached_keys,
             display,
             qualname,
@@ -750,9 +1018,11 @@ impl<'a> Walker<'a> {
         // count it), and the keys object when this dict owns it alone.
         if values != 0 {
             out.extra_size += keys.shared_usable() * 8;
+            self.own_buffer(values);
         }
         if keys.refcnt == 1 {
             out.extra_size += keys.alloc_size(&o);
+            self.own_buffer(k);
         }
         let entries = match self.keys_entries(&keys, vals) {
             Ok(e) => e,
@@ -771,10 +1041,12 @@ impl<'a> Walker<'a> {
             out.edges.push(Edge {
                 target: kp,
                 label: EdgeLabel::DictKey(label),
+                origin: EdgeOrigin::Exact,
             });
             out.edges.push(Edge {
                 target: vp,
                 label: EdgeLabel::DictValue(label),
+                origin: EdgeOrigin::Exact,
             });
         }
         Ok(())
@@ -804,7 +1076,11 @@ impl<'a> Walker<'a> {
                 Some(s) => EdgeLabel::Attr(s),
                 None => EdgeLabel::Other(None),
             };
-            out.edges.push(Edge { target: v, label });
+            out.edges.push(Edge {
+                target: v,
+                label,
+                origin: EdgeOrigin::Exact,
+            });
         }
         Ok(())
     }
@@ -851,6 +1127,7 @@ impl<'a> Walker<'a> {
                     out.edges.push(Edge {
                         target: d,
                         label: l,
+                        origin: EdgeOrigin::Exact,
                     });
                 }
                 if let Some(v) = values {
@@ -873,7 +1150,228 @@ impl<'a> Walker<'a> {
             out.edges.push(Edge {
                 target: t,
                 label: EdgeLabel::Type,
+                origin: EdgeOrigin::Exact,
             });
+        }
+        Ok(())
+    }
+
+    /// An `int` whose value is an address inside a native heap block: a
+    /// pointer kept as a number (`ctypes` returns `malloc` results this way,
+    /// and handles to C objects are passed around as ints). The int then
+    /// holds the block, as far as anything in the process does.
+    fn int_address_edge(&mut self, addr: u64, out: &mut Out) -> Result<()> {
+        if self.native.is_empty() {
+            return Ok(());
+        }
+        let o = &self.o;
+        let Ok(tag) = self.src.read_u64(addr + o.long_tag) else {
+            return Ok(());
+        };
+        // `lv_tag`: digit count above bit 3, sign in the low two bits (0 is
+        // positive). A 64-bit address fits in three 30-bit digits.
+        let ndigits = tag >> 3;
+        if tag & 3 != 0 || !(1..=3).contains(&ndigits) {
+            return Ok(());
+        }
+        let mut value = 0u64;
+        for i in (0..ndigits).rev() {
+            let Ok(d) = self.src.read_u32(addr + o.long_digits + i * 4) else {
+                return Ok(());
+            };
+            value = (value << 30) | (d as u64 & 0x3FFF_FFFF);
+        }
+        if let Some(b) = self.native_ref(value) {
+            let label = self.out.intern("address")?;
+            out.edges.push(Edge {
+                target: self.native[b].start,
+                label: EdgeLabel::Other(Some(label)),
+                origin: EdgeOrigin::Scanned,
+            });
+        }
+        Ok(())
+    }
+
+    /// References of an object whose layout the walker does not know: every
+    /// pointer-sized word of its body that points at an object.
+    ///
+    /// This stands in for the type's `tp_traverse`, which cannot be run from
+    /// outside. A C type keeps the objects it owns in fields of its struct,
+    /// so reading each word and keeping those that point at the start of a
+    /// live object (see [`Walker::is_object`]) finds them without per-type
+    /// layouts: an exception's args and traceback, a traceback's frame, an
+    /// `lru_cache`'s cache dict, an extension type's members. A field named
+    /// in `tp_members` gets that name; others are labelled by offset.
+    ///
+    /// A field that only borrows (does not own) its target would add an edge
+    /// the target's real owner should have had. Weak references, the common
+    /// case, have their own kind and are never scanned; for the rest these
+    /// edges are marked [`EdgeOrigin::Scanned`], and the analyzer drops them
+    /// where a target has more of them than its refcount allows.
+    ///
+    /// Objects a type owns through a separate allocation (a `deque`'s blocks,
+    /// a C array of pointers) are found by [`Walker::search_out_of_line`],
+    /// starting from the words here that point into the heap but not at an
+    /// object.
+    fn scan_edges(&mut self, addr: u64, t: u64, ti: &TypeInfo, out: &mut Out) -> Result<()> {
+        let mut size = ti.basicsize;
+        if ti.itemsize > 0 {
+            let n = self.i64(addr + 16).unwrap_or(0).clamp(0, MAX_ITEMS as i64) as u64;
+            size += ti.itemsize * n;
+        }
+        // Past the header (refcount and ob_type).
+        let words = (size / 8).min(MAX_SLOTS);
+        if words <= 2 {
+            return Ok(());
+        }
+        let Ok(body) = self.src.read_ptrs(addr + 16, (words - 2) as usize) else {
+            self.err(out);
+            return Ok(());
+        };
+        let mut blocks = Vec::new();
+        for (i, &w) in body.iter().enumerate() {
+            if w == addr || w == t || w == 0 || out.edges.iter().any(|e| e.target == w) {
+                continue;
+            }
+            let off = 16 + i as u64 * 8;
+            if !self.is_object(w) {
+                // A pointer into a native heap block that is not a Python
+                // object's own: the object holds that native memory (a
+                // buffer, a C struct, an array).
+                if let Some(b) = self.native_ref(w) {
+                    let start = self.native[b].start;
+                    if !out.edges.iter().any(|e| e.target == start) {
+                        let label = self.out.intern(&format!("+{off}"))?;
+                        out.edges.push(Edge {
+                            target: start,
+                            label: EdgeLabel::Other(Some(label)),
+                            origin: EdgeOrigin::Scanned,
+                        });
+                    }
+                }
+                if w & 7 == 0 && self.in_heap(w) {
+                    blocks.push((w, off));
+                }
+                continue;
+            }
+            let label = match ti
+                .members
+                .iter()
+                .chain(ti.slots.iter())
+                .find(|&&(_, o)| o == off)
+            {
+                Some(&(name, _)) => EdgeLabel::Attr(name),
+                None => EdgeLabel::Other(Some(self.out.intern(&format!("+{off}"))?)),
+            };
+            out.edges.push(Edge {
+                target: w,
+                label,
+                origin: EdgeOrigin::Scanned,
+            });
+        }
+        if !blocks.is_empty() {
+            self.search_out_of_line(addr..addr + size, blocks, out)?;
+        }
+        Ok(())
+    }
+
+    /// Object pointers in memory that `owner` points at but does not lay
+    /// out: the blocks of a `deque`, the item array of an extension's
+    /// container, a linked list of nodes.
+    ///
+    /// Nothing says how long such a block is or which of its slots are in
+    /// use, so this reads a fixed window from each block the object points
+    /// at, and stops at a budget. Every object pointer it finds becomes an
+    /// [`EdgeOrigin::Speculative`] edge. Some will be stale: an unused slot
+    /// still holding an object that has since moved on, or the next
+    /// allocation over. The analyzer keeps a speculative edge only where the
+    /// target has owners its refcount counts and no other edge explains,
+    /// which a stale pointer's target does not.
+    ///
+    /// Past the blocks the object points at directly, a heap pointer is
+    /// followed only when the block it leads to points back at the block it
+    /// came from: the two links of a chain like a `deque`'s blocks. Anything
+    /// else is someone else's memory, and following it would hand this
+    /// object whatever that memory holds.
+    fn search_out_of_line(
+        &mut self,
+        owner: std::ops::Range<u64>,
+        blocks: Vec<(u64, u64)>,
+        out: &mut Out,
+    ) -> Result<()> {
+        // Direct blocks spend `budget`; chained blocks only the walk's total.
+        let mut budget = OUT_OF_LINE_BUDGET;
+        // Targets this object already references, and those found so far:
+        // a pointer to either explains nothing new.
+        let mut found: HashSet<u64> = out.edges.iter().map(|e| e.target).collect();
+        let mut seen: HashSet<u64> = HashSet::new();
+        // (block address, label prefix, the block that linked to it)
+        let mut work: Vec<(u64, String, Option<u64>)> = blocks
+            .into_iter()
+            .map(|(b, off)| (b, format!("+{off}"), None))
+            .collect();
+        while let Some((block, prefix, from)) = work.pop() {
+            let left = if from.is_none() {
+                budget.min(self.out_of_line_left)
+            } else {
+                self.out_of_line_left
+            };
+            if left == 0 {
+                continue;
+            }
+            // The object's own body was read already. A block is marked seen
+            // only once accepted (below): reached first from a block that
+            // merely lies next to its real predecessor, it fails the link
+            // check, and must still be read when the real one gets to it.
+            if owner.contains(&block) || seen.contains(&block) {
+                continue;
+            }
+            let n = BLOCK_WORDS.min(left);
+            // A block near the end of a mapping: read what is there.
+            let words = match self.src.read_ptrs(block, n) {
+                Ok(w) => w,
+                Err(_) => {
+                    let end = self
+                        .heap_ranges
+                        .iter()
+                        .find(|&&(s, e)| s <= block && block < e)
+                        .map_or(block, |&(_, e)| e);
+                    let fit = ((end - block) / 8) as usize;
+                    match self.src.read_ptrs(block, fit.min(n)) {
+                        Ok(w) => w,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            if from.is_none() {
+                budget -= words.len();
+            }
+            self.out_of_line_left -= words.len();
+            // The link back has to be in the block's header, where a deque
+            // block and a list node keep it. Anywhere in the window would
+            // match memory that merely follows this block.
+            if from.is_some_and(|prev| !words.iter().take(4).any(|&w| w == prev)) {
+                continue;
+            }
+            seen.insert(block);
+            for (i, &w) in words.iter().enumerate() {
+                if w == 0 || owner.contains(&w) || w & 7 != 0 {
+                    continue;
+                }
+                if self.is_object(w) {
+                    if !found.insert(w) {
+                        continue;
+                    }
+                    let label = self.out.intern(&format!("{prefix}[{i}]"))?;
+                    out.edges.push(Edge {
+                        target: w,
+                        label: EdgeLabel::Other(Some(label)),
+                        origin: EdgeOrigin::Speculative,
+                    });
+                } else if self.in_heap(w) && !seen.contains(&w) {
+                    work.push((w, "…".to_string(), Some(block)));
+                }
+            }
         }
         Ok(())
     }
@@ -894,6 +1392,7 @@ impl<'a> Walker<'a> {
             out.edges.push(Edge {
                 target: code,
                 label: l,
+                origin: EdgeOrigin::Exact,
             });
         }
         let l = self.attr("f_func")?;
@@ -908,7 +1407,11 @@ impl<'a> Walker<'a> {
                         Some(n) => EdgeLabel::FrameLocal(self.out.intern(&n)?),
                         None => EdgeLabel::Other(Some(self.out.intern("stack")?)),
                     };
-                    out.edges.push(Edge { target: v, label });
+                    out.edges.push(Edge {
+                        target: v,
+                        label,
+                        origin: EdgeOrigin::Exact,
+                    });
                 }
             }
             Err(_) => self.err(out),
@@ -997,6 +1500,7 @@ impl<'a> Walker<'a> {
                 (Ok(n), Ok(items)) => {
                     let alloc = self.i64(addr + o.list_allocated).unwrap_or(n).max(0) as u64;
                     out.extra_size += alloc.min(MAX_ITEMS) * 8;
+                    self.own_buffer(items);
                     let n = (n.max(0) as u64).min(MAX_ITEMS);
                     if n > 0 && items != 0 {
                         match self.src.read_ptrs(items, n as usize) {
@@ -1006,6 +1510,7 @@ impl<'a> Walker<'a> {
                                         out.edges.push(Edge {
                                             target: x,
                                             label: EdgeLabel::ListItem(i as u32),
+                                            origin: EdgeOrigin::Exact,
                                         });
                                     }
                                 }
@@ -1026,6 +1531,7 @@ impl<'a> Walker<'a> {
                                     out.edges.push(Edge {
                                         target: x,
                                         label: EdgeLabel::TupleItem(i as u32),
+                                        origin: EdgeOrigin::Exact,
                                     });
                                 }
                             }
@@ -1041,6 +1547,7 @@ impl<'a> Walker<'a> {
                         let n = mask as u64 + 1;
                         if table != addr + o.set_smalltable {
                             out.extra_size += n * 16;
+                            self.own_buffer(table);
                         }
                         match self.src.read_vec(table, (n * 16) as usize) {
                             Ok(raw) => {
@@ -1052,6 +1559,7 @@ impl<'a> Walker<'a> {
                                         out.edges.push(Edge {
                                             target: key,
                                             label: EdgeLabel::SetItem,
+                                            origin: EdgeOrigin::Exact,
                                         });
                                     }
                                 }
@@ -1063,7 +1571,12 @@ impl<'a> Walker<'a> {
                 }
             }
             Kind::ByteArray => match self.i64(addr + o.bytearray_alloc) {
-                Ok(n) if n >= 0 => out.extra_size += n as u64,
+                Ok(n) if n >= 0 => {
+                    out.extra_size += n as u64;
+                    if let Ok(buf) = self.ptr(addr + o.bytearray_bytes) {
+                        self.own_buffer(buf);
+                    }
+                }
                 _ => self.err(&mut out),
             },
             Kind::Module => {
@@ -1102,6 +1615,7 @@ impl<'a> Walker<'a> {
                                         out.edges.push(Edge {
                                             target: cell,
                                             label: EdgeLabel::ClosureCell(i as u32),
+                                            origin: EdgeOrigin::Exact,
                                         });
                                     }
                                 }
@@ -1191,10 +1705,14 @@ impl<'a> Walker<'a> {
                     Err(_) => self.err(&mut out),
                 }
             }
-            Kind::Str | Kind::Bytes | Kind::Int | Kind::Float | Kind::Other => {}
+            Kind::Int => self.int_address_edge(addr, &mut out)?,
+            Kind::Str | Kind::Bytes | Kind::Float | Kind::WeakRef | Kind::Other => {}
         }
         if ti.heap || ti.flags & TPFLAGS_MANAGED_DICT != 0 || ti.dictoffset > 0 {
             self.instance_edges(addr, ti, t, &mut out)?;
+        }
+        if ti.kind == Kind::Other {
+            self.scan_edges(addr, t, ti, &mut out)?;
         }
         out.extras.length = self.len_of(addr, ti);
         if self.opts.capture_contents && matches!(ti.kind, Kind::Str | Kind::Bytes) {
@@ -1320,6 +1838,7 @@ impl<'a> Walker<'a> {
                     shallow_size: 16,
                     flags: flags | ObjectFlags::PARTIAL,
                     extras: ObjectExtras::default(),
+                    refcount: None,
                 };
                 self.out.add_object(&obj, [])?;
                 self.stats.objects += 1;
@@ -1328,9 +1847,17 @@ impl<'a> Walker<'a> {
         };
         let refcnt = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
         let t = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        if (refcnt as u32 as i32) < 0 {
+        self.pools.insert(addr & !(POOL_SIZE - 1));
+        let immortal = (refcnt as u32 as i32) < 0;
+        if immortal {
             flags |= ObjectFlags::IMMORTAL;
         }
+        // The count itself is the low 32 bits; 3.14 keeps flags above them.
+        let refcount = Some(if immortal {
+            refcnt
+        } else {
+            refcnt & 0xFFFF_FFFF
+        });
         let ti = self.type_info(t)?;
         let mut d = if ti.id.is_unknown() {
             self.stats.read_errors += 1;
@@ -1350,8 +1877,14 @@ impl<'a> Walker<'a> {
             self.type_info(addr)?;
         }
         let size = self.base_size(addr, &ti) + d.extra_size;
+        if size > 512 {
+            self.big_objects.push((addr, size));
+        }
         for e in &d.edges {
-            if !self.is_tracked(e.target) && self.untracked.insert(e.target) {
+            if !self.is_tracked(e.target)
+                && !self.is_native_start(e.target)
+                && self.untracked.insert(e.target)
+            {
                 self.queue.push(e.target);
             }
         }
@@ -1361,6 +1894,7 @@ impl<'a> Walker<'a> {
             shallow_size: size,
             flags,
             extras: d.extras,
+            refcount,
         };
         self.stats.edges += d.edges.len() as u64;
         self.out.add_object(&obj, d.edges.drain(..))?;
@@ -1481,6 +2015,10 @@ impl<'a> Walker<'a> {
             .map(|r| r.iter().map(|m| m.size).sum::<u64>() / 32)
             .unwrap_or(1 << 32)
             .max(1 << 16);
+        // Known before the walk, so Python objects' pointers into native
+        // memory become edges as they are emitted. A heap walk that fails
+        // leaves native memory unlisted, as it was before heap walkers.
+        self.native = self.src.native_blocks().ok().flatten().unwrap_or_default();
 
         for &is in &interps {
             let gc = is + o.is_gc;
@@ -1504,7 +2042,265 @@ impl<'a> Walker<'a> {
             self.interp_roots(is)?;
         }
         self.drain()?;
+        if !self.native.is_empty() {
+            self.emit_native()?;
+            self.native_roots()?;
+            self.drain()?;
+        }
+
+        let p = self.pymalloc_usage();
+        if p.pools > 0 {
+            self.out.add_meta("pymalloc.pools", &p.pools.to_string())?;
+            self.out
+                .add_meta("pymalloc.pool_bytes", &p.pool_bytes().to_string())?;
+            self.out
+                .add_meta("pymalloc.used_bytes", &p.used_bytes.to_string())?;
+            self.out
+                .add_meta("pymalloc.arenas", &p.arenas.to_string())?;
+            self.out
+                .add_meta("pymalloc.arena_bytes", &p.arena_bytes().to_string())?;
+        }
         Ok(self.stats)
+    }
+
+    /// Record the native heap blocks as objects of the graph, so native
+    /// memory has retaining paths like Python memory does.
+    ///
+    /// A block holding a Python object too big for pymalloc is that object's
+    /// memory, already recorded, and is skipped. Every other block becomes an
+    /// object flagged [`ObjectFlags::NATIVE`] with a synthetic `native.*`
+    /// type, whose edges are the words of its contents that point at a
+    /// Python object or into another block: a C struct holding a callback, a
+    /// buffer list, a linked node. Nothing says which words of native memory
+    /// are pointers, so this is conservative, the way a C leak checker scans:
+    /// a number that happens to equal an address makes an edge. Edges into
+    /// Python objects are still checked against their refcounts by the
+    /// analyzer; edges between blocks cannot be.
+    ///
+    /// A small-block container (a Windows LFH subsegment) holds many small
+    /// allocations nobody listed; it is recorded as one block, less the
+    /// Python objects found inside it.
+    fn emit_native(&mut self) -> Result<()> {
+        let mut big = std::mem::take(&mut self.big_objects);
+        big.sort_unstable();
+        let mut buffers = std::mem::take(&mut self.buffers);
+        buffers.sort_unstable();
+        // Synthetic types. Their "addresses" are small numbers no real type
+        // can have; nothing looks them up.
+        let ty = |w: &mut SnapshotWriter, addr: u64, q: &str| w.add_type(addr, "native", q);
+        let t_alloc = ty(self.out, 1, "heap_block")?;
+        let t_large = ty(self.out, 2, "large_allocation")?;
+        let t_small = ty(self.out, 3, "small_block_container")?;
+        let mut budget = NATIVE_SCAN_TOTAL;
+        for bi in 0..self.native.len() {
+            let b = self.native[bi];
+            let end = b.start + b.size;
+            let lo = big.partition_point(|&(a, _)| a < b.start);
+            let inside = big[lo..].iter().take_while(|&&(a, _)| a < end);
+            let python_bytes: u64 = inside.clone().map(|&(_, s)| s).sum();
+            if b.kind != NativeBlockKind::SmallBlockContainer && inside.count() > 0 {
+                continue;
+            }
+            // Out-of-line storage of a Python object, counted in its size.
+            let bi_buf = buffers.partition_point(|&p| p < b.start);
+            if b.kind != NativeBlockKind::SmallBlockContainer
+                && buffers.get(bi_buf).is_some_and(|&p| p < end)
+            {
+                continue;
+            }
+            let mut edges = Vec::new();
+            let mut seen = HashSet::new();
+            let mut off = 0u64;
+            let mut partial = false;
+            while off + 8 <= b.size && budget > 0 {
+                let n = ((b.size - off) / 8).min(NATIVE_CHUNK_WORDS).min(budget);
+                let Ok(words) = self.src.read_ptrs(b.start + off, n as usize) else {
+                    partial = true;
+                    break;
+                };
+                budget -= n;
+                for (i, &w) in words.iter().enumerate() {
+                    if w == 0 || w & 7 != 0 || (b.start..end).contains(&w) {
+                        continue;
+                    }
+                    let target = if self.is_known_object(w) {
+                        w
+                    } else if let Some(t) = self.native_ref(w) {
+                        self.native[t].start
+                    } else {
+                        continue;
+                    };
+                    if !seen.insert(target) {
+                        continue;
+                    }
+                    let o = off + i as u64 * 8;
+                    let text = if o < 4096 {
+                        format!("+{o}")
+                    } else {
+                        "contents".to_string()
+                    };
+                    edges.push(Edge {
+                        target,
+                        label: EdgeLabel::Other(Some(self.out.intern(&text)?)),
+                        origin: EdgeOrigin::Scanned,
+                    });
+                }
+                off += n * 8;
+            }
+            for e in &edges {
+                if !self.is_tracked(e.target)
+                    && !self.is_native_start(e.target)
+                    && self.untracked.insert(e.target)
+                {
+                    self.queue.push(e.target);
+                }
+            }
+            let mut flags = ObjectFlags::NATIVE;
+            if partial || budget == 0 {
+                flags |= ObjectFlags::PARTIAL;
+            }
+            let obj = ObjectInput {
+                addr: b.start,
+                type_id: match b.kind {
+                    NativeBlockKind::Allocation => t_alloc,
+                    NativeBlockKind::Large => t_large,
+                    NativeBlockKind::SmallBlockContainer => t_small,
+                },
+                shallow_size: b.size.saturating_sub(python_bytes),
+                flags,
+                extras: ObjectExtras::default(),
+                refcount: None,
+            };
+            self.stats.edges += edges.len() as u64;
+            self.out.add_object(&obj, edges)?;
+            self.stats.objects += 1;
+        }
+        Ok(())
+    }
+
+    /// Roots in native memory the program reaches without any heap: each
+    /// loaded module's writable data (C globals) and each thread's stack.
+    ///
+    /// A pointer there into a native block, or at a mortal Python object,
+    /// roots it as [`RootKind::Native`], labelled by where it was found:
+    /// `python312.dll globals`, `thread 1234 stack`. The analyzer reaches
+    /// these after every Python root, so they only explain what nothing in
+    /// Python holds: native memory, and objects C code keeps alive. Stacks
+    /// hold stale words too, which can root something already dead; that
+    /// only moves it from "garbage" to "held by a thread's stack".
+    fn native_roots(&mut self) -> Result<()> {
+        let ranges = self.src.mapped_ranges().unwrap_or_default();
+        let modules = self.src.modules().unwrap_or_default();
+        let mut areas: Vec<(u64, u64, String)> = Vec::new();
+        for m in &modules {
+            let m_end = m.base.saturating_add(m.size);
+            for r in &ranges {
+                let (s, e) = (r.start.max(m.base), (r.start + r.size).min(m_end));
+                if r.perms.write && s < e {
+                    areas.push((s, e, format!("{} globals", m.name)));
+                }
+            }
+        }
+        for t in self.src.threads().unwrap_or_default() {
+            let Some(sp) = t.stack_pointer else { continue };
+            if let Some(r) = ranges
+                .iter()
+                .find(|r| r.start <= sp && sp < r.start + r.size)
+            {
+                areas.push((sp & !7, r.start + r.size, format!("thread {} stack", t.tid)));
+            }
+        }
+        for (start, end, label) in areas {
+            let l = self.out.intern(&label)?;
+            let mut done = HashSet::new();
+            let mut a = start;
+            while a + 8 <= end {
+                let n = ((end - a) / 8).min(NATIVE_CHUNK_WORDS);
+                let Ok(words) = self.src.read_ptrs(a, n as usize) else {
+                    break;
+                };
+                for &w in &words {
+                    if w == 0 || w & 7 != 0 {
+                        continue;
+                    }
+                    let (target, python) = if let Some(b) = self.native_ref(w) {
+                        (self.native[b].start, false)
+                    } else if self.is_known_object(w) && !self.is_immortal(w) {
+                        (w, true)
+                    } else {
+                        continue;
+                    };
+                    if !done.insert(target) {
+                        continue;
+                    }
+                    self.out.add_root(target, RootKind::Native, l)?;
+                    self.stats.roots += 1;
+                    if python && !self.is_tracked(target) && self.untracked.insert(target) {
+                        self.queue.push(target);
+                    }
+                }
+                a += n * 8;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Walker::is_object`] for words read from native memory after the
+    /// Python walk, which hold far more arbitrary values (code addresses,
+    /// handles, packed data) than an object's fields do: a GC-tracked object,
+    /// or one in heap memory whose type the walk already met. Every live
+    /// type has been seen by then, so a type pointer to anything else is a
+    /// coincidence, such as the bytes of a function that look like a type.
+    fn is_known_object(&self, addr: u64) -> bool {
+        if self.is_tracked(addr) {
+            return true;
+        }
+        if !self.in_heap(addr) || !self.is_object(addr) {
+            return false;
+        }
+        self.ptr(addr + 8)
+            .is_ok_and(|t| self.types.get(&t).is_some_and(|ti| !ti.id.is_unknown()))
+    }
+
+    fn is_immortal(&self, addr: u64) -> bool {
+        self.src.read_u64(addr).is_ok_and(|r| (r as u32 as i32) < 0)
+    }
+
+    /// How much pymalloc holds and how much of it is in use.
+    ///
+    /// Every small object is a block in a 16 KiB pool, and every pool starts
+    /// with a header saying its block size and how many blocks are handed
+    /// out. Reading the header of each pool an object was found in gives the
+    /// allocator's own count, without its arena table: what is in use, what
+    /// the pools hold in reserve, and how many arenas back them. A header
+    /// that does not check out (the object was not from pymalloc: a large
+    /// object from `malloc`, a static object) is skipped.
+    ///
+    /// Arenas holding no recorded object are not counted; pymalloc returns
+    /// a fully empty arena to the OS, so few are left.
+    fn pymalloc_usage(&self) -> PymallocUsage {
+        let mut u = PymallocUsage::default();
+        let mut arenas = HashSet::new();
+        for &pool in &self.pools {
+            let Ok(h) = self.src.read_vec(pool, POOL_OVERHEAD as usize) else {
+                continue;
+            };
+            let word = |i: usize| u32::from_le_bytes(h[i..i + 4].try_into().unwrap());
+            let (count, arena, szidx, maxnext) = (word(0), word(32), word(36), word(44));
+            if szidx >= POOL_SIZE_CLASSES {
+                continue;
+            }
+            let size = (szidx as u64 + 1) * 16;
+            let capacity = (POOL_SIZE - POOL_OVERHEAD) / size;
+            if maxnext as u64 != POOL_SIZE - size || count == 0 || count as u64 > capacity {
+                continue;
+            }
+            u.pools += 1;
+            u.used_bytes += count as u64 * size;
+            arenas.insert(arena);
+        }
+        u.arenas = arenas.len() as u64;
+        u
     }
 
     // ---- roots ---------------------------------------------------------------

@@ -20,6 +20,9 @@
 //! - Memory summary: mapped totals by region kind; a core has no residency
 //!   information, so `resident_bytes` is `None`.
 //! - `captured_at`: the core file's mtime.
+//! - Native heap: glibc malloc's chunks, walked by [`super::glibc_heap`]. A
+//!   core does not say which mapping is `[heap]`, so the brk heap is found
+//!   by its chunks; see there. Not yet run against a real core.
 //!
 //! The core is memory-mapped; nothing is copied up front. Corrupt input is
 //! reported as [`Error::Format`], never a panic.
@@ -33,7 +36,10 @@ use std::time::UNIX_EPOCH;
 use heapspy_snapshot::{Arch, MemoryRegion, Os, RegionKind};
 use memmap2::Mmap;
 
-use super::{MappedRange, MemorySource, MemorySummary, Module, Perms, TargetInfo, ThreadInfo};
+use super::glibc_heap::{self, HeapHints};
+use super::{
+    MappedRange, MemorySource, MemorySummary, Module, NativeBlock, Perms, TargetInfo, ThreadInfo,
+};
 use crate::error::{Error, Result};
 use crate::symbols;
 
@@ -544,6 +550,10 @@ fn parse_prstatus(desc: &[u8], arch: Arch) -> Result<ThreadInfo> {
 }
 
 impl MemorySource for ElfCore {
+    fn native_blocks(&self) -> Result<Option<Vec<NativeBlock>>> {
+        glibc_heap::native_blocks(self, &HeapHints::default())
+    }
+
     fn target(&self) -> TargetInfo {
         self.target
     }
@@ -878,6 +888,48 @@ mod tests {
         let mut not_core = full.clone();
         not_core[0x10] = 2;
         assert!(matches!(open_bytes(&not_core), Err(Error::Format(_))));
+    }
+
+    /// A core with glibc mapped and a brk heap: native blocks come from the
+    /// heap's chunks. The heap is anonymous, so the core does not name it.
+    #[test]
+    fn native_blocks_walk_the_glibc_heap() {
+        use crate::source::glibc_heap::testkit;
+        const LIBC: &str = "/lib/x86_64-linux-gnu/libc.so.6";
+        const BRK: u64 = 0x5555_5555_9000;
+        let (heap, want) = testkit::simple_brk_heap(testkit::V2_35, BRK, 0x4000);
+        let mut hdr = vec![0u8; 0x1000];
+        hdr[..4].copy_from_slice(b"\x7fELF");
+        let mut b = CoreBuilder::new();
+        b.notes
+            .push((NT_PRSTATUS, prstatus(1, 0x7ffd_0000_0100, 0)));
+        b.notes.push((
+            NT_FILE,
+            nt_file(&[
+                (0x7f00_0000_0000, 0x7f00_0000_1000, 0, LIBC),
+                (0x7f00_0020_0000, 0x7f00_0020_4000, 0x200, LIBC),
+            ]),
+        ));
+        b.loads.push((0x7f00_0000_0000, 0x1000, hdr));
+        b.loads.push((0x7f00_0020_0000, 0x4000, vec![0; 0x4000]));
+        b.loads.push((BRK, 0x4000, heap));
+        b.loads.push((0x7ffd_0000_0000, 0x1000, vec![0; 0x1000]));
+        let core = open_bytes(&b.build()).unwrap();
+        assert_eq!(core.modules().unwrap()[0].name, "libc.so.6");
+        assert_eq!(core.native_blocks().unwrap(), Some(want));
+
+        // Without glibc there is no walker to use.
+        let mut b2 = CoreBuilder::new();
+        b2.notes.push((NT_PRSTATUS, prstatus(1, 0, 0)));
+        b2.loads.push((
+            BRK,
+            0x4000,
+            testkit::simple_brk_heap(testkit::V2_35, BRK, 0x4000).0,
+        ));
+        assert_eq!(
+            open_bytes(&b2.build()).unwrap().native_blocks().unwrap(),
+            None
+        );
     }
 
     #[test]

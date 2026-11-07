@@ -28,6 +28,9 @@ pub const ROOT_RECORD_LEN: u32 = 16;
 pub const EXTRAS_RECORD_LEN: u32 = 32;
 pub const REGION_RECORD_LEN: u32 = 24;
 pub const META_RECORD_LEN: u32 = 8;
+pub const REFCOUNT_RECORD_LEN: u32 = 8;
+/// A refcount record for an object whose header could not be read.
+pub const UNKNOWN_REFCOUNT: u64 = u64::MAX;
 
 /// Sentinel for "no string" in any u32 string-id field.
 pub const NO_STRING: u32 = u32::MAX;
@@ -76,6 +79,7 @@ pub const SK_ROOTS: u32 = 5;
 pub const SK_EXTRAS: u32 = 6;
 pub const SK_MEMORY_SUMMARY: u32 = 7;
 pub const SK_META: u32 = 8;
+pub const SK_REFCOUNTS: u32 = 9;
 
 pub(crate) fn section_name(kind: u32) -> &'static str {
     match kind {
@@ -87,6 +91,7 @@ pub(crate) fn section_name(kind: u32) -> &'static str {
         SK_EXTRAS => "extras",
         SK_MEMORY_SUMMARY => "memory_summary",
         SK_META => "meta",
+        SK_REFCOUNTS => "refcounts",
         _ => "unknown",
     }
 }

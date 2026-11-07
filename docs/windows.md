@@ -91,7 +91,7 @@ directory (`%TEMP%`). To keep the dump, capture with procdump instead, or use
 | `ModuleListStream` | in practice | finding `python3XY.dll`: name and path (UTF-16), base, size, file version, and the CodeView record (PDB GUID and age) |
 | `ThreadListStream` | in practice | thread ids, TEB addresses (`ThreadInfo::tls_base`), stack pointers from the thread contexts |
 | `ThreadNamesStream` | no | thread names set with `SetThreadDescription` |
-| `MemoryInfoListStream` | no | protection of each range (`mapped_ranges`), and committed bytes by kind (`memory_summary`) |
+| `MemoryInfoListStream` | no | protection of each range (`mapped_ranges`), committed bytes by kind (`memory_summary`), and allocation bases and reservation sizes for the native heap walk (`native_blocks`) |
 | `MiscInfoStream` | no | process id and creation time |
 
 The header's `TimeDateStamp` is recorded as the snapshot's capture time.
@@ -114,6 +114,63 @@ From `MemoryInfoListStream`, committed regions are counted as:
 
 Minidumps do not record which pages were resident, so resident bytes and RSS
 are unknown.
+
+### Native heap blocks
+
+`MemorySource::native_blocks` lists every busy block of the target's NT heaps
+(what `malloc` and `HeapAlloc` handed out), read from the heap metadata in the
+dump the way WinDbg's `!heap` reads it. Nothing is asked of the target, so it
+works the same for `--pid` and for a full-memory dump opened with
+`--minidump`, on any host OS. The code and the details are in
+`crates/heapspy-reader/src/source/minidump/nt_heap.rs`.
+
+- **Which heaps.** On Windows 11 build 26300 `PEB.ProcessHeaps` listed only
+  the default heap; `msvcrt.dll`'s private heap and other `HeapCreate` heaps
+  were not in it. So heapspy also probes the base of every committed private
+  allocation for an NT heap header, and walks every heap it finds.
+  `NativeBlock::heap` indexes `PEB.ProcessHeaps` first, then the heaps found
+  only this way, by address.
+- **Backend blocks.** Each segment (the heap itself, then `_HEAP.SegmentList`)
+  is walked header by header. Headers are XOR-decoded with `_HEAP.Encoding`,
+  and their checksum and previous-size field are checked. Uncommitted runs
+  (the segment's UCR list) are skipped. A header that fails a check, or
+  cannot be read, ends that segment's walk; the other segments are still
+  walked. A block is reported as `[header + 8, header + 8 + size)`, because on
+  x64 a block's data may run into the first 8 bytes of the next header. The
+  pointer the program holds is 8 bytes into the range.
+- **Large blocks.** Allocations of about 512 KiB and more have their own
+  `VirtualAlloc` (`_HEAP.VirtualAllocdBlocks`). The entry sits at a random page
+  offset inside it, so the whole reservation (from `MemoryInfoListStream`) is
+  reported as `Large`. Without that stream it is the entry and its committed
+  size.
+- **LFH.** Low-fragmentation-heap user blocks are decoded into their busy
+  blocks (`Allocation`, one per busy bit, the full block stride each). The
+  layout is checked against every block's header. An area that does not
+  check out is reported whole as one `SmallBlockContainer`.
+- **Left out.** Free blocks; the block holding the heap's `_LFH_HEAP`; and
+  **segment heaps** (signature 0xDDEEDDEE, used by apps that opt in through
+  their manifest and by many system processes, but not by `python.exe`).
+  Segment heaps are detected and skipped. If no NT heap is found,
+  `native_blocks` returns `None`.
+
+Offsets used (64-bit Windows 10/11; ARM64 is assumed to match but was not
+tested):
+
+| structure | field | offset |
+|---|---|---|
+| `_HEAP_SEGMENT` | `SegmentSignature` (0xFFEEFFEE), `SegmentListEntry`, `Heap`, `FirstEntry`, `LastValidEntry`, `UCRSegmentList` | 0x10, 0x18, 0x28, 0x40, 0x48, 0x60 |
+| `_HEAP` | `EncodeFlagMask`, `Encoding`, `Signature` (0xEEFFEEFF), `VirtualAllocdBlocks`, `SegmentList`, `FrontEndHeap` | 0x7c, 0x80, 0x98, 0x110, 0x120, 0x1a8 |
+| `_HEAP_ENTRY` (decoded bytes 8..16) | `Size` (u16, ×16), `Flags`, checksum, `PreviousSize` (u16, ×16), `UnusedBytes` | 8, 0xa, 0xb, 0xc, 0xf |
+| `_HEAP_UCR_DESCRIPTOR` | `SegmentEntry`, `Address`, `Size` | 0x10, 0x20, 0x28 |
+| `_HEAP_VIRTUAL_ALLOC_ENTRY` | `CommitSize`, `BusyBlock` (user data at +0x40) | 0x20, 0x30 |
+| `_HEAP_USERDATA_HEADER` | `SubSegment`, `Signature` (0xF0E0D0C0), `EncodedOffsets`, `BusyBitmap` (bits, buffer), bitmap words | 0, 0x14, 0x18, 0x20, 0x30 |
+| `_HEAP_SUBSEGMENT` | `UserBlocks`, `BlockSize` (×16), `BlockCount` | 0x08, 0x24, 0x28 |
+
+Verified on Windows 11 build 26300 (x64) by reading each field from live
+processes and comparing the walk with `RtlQueryProcessDebugInformation`'s
+heap block lists. On a CPython 3.12 process with about 400 MB of heap blocks
+(250,000 `malloc`ed `bytes` objects), the walk found 253,539 blocks and 305 MB
+(Rtl: 253,402 and 305 MB) plus the same 22 large blocks, in about 0.2 s.
 
 ## Finding CPython in the dump
 

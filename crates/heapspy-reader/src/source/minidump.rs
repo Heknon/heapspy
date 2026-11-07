@@ -21,6 +21,14 @@
 //!
 //! The header's `TimeDateStamp` is [`MemorySource::captured_at`].
 //!
+//! # Native heaps
+//!
+//! [`MemorySource::native_blocks`] walks the NT heaps found in the dump's
+//! memory (see [`nt_heap`]). It needs a full-memory dump of a 64-bit
+//! Windows process; `MemoryInfoListStream`, when present, supplies the
+//! allocation bases probed for heaps and the extent of `VirtualAlloc`ed
+//! blocks.
+//!
 //! # Full and partial dumps
 //!
 //! Only a full-memory dump (`MiniDumpWithFullMemory`, `procdump -ma`)
@@ -41,17 +49,19 @@
 use std::fmt;
 use std::fs::File;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use heapspy_snapshot::{Arch, MemoryRegion, Os, RegionKind};
 
 use super::{
-    MappedRange, MemorySource, MemorySourceExt, MemorySummary, Module, Perms, TargetInfo,
-    ThreadInfo,
+    MappedRange, MemorySource, MemorySourceExt, MemorySummary, Module, NativeBlock, Perms,
+    TargetInfo, ThreadInfo,
 };
 use crate::error::{Error, Result};
 
 #[cfg(test)]
 mod core_convert;
+pub mod nt_heap;
 mod parse;
 #[cfg(test)]
 pub(crate) mod synth;
@@ -245,6 +255,12 @@ pub struct Minidump {
     process_create_time: Option<u32>,
     timestamp: u32,
     flags: u64,
+    /// Working set of the process when it was dumped, if whoever captured it
+    /// also asked the OS (see [`Minidump::set_rss_bytes`]). A minidump file
+    /// does not record residency itself.
+    rss_bytes: Option<u64>,
+    /// The NT heap walk, done on first use.
+    native: OnceLock<Option<nt_heap::HeapWalk>>,
 }
 
 impl fmt::Debug for Minidump {
@@ -262,6 +278,13 @@ impl fmt::Debug for Minidump {
 }
 
 impl Minidump {
+    /// Record the process's working set at capture time, which the dump file
+    /// itself does not carry. Live capture knows it; a dump opened from disk
+    /// does not.
+    pub fn set_rss_bytes(&mut self, rss: Option<u64>) {
+        self.rss_bytes = rss;
+    }
+
     /// Open a full-memory minidump. Fails with [`Error::Format`] if the dump
     /// has no `Memory64ListStream` (it was not written with full memory).
     pub fn open(path: &Path) -> Result<Minidump> {
@@ -385,6 +408,8 @@ impl Minidump {
         };
 
         Ok(Minidump {
+            rss_bytes: None,
+            native: OnceLock::new(),
             data,
             target,
             full_memory,
@@ -501,6 +526,57 @@ impl Minidump {
         };
         heaps().unwrap_or_default()
     }
+
+    /// The NT heap walk behind [`MemorySource::native_blocks`], with the
+    /// heap list and what the walk ran into. Computed once and kept. `None`
+    /// if the dump is not of a 64-bit Windows process or holds no NT heap.
+    pub fn native_heap_walk(&self) -> Option<&nt_heap::HeapWalk> {
+        self.native
+            .get_or_init(|| {
+                if self.target.os != Os::Windows || self.target.pointer_size != 8 {
+                    return None;
+                }
+                nt_heap::walk(
+                    self,
+                    &self.process_heaps(),
+                    &self.heap_candidates(),
+                    &|addr| self.allocation_span(addr),
+                )
+            })
+            .as_ref()
+    }
+
+    /// Addresses that may start a heap: the base of every committed private
+    /// allocation, or without `MemoryInfoListStream`, the start of every
+    /// captured range (allocation bases are among them).
+    fn heap_candidates(&self) -> Vec<u64> {
+        if self.memory_info.is_empty() {
+            return self.ranges.iter().map(|r| r.start).collect();
+        }
+        self.memory_info
+            .iter()
+            .filter(|m| {
+                m.base == m.allocation_base && m.is_committed() && m.kind == mem::MEM_PRIVATE
+            })
+            .map(|m| m.base)
+            .collect()
+    }
+
+    /// `[start, end)` of the whole reservation (`VirtualAlloc` allocation)
+    /// containing `addr`, committed and reserved parts together.
+    fn allocation_span(&self, addr: u64) -> Option<(u64, u64)> {
+        let base = self.info_at(addr)?.allocation_base;
+        let first = self.memory_info.partition_point(|m| m.base < base);
+        let regions = self.memory_info[first..]
+            .iter()
+            .take_while(|m| m.allocation_base == base && m.state != mem::MEM_FREE);
+        let end = regions.fold(None, |end: Option<u64>, m| match end {
+            // Regions of one allocation are contiguous; stop at a gap.
+            Some(e) if m.base != e => Some(e),
+            _ => Some(m.end()),
+        })?;
+        (addr < end).then_some((base, end))
+    }
 }
 
 fn target_info(sys: &parse::RawSystemInfo) -> Result<TargetInfo> {
@@ -593,6 +669,12 @@ fn module_from_raw(m: parse::RawModule) -> MinidumpModule {
 }
 
 impl MemorySource for Minidump {
+    /// The busy blocks of every NT heap in the dump; see [`nt_heap`] for how
+    /// the heaps are found and walked, and what is left out (segment heaps).
+    fn native_blocks(&self) -> Result<Option<Vec<NativeBlock>>> {
+        Ok(self.native_heap_walk().map(|w| w.blocks.clone()))
+    }
+
     fn target(&self) -> TargetInfo {
         self.target
     }
@@ -708,7 +790,7 @@ impl MemorySource for Minidump {
                     resident_bytes: None,
                 })
                 .collect(),
-            rss_bytes: None,
+            rss_bytes: self.rss_bytes,
         })
     }
 

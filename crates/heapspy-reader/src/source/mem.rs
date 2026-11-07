@@ -2,7 +2,9 @@
 //! walker and of symbol lookup: lay out fake objects at chosen addresses and
 //! read them back through the same trait the real backends implement.
 
-use super::{MappedRange, MemorySource, MemorySummary, Module, Perms, TargetInfo, ThreadInfo};
+use super::{
+    MappedRange, MemorySource, MemorySummary, Module, NativeBlock, Perms, TargetInfo, ThreadInfo,
+};
 use crate::error::{Error, Result};
 
 /// Segments of target memory held in memory.
@@ -14,6 +16,7 @@ pub struct MemImage {
     modules: Vec<Module>,
     threads: Vec<ThreadInfo>,
     summary: Option<MemorySummary>,
+    native: Option<Vec<NativeBlock>>,
 }
 
 impl MemImage {
@@ -24,7 +27,16 @@ impl MemImage {
             modules: Vec::new(),
             threads: Vec::new(),
             summary: None,
+            native: None,
         }
+    }
+
+    /// Declare the image's native heap blocks, as a heap walker would have
+    /// found them. Sorted here.
+    pub fn set_native_blocks(&mut self, mut blocks: Vec<NativeBlock>) -> &mut Self {
+        blocks.sort_by_key(|b| b.start);
+        self.native = Some(blocks);
+        self
     }
 
     /// Map `bytes` at `addr`. Panics if it overlaps an existing segment
@@ -126,6 +138,10 @@ impl MemorySource for MemImage {
 
     fn memory_summary(&self) -> Option<MemorySummary> {
         self.summary.clone()
+    }
+
+    fn native_blocks(&self) -> Result<Option<Vec<NativeBlock>>> {
+        Ok(self.native.clone())
     }
 }
 

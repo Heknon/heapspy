@@ -108,6 +108,14 @@ heapspy diff before.hpy after.hpy
 
 `diff` reports growth by type and by retaining site. Object addresses change between dumps, so matching individual objects across snapshots is approximate. The output says so and reports aggregates.
 
+### Investigate until it is clear
+
+```sh
+python3 scripts/investigate.py --pid 1234 --heapspy target/release/heapspy
+```
+
+`scripts/investigate.py` runs `dump`, `analyze` and `diff` in rounds. After each round it asks what is still unclear about each suspect and gets the information that answers it. Another snapshot tells growth from size and a cache warming up from a leak. A snapshot with contents captured names module files. `query --locate` finds the code. It stops when nothing more can be learned. The report gives, for each holder, a verdict, a growth rate, what the growth is made of down to the field that pins it (`[<index>] <+40>.tb_frame local 'upload'`), and where the code is. It lists what heapspy could not make clear, and how to get it.
+
 ### Retention flame graph
 
 ```sh
@@ -224,7 +232,8 @@ Out of scope for v1: allocation call chains, per-object native or C-extension me
 ## Known blind spots
 
 - **Untracked objects.** Bare ints, short strings, and raw buffers are not on the GC lists. heapspy sees them only when a tracked container references them. A leak made entirely of floating untracked objects will not show up in v1, and the output will say so.
-- **Native memory.** Memory allocated by C extensions is invisible to the object graph. heapspy reports how much of RSS falls outside the graph rather than guessing.
+- **Native memory.** Memory allocated by C extensions is invisible to the object graph. heapspy reports how much of RSS falls outside the graph rather than guessing. Python objects that native code holds are not lost: their refcounts show owners heapspy found no reference from, and they are reported under the root `held outside the Python graph`.
+- **C types heapspy has no layout for.** Their references are found by scanning their fields for pointers to objects, and the memory they point at but do not lay out (a `deque`'s blocks, an extension's item array) is searched the same way. Both kinds of edge are checked against the targets' refcounts, so a field that only borrows, or a stale slot, does not count as ownership.
 - **Struct layouts.** CPython's internal layouts change between versions and builds. heapspy uses DWARF or PDB symbols when available, 3.14's debug offsets section where present, and shipped per-version offset tables otherwise.
 
 ## Agent integration: heapspy-mcp

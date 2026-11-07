@@ -21,15 +21,35 @@
     "shallow_bytes": 469762048,
     "reachable_objects": 2839001,
     "reachable_bytes": 469460992,
+    "external_objects": 0,
+    "external_bytes": 0,
     "unreachable_objects": 2906,
     "unreachable_bytes": 301056,
-    "dangling_edges": 0
+    "dangling_edges": 0,
+    "refcounts_checked": true,
+    "borrowed_edges_dropped": 0,
+    "stale_edges_dropped": 0,
+    "out_of_line_edges": 0,
+    "native_blocks": 0,
+    "native_bytes": 0,
+    "native_lost_blocks": 0,
+    "native_lost_bytes": 0
   },
   "memory": {
     "rss_bytes": 2040109465,
     "graph_bytes": 469762048,
     "outside_graph_bytes": 1570347417,
-    "outside_graph_pct": 76.97
+    "outside_graph_pct": 76.97,
+    "breakdown": [
+      { "part": "images", "bytes": 41943040 },
+      { "part": "mapped_files", "bytes": 8388608 },
+      { "part": "stacks", "bytes": 2097152 },
+      { "part": "python_small_objects", "bytes": 320864256 },
+      { "part": "pymalloc_free", "bytes": 46137344 },
+      { "part": "python_large_objects", "bytes": 148897792 },
+      { "part": "native_unknown", "bytes": 1471781273 }
+    ],
+    "breakdown_basis": "resident"
   },
   "top_retainers": [
     {

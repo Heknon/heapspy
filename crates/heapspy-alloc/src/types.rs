@@ -54,17 +54,24 @@ pub enum EventKind {
     /// An allocation above pymalloc's small-object threshold (512 bytes) went
     /// to the system allocator.
     LargeObject,
+    /// A call to the C heap (`RtlAllocateHeap` / `RtlReAllocateHeap` on
+    /// Windows), from any caller: C extensions, ctypes, the runtime itself.
+    /// `address` is the pointer the call returned, which lies inside the
+    /// heap block, after the allocator's header; `size` is the requested
+    /// size. Sampled by byte interval above a size floor.
+    Native,
     /// A code this build does not know. Kept so newer files still open.
     Unknown(u8),
 }
 
 impl EventKind {
     /// The kinds this build knows, in code order.
-    pub const ALL: [EventKind; 4] = [
+    pub const ALL: [EventKind; 5] = [
         EventKind::Other,
         EventKind::Arena,
         EventKind::Pool,
         EventKind::LargeObject,
+        EventKind::Native,
     ];
 
     pub fn code(self) -> u8 {
@@ -73,6 +80,7 @@ impl EventKind {
             EventKind::Arena => 1,
             EventKind::Pool => 2,
             EventKind::LargeObject => 3,
+            EventKind::Native => 4,
             EventKind::Unknown(c) => c,
         }
     }
@@ -83,6 +91,7 @@ impl EventKind {
             1 => EventKind::Arena,
             2 => EventKind::Pool,
             3 => EventKind::LargeObject,
+            4 => EventKind::Native,
             c => EventKind::Unknown(c),
         }
     }
@@ -94,8 +103,15 @@ impl EventKind {
             EventKind::Arena => "arena",
             EventKind::Pool => "pool",
             EventKind::LargeObject => "large_object",
+            EventKind::Native => "native",
             EventKind::Unknown(_) => "unknown",
         }
+    }
+
+    /// Samples of this kind describe one allocation each, whose block is
+    /// sampled by byte interval: `large_object` and `native`.
+    pub fn is_byte_sampled(self) -> bool {
+        matches!(self, EventKind::LargeObject | EventKind::Native)
     }
 }
 
@@ -107,16 +123,18 @@ impl fmt::Display for EventKind {
 
 impl FromStr for EventKind {
     type Err = String;
-    /// Accepts `arena`, `pool`, `large_object` (or `large`) and `other`.
+    /// Accepts `arena`, `pool`, `large_object` (or `large`), `native` and
+    /// `other`.
     fn from_str(s: &str) -> Result<Self, String> {
         Ok(match s {
             "arena" => EventKind::Arena,
             "pool" => EventKind::Pool,
             "large" | "large_object" => EventKind::LargeObject,
+            "native" => EventKind::Native,
             "other" => EventKind::Other,
             _ => {
                 return Err(format!(
-                    "unknown event kind {s:?} (expected arena, pool, large or other)"
+                    "unknown event kind {s:?} (expected arena, pool, large, native or other)"
                 ))
             }
         })
@@ -133,6 +151,8 @@ impl EventKinds {
 
     /// The default for `heapspy record`: arenas and large objects. Pool
     /// probes need a symbol that some builds inline, so they are opt-in.
+    /// Native heap calls trap on every call to the C heap, so they are
+    /// opt-in too.
     pub const DEFAULT: EventKinds = EventKinds((1 << 1) | (1 << 3));
 
     pub fn of(kinds: &[EventKind]) -> Self {
@@ -277,26 +297,33 @@ impl Mechanisms {
 
 // ---------------------------------------------------------------- header
 
-/// How the recorder sampled (header `events`, `byte_interval`, `max_frames`).
+/// How the recorder sampled (header `events`, `byte_interval`,
+/// `max_frames`, `native_min_size`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SamplingParams {
     /// Event kinds the recorder had enabled.
     pub events: EventKinds,
-    /// Mean bytes between kept large-object samples. 0 means every event was
-    /// kept. Arena and pool events are never sub-sampled.
+    /// Mean bytes between kept large-object and native samples. 0 means
+    /// every event was kept. Arena and pool events are never sub-sampled.
     pub byte_interval: u64,
     /// Most Python frames recorded per sample, innermost first.
     pub max_frames: u32,
+    /// Native heap calls asking for fewer bytes than this were not sampled
+    /// at all, so native weights estimate only the bytes of calls at or
+    /// above it. 0 (and every file written before the field existed, where
+    /// the header bytes are reserved zeros) means no floor.
+    pub native_min_size: u32,
 }
 
 impl SamplingParams {
-    /// Provisional defaults for `heapspy record`, until the M7 spike
-    /// measures the overhead: arenas and large objects, a 512 KiB byte
-    /// interval, 64 frames.
+    /// Defaults for `heapspy record`: arenas and large objects, a 512 KiB
+    /// byte interval, 64 frames, and the native floor
+    /// [`DEFAULT_NATIVE_MIN_SIZE`] for when `native` is asked for.
     pub const DEFAULT: SamplingParams = SamplingParams {
         events: EventKinds::DEFAULT,
         byte_interval: DEFAULT_BYTE_INTERVAL,
         max_frames: DEFAULT_MAX_FRAMES,
+        native_min_size: DEFAULT_NATIVE_MIN_SIZE,
     };
 }
 
@@ -310,6 +337,9 @@ impl Default for SamplingParams {
 pub const DEFAULT_BYTE_INTERVAL: u64 = 512 * 1024;
 /// Default `--max-frames`.
 pub const DEFAULT_MAX_FRAMES: u32 = 64;
+/// Default `--native-min-size`: 4 KiB. See `docs/allocation-sampling.md`,
+/// "Native heap".
+pub const DEFAULT_NATIVE_MIN_SIZE: u32 = 4096;
 
 /// What recording cost, measured by the recorder.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -589,6 +619,14 @@ mod tests {
             all,
             [EventKind::Other, EventKind::Pool, EventKind::LargeObject]
         );
+        let k: EventKinds = "native".parse().unwrap();
+        assert_eq!(k.iter().collect::<Vec<_>>(), [EventKind::Native]);
+        assert!(!EventKinds::DEFAULT.contains(EventKind::Native));
+        for kind in EventKind::ALL {
+            assert_eq!(EventKind::from_code(kind.code()), kind);
+            assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
+        }
+        assert_eq!(EventKind::from_code(5), EventKind::Unknown(5));
     }
 
     #[test]

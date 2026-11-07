@@ -22,6 +22,11 @@
 //!   names from `comm`, stack pointer and `fs_base` from `PTRACE_GETREGS`.
 //! - Memory summary: `/proc/<pid>/smaps` for per-kind mapped and resident
 //!   totals, `/proc/<pid>/smaps_rollup` for RSS.
+//! - Native heap: glibc malloc's chunks, walked by [`super::glibc_heap`]
+//!   from the image like everything else, with the brk heap located by its
+//!   `[heap]` line in `maps`. Checked on synthetic images and by the ignored
+//!   test `tests/native_heap_live.rs`, which the e2e workflow runs; it has
+//!   not been run against a real process from this repository's checks yet.
 //! - Errors: `EPERM` maps to [`Error::PermissionDenied`] with a hint about
 //!   `CAP_SYS_PTRACE` and `kernel.yama.ptrace_scope`.
 //!
@@ -129,6 +134,14 @@ impl LiveProcess {
 
 #[cfg(target_os = "linux")]
 impl MemorySource for LiveProcess {
+    fn native_blocks(&self) -> Result<Option<Vec<super::NativeBlock>>> {
+        super::glibc_heap::native_blocks(
+            self,
+            &super::glibc_heap::HeapHints {
+                brk: self.inner.brk_range(),
+            },
+        )
+    }
     fn target(&self) -> TargetInfo {
         self.target
     }

@@ -56,6 +56,16 @@ uvx ruff check tests/e2e && uvx ruff format --check tests/e2e
 See [tests/e2e/README.md](tests/e2e/README.md) for choosing interpreters and
 adding a fixture.
 
+The Linux e2e job also runs the glibc native heap walker against a real
+CPython, live and through `gcore` (the ignored test
+`crates/heapspy-reader/tests/native_heap_live.rs`). Locally, with gdb and
+ptrace permission:
+
+```sh
+HEAPSPY_PY="$(uv python find 3.13)" \
+    cargo test -p heapspy-reader --test native_heap_live -- --ignored --test-threads 1
+```
+
 Live `heapspy record` tests (`.github/workflows/record.yml`) record real
 CPython 3.12, 3.13 and 3.14 processes through every mechanism:
 

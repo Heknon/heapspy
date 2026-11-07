@@ -166,6 +166,91 @@ fn reads_within_across_and_outside_ranges() {
 }
 
 #[test]
+fn native_blocks_walk_the_heaps_in_the_dump() {
+    use super::nt_heap::off;
+    use super::nt_heap::tests::{Img, FIRST, KEY};
+    use crate::source::{NativeBlock, NativeBlockKind};
+
+    // The sample's PEB lists HEAP; make it an NT heap, add a second heap
+    // that only a scan finds, and give the first a large block in its own
+    // reservation (committed and reserved parts).
+    let other = HEAP + 0x10_0000;
+    let res = 0x0000_0300_0000_0000u64;
+    let va = res + 0x5000;
+    let mut img = Img::default();
+    img.region(HEAP, 0x1000)
+        .region(other, 0x1000)
+        .region(va, 0x100);
+    img.heap(HEAP, 0x1000);
+    img.blocks(HEAP + FIRST, &[(0x40, 1, 0x10), (0xdc0, 0, 0)]);
+    img.heap(other, 0x1000);
+    img.blocks(other + FIRST, &[(0xe00, 1, 0x10)]);
+    img.u64(va + off::VA_COMMIT_SIZE, 0x1000);
+    img.entry(va + off::VA_BUSY_BLOCK, 0x1000, 3, 0, 0, &KEY);
+    img.list(HEAP + off::VIRTUAL_ALLOCD_BLOCKS, &[va]);
+
+    let rw = mem::PAGE_READWRITE;
+    let mut b = sample();
+    b.memory64 = Some(
+        [(PEB, peb_bytes()), (TEB, teb_bytes())]
+            .into_iter()
+            .chain(img.regions.clone())
+            .collect(),
+    );
+    b.memory_info = Some(vec![
+        info(PEB, 0x1000, PEB, mem::PAGE_READONLY, mem::MEM_PRIVATE),
+        info(TEB, 0x2000, TEB, rw, mem::MEM_PRIVATE),
+        info(HEAP, 0x1000, HEAP, rw, mem::MEM_PRIVATE),
+        info(other, 0x1000, other, rw, mem::MEM_PRIVATE),
+        info(res, 0x6000, res, rw, mem::MEM_PRIVATE),
+        MemoryInfo {
+            state: mem::MEM_RESERVE,
+            ..info(res + 0x6000, 0x2000, res, 0, mem::MEM_PRIVATE)
+        },
+    ]);
+    let block = |start, size, kind, heap, data_offset| NativeBlock {
+        start,
+        size,
+        kind,
+        heap,
+        data_offset,
+    };
+    let small = [
+        block(HEAP + FIRST + 8, 0x40, NativeBlockKind::Allocation, 0, 8),
+        block(other + FIRST + 8, 0xe00, NativeBlockKind::Allocation, 1, 8),
+    ];
+
+    let d = Minidump::from_bytes(b.build(), MinidumpOptions::default()).unwrap();
+    let mut want = small.to_vec();
+    want.push(block(
+        res,
+        0x8000,
+        NativeBlockKind::Large,
+        0,
+        va + 0x40 - res,
+    ));
+    assert_eq!(d.native_blocks().unwrap(), Some(want));
+    let w = d.native_heap_walk().unwrap();
+    assert_eq!(w.heaps, vec![HEAP, other]);
+    // Cached: the same walk comes back.
+    assert!(std::ptr::eq(w, d.native_heap_walk().unwrap()));
+
+    // Without MemoryInfoListStream the heaps are still found (from the
+    // range starts), and the large block is the entry and its commit.
+    b.memory_info = None;
+    let d = Minidump::from_bytes(b.build(), MinidumpOptions::default()).unwrap();
+    let mut want = small.to_vec();
+    want.push(block(va, 0x1000, NativeBlockKind::Large, 0, 0x40));
+    assert_eq!(d.native_blocks().unwrap(), Some(want));
+
+    // No heap in the sample dump; not a Windows dump.
+    assert_eq!(open_sample().native_blocks().unwrap(), None);
+    b.platform_id = 0x8201;
+    let d = Minidump::from_bytes(b.build(), MinidumpOptions::default()).unwrap();
+    assert_eq!(d.native_blocks().unwrap(), None);
+}
+
+#[test]
 fn modules_threads_and_metadata() {
     let d = open_sample();
     let mods = d.modules().unwrap();
@@ -503,6 +588,7 @@ fn exercise(d: &Minidump) {
     let _ = d.memory_summary();
     let _ = d.memory_totals();
     let _ = d.captured_at();
+    let _ = d.native_blocks().unwrap();
     let _ = format!("{d:?}");
     for r in ranges.iter().take(16) {
         let _ = d.read_vec(r.start, r.size.min(0x2000) as usize);

@@ -320,18 +320,50 @@ window early: the profile is written and `truncated` is `true`.
 | `shallow_bytes` | integer | sum of shallow sizes of all objects |
 | `reachable_objects` | integer | objects reachable from at least one root |
 | `reachable_bytes` | integer | sum of shallow sizes of reachable objects |
-| `unreachable_objects` | integer | objects no root reaches (cyclic garbage not yet collected, or held only from outside the recorded graph) |
+| `external_objects` | integer | objects no root reaches that something outside the recorded graph owns, as their refcounts show (native code, C globals, memory heapspy could not lay out). Paths to them start at the root `held outside the Python graph`, kind `external`. 0 when `refcounts_checked` is false |
+| `external_bytes` | integer | their shallow sizes |
+| `unreachable_objects` | integer | objects neither reachable nor held from outside. When `refcounts_checked` is true, their owners are all each other: cyclic garbage the collector will free. When it is false, this also includes what `external_objects` would have counted |
 | `unreachable_bytes` | integer | their shallow sizes |
 | `dangling_edges` | integer | edges whose target is not in the snapshot |
+| `refcounts_checked` | boolean | whether the snapshot recorded refcounts and references were checked against them |
+| `borrowed_edges_dropped` | integer | scanned edges (fields of a layout heapspy does not know) dropped because their target had more of them than owners |
+| `stale_edges_dropped` | integer | out-of-line pointers dropped because nothing about their target needed them. Without refcounts, every out-of-line pointer |
+| `out_of_line_edges` | integer | out-of-line references kept: objects held through memory their owner points at but does not lay out, such as a `deque`'s blocks |
+| `native_blocks` | integer | native heap blocks recorded (objects flagged `NATIVE`, type `native.*`): memory C code allocated, apart from Python objects. 0 when the source could not walk its heaps. Included in `objects`, `shallow_bytes` and, when reachable, `reachable_*` |
+| `native_bytes` | integer | their bytes |
+| `native_lost_blocks` | integer | native blocks nothing points to (no Python object, other block, module global or thread stack): leaked memory. Not counted in `unreachable_*` |
+| `native_lost_bytes` | integer | their bytes |
+
+Percentages in reports (`retained_pct`) are of everything held:
+`reachable_bytes + external_bytes`. A native block is reached through a
+Python object that points into it (a field, or an `int` whose value is an
+address in it: label `<address>`), another block, or a `native` root.
 
 `memory`:
 
 | field | type | meaning |
 |---|---|---|
 | `rss_bytes` | integer, nullable | process resident set size, if the source recorded it |
-| `graph_bytes` | integer | bytes in the object graph (`totals.shallow_bytes`) |
+| `graph_bytes` | integer | bytes of Python objects in the graph (`totals.shallow_bytes` less `totals.native_bytes`) |
 | `outside_graph_bytes` | integer, nullable | `rss_bytes - graph_bytes`, floored at 0 |
 | `outside_graph_pct` | float, nullable | `outside_graph_bytes / rss_bytes * 100` |
+| `breakdown` | array | what the process's memory is, by kind: `{part, bytes}` (below). Empty without a memory map |
+| `breakdown_basis` | string, nullable | `resident`, or `committed` where the source does not record residency (Windows minidumps); committed can exceed RSS |
+
+`breakdown[].part`:
+
+| part | meaning |
+|---|---|
+| `images` | code and data of loaded modules |
+| `mapped_files` | memory-mapped files |
+| `stacks` | thread stacks |
+| `python_small_objects` | blocks pymalloc has handed out, from its pool headers |
+| `pymalloc_free` | the rest of pymalloc's arenas: held by Python's allocator, not in use |
+| `python_large_objects` | Python objects too big for pymalloc, which come from `malloc` |
+| `native_heap` | native heap blocks something points to (with a heap walk) |
+| `native_lost` | native heap blocks nothing points to: leaked (with a heap walk) |
+| `native_other` | private memory outside any heap block: allocator overhead and free space, memory C code mapped itself (with a heap walk) |
+| `native_unknown` | all private memory C code allocated, when the heaps were not walked |
 
 Retainer (`top_retainers[]`):
 
@@ -449,31 +481,35 @@ allocation profile written by `heapspy record` (format:
 check the profile (its notes are added).
 
 Samples are an estimate of where growth came from during the recording
-window, not a full allocation history: only arena, pool and large-object
-events are sampled, blocks reused from freed memory are not, and objects
-allocated before recording started have no sample. An object is *linked*
-to a sample when its address lies inside the sampled range and no later
-sample covers that address. For a `large_object` sample the object must
-also be that allocation: it starts at the sample's address plus 0, 16 or
-32 bytes (no GC header, the GC header, or the GC header and the managed
+window, not a full allocation history: only arena, pool, large-object and
+native heap events are sampled, blocks reused from freed memory are not,
+and objects allocated before recording started have no sample. An object
+is *linked* to a sample when its address lies inside the sampled range and
+no later sample covers that address. For a `large_object` sample the object
+must also be that allocation: it starts at the sample's address plus 0, 16
+or 32 bytes (no GC header, the GC header, or the GC header and the managed
 dict and weakref words), and the sample's requested size is within 16
 bytes of the object's `shallow_size` (for a type object, at most 16 bytes
 above it). When the latest covering sample is a `large_object` sample the
 object does not match, the object is not linked at all and is counted in
-`coverage.unlinked_reused_*`. Samples taken after the snapshot's capture
-second are not used for linking. When the profile does not match the
-snapshot (the `allocations_*_mismatch` and `allocations_after_snapshot`
-notes), nothing is linked and the report carries `allocations_not_linked`.
-The algorithm is described in `docs/allocation-sampling.md`, "Joining with
-a snapshot".
+`coverage.unlinked_reused_*`. A `native` sample is matched differently: its
+address is the pointer *inside* the block that the allocator returned, so
+the object linked is the one whose range contains the whole returned block;
+this runs as a separate pass and never overrides an exact or arena/pool
+link (see `docs/allocation-sampling.md`, "Native samples: by containment").
+Samples taken after the snapshot's capture second are not used for linking.
+When the profile does not match the snapshot (the `allocations_*_mismatch`
+and `allocations_after_snapshot` notes), nothing is linked and the report
+carries `allocations_not_linked`. The algorithm is described in
+`docs/allocation-sampling.md`, "Joining with a snapshot".
 
-Links through `large_object` samples are *exact*: the sample is the
-object's own allocation. Links through `arena` and `pool` samples (and `other`) are
-*approximate*: the sample is the most recent growth event that created
-the memory, not necessarily the call that allocated the object. The
-`exact_linked_*` fields give the exact part of each linked count. The
-`approximate` flags mean something else: Python frames matched to the
-event by time (ETW).
+Links through `large_object` and `native` samples are *exact*: the sample
+is the object's own allocation. Links through `arena` and `pool` samples
+(and `other`) are *approximate*: the sample is the most recent growth event
+that created the memory, not necessarily the call that allocated the
+object. The `exact_linked_*` fields give the exact part of each linked
+count. The `approximate` flags mean something else: Python frames matched
+to the event by time (ETW).
 
 ### Allocations (`allocations`)
 
@@ -485,8 +521,8 @@ event by time (ETW).
 | `started_at` | integer | Unix seconds when recording started |
 | `duration_ms` | integer | length of the recording window in milliseconds |
 | `mechanisms` | array of string | mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"` |
-| `sampling.events` | array of string | event kinds enabled: `"arena"`, `"pool"`, `"large_object"` |
-| `sampling.byte_interval` | integer | mean bytes between large-object samples; 0 means every one was kept |
+| `sampling.events` | array of string | event kinds enabled: `"arena"`, `"pool"`, `"large_object"`, `"native"` |
+| `sampling.byte_interval` | integer | mean bytes between large-object and native samples; 0 means every one was kept |
 | `sampling.max_frames` | integer | most Python frames kept per sample |
 | `overhead.samples_taken` | integer | samples written |
 | `overhead.samples_dropped` | integer | samples lost before they were written (buffer full, stack unreadable) |
@@ -499,7 +535,7 @@ event by time (ETW).
 | `coverage.linked_objects` | integer | reachable objects linked to a sample |
 | `coverage.linked_bytes` | integer | their shallow bytes |
 | `coverage.linked_pct` | float | `coverage.linked_bytes / totals.reachable_bytes * 100` |
-| `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` samples (exact links) |
+| `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` or `native` samples (exact links) |
 | `coverage.exact_linked_bytes` | integer | their shallow bytes |
 | `coverage.unlinked_reused_objects` | integer | reachable objects not linked because the latest sample over their address is a `large_object` sample they do not match: the sampled block was freed and the memory reused by an allocation that was not sampled. Added after the first M7 release; reads as 0 when missing |
 | `coverage.unlinked_reused_bytes` | integer | their shallow bytes; reads as 0 when missing |
@@ -515,7 +551,7 @@ AllocationStack (`top_stacks[]`):
 | `samples` | integer | samples with this stack |
 | `events` | array of string | event kinds among them, sorted |
 | `linked_bytes` | integer | shallow bytes of reachable objects linked to these samples |
-| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` or `native` samples |
 | `approximate` | bool | any frame of any of these samples was approximate |
 
 Two samples have the same stack when their frames have the same
@@ -543,7 +579,7 @@ objects has `linked_objects: 0` and no stacks.
 |---|---|---|
 | `linked_objects` | integer | objects in the subtree linked to a sample |
 | `linked_bytes` | integer | their shallow bytes |
-| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` or `native` samples |
 | `stacks` | array of AllocatedAtStack | by `linked_bytes`, at most 5 |
 | `approximate` | bool | any listed stack is approximate |
 
@@ -554,7 +590,7 @@ AllocatedAtStack:
 | `frames` | array of StackFrame | innermost first |
 | `linked_objects` | integer | linked objects in the subtree allocated through this stack |
 | `linked_bytes` | integer | their shallow bytes |
-| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` or `native` samples |
 | `top_stack_rank` | integer, nullable | `rank` of the same stack in `allocations.top_stacks`, if it is listed there; always `null` on query reports |
 
 ## `retaining_path`
@@ -699,7 +735,7 @@ labels so that it can be found again in another dump:
   `sys.modules['app.a'].__dict__['SHARED']`.
 - List and tuple indices are generalised to `[<index>]`, since positions
   shift as a container changes.
-- Only the first 6 levels of the dominator tree get sites (level 1 is the
+- Only the first 10 levels of the dominator tree get sites (level 1 is the
   root objects). Deeper objects are counted in the retained size of their
   ancestor's site.
 - Objects that end up with the same site are summed: every value of a dict
