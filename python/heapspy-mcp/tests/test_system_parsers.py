@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,10 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the fake kubepods cgroup path is longer than Windows' MAX_PATH",
+)
 def test_locate_and_read_v2_tree(tmp_path: Path) -> None:
     root = tmp_path / "cgroup"
     pod = (

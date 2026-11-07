@@ -36,8 +36,10 @@ use crate::{notes, push_edge, snapshot_summary, DiffOptions, Result};
 
 /// Deepest dominator-tree level that gets its own site. Level 1 is the root
 /// objects; `module -> __dict__ -> CACHE -> entry -> entry.__dict__ ->
-/// value` reaches level 6.
-pub const MAX_SITE_DEPTH: u8 = 6;
+/// value` reaches level 6. Leaks often sit deeper than that: an exception
+/// kept in a list holds `traceback -> frame -> local`, level 7 and on, and
+/// that last hop is the one that names what to fix.
+pub const MAX_SITE_DEPTH: u8 = 10;
 
 struct Site {
     parent: u32,
@@ -178,19 +180,35 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
         }
     }
     drop(trie);
-    let mut out = HashMap::with_capacity(sites.len());
+    // Two trie sites can render to the same text: an object several roots
+    // share is named by its shortest path, which can read exactly like the
+    // site of the objects its container owns (`...['CACHE'][<index>]`). They
+    // are the same site to a reader, so they are summed. Overwriting kept
+    // whichever came last, and a diff then saw a whole site appear or vanish.
+    let mut out: HashMap<String, SiteStat> = HashMap::with_capacity(sites.len());
     for (id, s) in sites.iter().enumerate() {
         let key = render_site(&sites, id as u32);
-        out.insert(
-            key,
-            SiteStat {
-                type_name: a.types.names[s.type_group as usize].clone(),
-                bytes: s.bytes,
-                objects: s.objects,
-                members: s.members,
-                parent: (s.parent != NONE).then(|| render_site(&sites, s.parent)),
-            },
-        );
+        match out.entry(key) {
+            Entry::Occupied(mut o) => {
+                let t = o.get_mut();
+                // The type of the bigger contribution names the site.
+                if s.bytes > t.bytes {
+                    t.type_name = a.types.names[s.type_group as usize].clone();
+                }
+                t.bytes += s.bytes;
+                t.objects += s.objects;
+                t.members += s.members;
+            }
+            Entry::Vacant(v) => {
+                v.insert(SiteStat {
+                    type_name: a.types.names[s.type_group as usize].clone(),
+                    bytes: s.bytes,
+                    objects: s.objects,
+                    members: s.members,
+                    parent: (s.parent != NONE).then(|| render_site(&sites, s.parent)),
+                });
+            }
+        }
     }
     Ok(out)
 }

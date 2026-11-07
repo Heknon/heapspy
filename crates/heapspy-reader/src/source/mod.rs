@@ -165,6 +165,14 @@ pub struct NativeBlock {
     /// (the process heaps on Windows, the arenas in glibc). 0 when there is
     /// one.
     pub heap: u32,
+    /// Where the program's data begins, as an offset from `start`: the
+    /// pointer `malloc` handed out is `start + data_offset`. The bytes
+    /// before it are the allocator's header, and pointers into them are the
+    /// allocator's own bookkeeping (the links chaining the Windows heap's
+    /// large blocks sit in such a header, at a random offset into the
+    /// block), not references the program holds. 0 if the source cannot
+    /// tell; then only a pointer to `start` itself is taken as bookkeeping.
+    pub data_offset: u64,
 }
 
 /// A read-only view of one process's memory. See the module docs for the

@@ -208,20 +208,27 @@ fn native_blocks_walk_the_heaps_in_the_dump() {
             ..info(res + 0x6000, 0x2000, res, 0, mem::MEM_PRIVATE)
         },
     ]);
-    let block = |start, size, kind, heap| NativeBlock {
+    let block = |start, size, kind, heap, data_offset| NativeBlock {
         start,
         size,
         kind,
         heap,
+        data_offset,
     };
     let small = [
-        block(HEAP + FIRST + 8, 0x40, NativeBlockKind::Allocation, 0),
-        block(other + FIRST + 8, 0xe00, NativeBlockKind::Allocation, 1),
+        block(HEAP + FIRST + 8, 0x40, NativeBlockKind::Allocation, 0, 8),
+        block(other + FIRST + 8, 0xe00, NativeBlockKind::Allocation, 1, 8),
     ];
 
     let d = Minidump::from_bytes(b.build(), MinidumpOptions::default()).unwrap();
     let mut want = small.to_vec();
-    want.push(block(res, 0x8000, NativeBlockKind::Large, 0));
+    want.push(block(
+        res,
+        0x8000,
+        NativeBlockKind::Large,
+        0,
+        va + 0x40 - res,
+    ));
     assert_eq!(d.native_blocks().unwrap(), Some(want));
     let w = d.native_heap_walk().unwrap();
     assert_eq!(w.heaps, vec![HEAP, other]);
@@ -233,7 +240,7 @@ fn native_blocks_walk_the_heaps_in_the_dump() {
     b.memory_info = None;
     let d = Minidump::from_bytes(b.build(), MinidumpOptions::default()).unwrap();
     let mut want = small.to_vec();
-    want.push(block(va, 0x1000, NativeBlockKind::Large, 0));
+    want.push(block(va, 0x1000, NativeBlockKind::Large, 0, 0x40));
     assert_eq!(d.native_blocks().unwrap(), Some(want));
 
     // No heap in the sample dump; not a Windows dump.

@@ -190,7 +190,17 @@ fn paths_to(a: &Analysis, targets: &[u32], max: usize) -> Result<Vec<Vec<Retaini
     for (i, &t) in targets.iter().enumerate() {
         let mut cands = std::mem::take(&mut refs[i]);
         let via = a.via[t as usize];
-        cands.sort_unstable_by_key(|&(u, e)| (a.dist[u as usize], e != via, e));
+        // The BFS path first: it starts at the best root kind (a module
+        // before a frame, both before native memory). Then the others by
+        // length, a pointer from native memory (a C global, a stack word)
+        // or an external root after every Python referrer: such a word may
+        // be a cache or a stale slot, and a direct root edge would otherwise
+        // always be shortest.
+        let late = |e: u32| {
+            a.g.root_phases[crate::graph::EXTERNAL_PHASE - 1].contains(&e)
+                || a.g.root_phases[crate::graph::EXTERNAL_PHASE].contains(&e)
+        };
+        cands.sort_unstable_by_key(|&(u, e)| (e != via, late(e), a.dist[u as usize], e));
         let mut paths: Vec<RetainingPath> = Vec::new();
         for (u, e) in cands {
             if paths.len() >= max {

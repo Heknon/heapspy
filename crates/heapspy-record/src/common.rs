@@ -53,6 +53,9 @@ pub fn note_events(
 ///    sampler the eBPF large-object path uses, so the kept weights are an
 ///    unbiased estimate of the bytes allocated at or above the floor.
 ///    `interval` 0 keeps every call that passed the floor, weighed its size.
+// Only the Windows recorder samples native allocations so far; a Linux one
+// would use the same filter.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct NativeFilter {
     min_size: u64,
@@ -60,6 +63,7 @@ pub struct NativeFilter {
     rng: u64,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 impl NativeFilter {
     pub fn new(min_size: u64, interval: u64, seed: u64) -> Self {
         Self {

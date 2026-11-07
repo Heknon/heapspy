@@ -40,7 +40,10 @@ from heapspy_mcp.system import cgroups as cg
 
 pytestmark = [
     pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc"),
-    pytest.mark.skipif(os.geteuid() != 0, reason="needs root to create cgroups and read stacks"),
+    pytest.mark.skipif(
+        getattr(os, "geteuid", lambda: -1)() != 0,
+        reason="needs root to create cgroups and read stacks",
+    ),
 ]
 
 FILE_MIB = 256

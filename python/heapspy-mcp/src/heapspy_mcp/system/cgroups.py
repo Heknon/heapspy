@@ -600,7 +600,7 @@ def memory_limits(loc: MemoryLocation) -> list[dict[str, Any]]:
             hi = None
         if d == loc.dir or mx is not None or hi is not None:
             try:
-                rel = "/" + str(d.relative_to(loc.root)) if d != loc.root else "/"
+                rel = "/" + d.relative_to(loc.root).as_posix() if d != loc.root else "/"
             except ValueError:
                 rel = str(d)
             out.append({"path": rel, "max_bytes": mx, "high_bytes": hi})

@@ -70,6 +70,7 @@ pub struct Unprepared {
     pub key_removed: bool,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn key_path(image: &str) -> String {
     format!("{IFEO}\\{image}")
 }

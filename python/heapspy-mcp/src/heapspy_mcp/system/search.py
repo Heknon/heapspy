@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import itertools
 import os
-import pwd
 import re
 import time
 from collections import defaultdict
@@ -28,6 +27,14 @@ import anyio
 from . import cgroups as cg
 from . import procfs as pf
 from . import wait_categories as wc
+
+# User names come from the Unix password database. Windows has none: the
+# server still has to import there (it is one package for every platform),
+# so names are just unavailable, and a numeric uid still works.
+try:
+    import pwd
+except ImportError:  # pragma: no cover - not Unix
+    pwd = None
 from .redact import redact_cmdline
 
 MAX_CMDLINE = 200
@@ -347,6 +354,11 @@ class Filters:
         if self.user is not None:
             if self.user.isdigit():
                 self._uid = int(self.user)
+            elif pwd is None:
+                raise SearchError(
+                    f"user names cannot be looked up on this platform: pass {self.user!r}'s "
+                    "numeric uid"
+                )
             else:
                 try:
                     self._uid = pwd.getpwnam(self.user).pw_uid
@@ -636,7 +648,7 @@ def _fd_info(proc_root: Path, pid: int) -> tuple[int | None, int | None]:
 
 
 def _user_name(uid: int | None, cache: dict[int, str | None]) -> str | None:
-    if uid is None:
+    if uid is None or pwd is None:
         return None
     if uid not in cache:
         try:

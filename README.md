@@ -108,6 +108,14 @@ heapspy diff before.hpy after.hpy
 
 `diff` reports growth by type and by retaining site. Object addresses change between dumps, so matching individual objects across snapshots is approximate. The output says so and reports aggregates.
 
+### Investigate until it is clear
+
+```sh
+python3 scripts/investigate.py --pid 1234 --heapspy target/release/heapspy
+```
+
+`scripts/investigate.py` runs `dump`, `analyze` and `diff` in rounds. After each round it asks what is still unclear about each suspect and gets the information that answers it. Another snapshot tells growth from size and a cache warming up from a leak. A snapshot with contents captured names module files. `query --locate` finds the code. It stops when nothing more can be learned. The report gives, for each holder, a verdict, a growth rate, what the growth is made of down to the field that pins it (`[<index>] <+40>.tb_frame local 'upload'`), and where the code is. It lists what heapspy could not make clear, and how to get it.
+
 ### Retention flame graph
 
 ```sh

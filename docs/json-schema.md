@@ -735,7 +735,7 @@ labels so that it can be found again in another dump:
   `sys.modules['app.a'].__dict__['SHARED']`.
 - List and tuple indices are generalised to `[<index>]`, since positions
   shift as a container changes.
-- Only the first 6 levels of the dominator tree get sites (level 1 is the
+- Only the first 10 levels of the dominator tree get sites (level 1 is the
   root objects). Deeper objects are counted in the retained size of their
   ancestor's site.
 - Objects that end up with the same site are summed: every value of a dict

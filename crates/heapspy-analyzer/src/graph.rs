@@ -189,8 +189,8 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     keyed.sort_by(|a, b| (phase(a.3.kind), a.1, &a.2, a.0).cmp(&(phase(b.3.kind), b.1, &b.2, b.0)));
     let in_phase = |p: u8| keyed.iter().filter(|k| phase(k.3.kind) == p).count() as u32;
     let (stable_roots, transient_roots) = (in_phase(0), in_phase(1));
-    let root_nodes: Vec<u32> = keyed.iter().map(|k| k.0).collect();
-    let root_entries: Vec<Root> = keyed.into_iter().map(|k| k.3).collect();
+    let mut root_nodes: Vec<u32> = keyed.iter().map(|k| k.0).collect();
+    let mut root_entries: Vec<Root> = keyed.into_iter().map(|k| k.3).collect();
 
     e.checked_add(root_nodes.len())
         .filter(|&t| t < NONE as usize)
@@ -216,6 +216,29 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     drop(index);
 
     let (reconciliation, unexplained) = reconcile(snap, &mut targets);
+
+    // Native roots (a C global's or a stack word's pointer) explain only what
+    // nothing in Python holds. A word that points at something a module
+    // already reaches is a cache or a stale slot more often than an owner,
+    // and as a root it would make that object shared with the super-root:
+    // it would leave its owner's dominator subtree, and a diff of two dumps
+    // would see it change hands whenever such a word came and went. Each
+    // native root is kept only if no root before it reaches the object.
+    let python = (stable_roots + transient_roots) as usize;
+    let mut seen = vec![false; n];
+    mark(&offsets, &targets, &root_nodes[..python], &mut seen);
+    let mut kept = python;
+    for i in python..root_nodes.len() {
+        let r = root_nodes[i];
+        if !seen[r as usize] {
+            mark(&offsets, &targets, &[r], &mut seen);
+            root_nodes[kept] = r;
+            root_entries[kept] = root_entries[i];
+            kept += 1;
+        }
+    }
+    root_nodes.truncate(kept);
+    root_entries.truncate(kept);
 
     // External roots: objects no root reaches that something outside the
     // graph holds. Found before the super-root's edges are appended, so the
@@ -348,6 +371,27 @@ fn reconcile(snap: &Snapshot, targets: &mut [u32]) -> (Reconciliation, Vec<u32>)
         })
         .collect();
     (r, unexplained)
+}
+
+/// Mark everything reachable from `from` in `seen` (edges only, no
+/// super-root yet).
+fn mark(offsets: &[u32], targets: &[u32], from: &[u32], seen: &mut [bool]) {
+    let mut stack: Vec<u32> = Vec::new();
+    for &r in from {
+        if !seen[r as usize] {
+            seen[r as usize] = true;
+            stack.push(r);
+        }
+    }
+    while let Some(v) = stack.pop() {
+        let v = v as usize;
+        for &w in &targets[offsets[v] as usize..offsets[v + 1] as usize] {
+            if w != NONE && !seen[w as usize] {
+                seen[w as usize] = true;
+                stack.push(w);
+            }
+        }
+    }
 }
 
 /// Objects to treat as roots because something outside the graph holds

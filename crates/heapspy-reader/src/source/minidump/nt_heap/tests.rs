@@ -172,6 +172,7 @@ fn alloc(start: u64, size: u64) -> NativeBlock {
         size,
         kind: NativeBlockKind::Allocation,
         heap: 0,
+        data_offset: DATA_FROM_OWNED,
     }
 }
 
@@ -457,6 +458,7 @@ fn lfh_blocks_that_do_not_check_out_are_reported_whole() {
                 size: GRANULARITY + 0x80 + 0x40 * 10,
                 kind: NativeBlockKind::SmallBlockContainer,
                 heap: 0,
+                data_offset: DATA_FROM_OWNED,
             }
         );
     };

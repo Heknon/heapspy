@@ -910,6 +910,7 @@ fn native_blocks_become_objects_with_edges_and_roots() {
             size: words * 8,
             kind: NativeBlockKind::Allocation,
             heap: 0,
+            data_offset: 0,
         }
     };
     // A: pointed at by an int (a ctypes-style handle); holds a pointer into
@@ -932,6 +933,7 @@ fn native_blocks_become_objects_with_edges_and_roots() {
         size: 700,
         kind: NativeBlockKind::Allocation,
         heap: 0,
+        data_offset: 0,
     };
     let holder = h.list(&[big]);
     let module_dict2 = h.str_dict(&[("BIG", holder)]);

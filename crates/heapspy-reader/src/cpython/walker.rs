@@ -366,8 +366,14 @@ impl<'a> Walker<'a> {
     /// neighbours, and whichever of them something else held would then
     /// appear to hold them all.
     fn native_ref(&self, addr: u64) -> Option<usize> {
-        self.native_at(addr)
-            .filter(|&b| self.native[b].start != addr)
+        self.native_at(addr).filter(|&b| {
+            let blk = &self.native[b];
+            // Into the header when the source knows where the data starts
+            // (a Windows large block's header sits at a random offset, and
+            // its list links point into other blocks' headers); otherwise
+            // at the block start itself.
+            addr >= blk.start + blk.data_offset.max(1)
+        })
     }
 
     /// Index of the native heap block whose range holds `addr`.

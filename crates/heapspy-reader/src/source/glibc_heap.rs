@@ -120,6 +120,10 @@ use heapspy_snapshot::{Arch, Os};
 use super::{MemorySource, NativeBlock, NativeBlockKind};
 use crate::error::Result;
 
+/// The program's data starts this far into a chunk: past `prev_size` and
+/// `size` (see `NativeBlock::data_offset`).
+const CHUNK_DATA: u64 = 16;
+
 const CHUNK_HDR: u64 = 16;
 const MINSIZE: u64 = 32;
 const ALIGN: u64 = 16;
@@ -373,6 +377,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
             size: c.size,
             kind: NativeBlockKind::Allocation,
             heap: a.1,
+            data_offset: CHUNK_DATA,
         })
         .collect();
 
@@ -841,6 +846,7 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
                         size: total,
                         kind: NativeBlockKind::Large,
                         heap: 0,
+                        data_offset: CHUNK_DATA,
                     });
                     p = block + total;
                     min_block = p;
@@ -1107,6 +1113,7 @@ pub(crate) mod testkit {
                 size: ch[i].1,
                 kind: NativeBlockKind::Allocation,
                 heap: 0,
+                data_offset: CHUNK_DATA,
             })
             .collect();
         (b.regions.remove(0).1, want)
@@ -1232,6 +1239,7 @@ mod tests {
             size: c.1,
             kind: NativeBlockKind::Allocation,
             heap,
+            data_offset: CHUNK_DATA,
         }
     }
 
@@ -1241,6 +1249,7 @@ mod tests {
             size,
             kind: NativeBlockKind::Large,
             heap: 0,
+            data_offset: CHUNK_DATA,
         }
     }
 

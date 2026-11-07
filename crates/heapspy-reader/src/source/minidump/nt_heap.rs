@@ -174,6 +174,9 @@ pub(crate) const GRANULARITY: u64 = 16;
 /// A block owns its memory from this far past its header: the header's
 /// first 8 bytes are the previous block's (see the module docs).
 pub(crate) const OWNED_FROM: u64 = 8;
+/// From where a block is owned to where the program's data starts: the
+/// rest of the 16-byte header.
+pub(crate) const DATA_FROM_OWNED: u64 = 8;
 
 /// Caps for lists read out of target memory, so a corrupt list ends.
 const MAX_SEGMENTS: usize = 1 << 16;
@@ -397,12 +400,26 @@ impl Heap {
         })
     }
 
+    /// A backend or LFH block owned from `start` (its header's second
+    /// half): the program's data follows the header, [`DATA_FROM_OWNED`]
+    /// bytes on.
     fn block(&self, start: u64, size: u64, kind: NativeBlockKind) -> NativeBlock {
+        self.block_with_data(start, size, kind, DATA_FROM_OWNED)
+    }
+
+    fn block_with_data(
+        &self,
+        start: u64,
+        size: u64,
+        kind: NativeBlockKind,
+        data_offset: u64,
+    ) -> NativeBlock {
         NativeBlock {
             start,
             size,
             kind,
             heap: self.index,
+            data_offset,
         }
     }
 
@@ -644,7 +661,10 @@ impl Heap {
             // header and committed data.
             _ => (entry, entry.checked_add(commit)?),
         };
-        Some(self.block(start, end - start, NativeBlockKind::Large))
+        // The data starts right after the entry, which sits at a random
+        // offset into the reservation; its list links point at other
+        // entries, inside other blocks' headers.
+        Some(self.block_with_data(start, end - start, NativeBlockKind::Large, user_end - start))
     }
 }
 
