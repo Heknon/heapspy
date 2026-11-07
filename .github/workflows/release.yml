@@ -308,15 +308,21 @@ jobs:
           name: mcp-dist
           path: dist-mcp
       - run: ls -l dist dist-mcp 2>/dev/null || ls -l dist
+      # skip-existing lets a release that stopped partway resume: if
+      # heapspy was uploaded and heapspy-mcp was refused, the next release
+      # push skips the heapspy files PyPI already has and uploads the rest.
+      # PyPI never replaces a file, so a skipped file stays as first built.
       - name: Publish heapspy
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
       - name: Publish heapspy-mcp
         if: needs.mcp.result == 'success'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-mcp
+          skip-existing: true
 
   publish-testpypi:
     name: publish to TestPyPI
