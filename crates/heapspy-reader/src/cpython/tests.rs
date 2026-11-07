@@ -883,10 +883,16 @@ fn a_block_first_reached_from_the_wrong_neighbour_is_still_followed() {
 
 /// Run the walker over `h` with native heap blocks and extra modules
 /// declared on the image.
-fn walk_with_native(h: &Heap, blocks: Vec<NativeBlock>, modules: Vec<Module>) -> Snapshot {
+fn walk_with_native(
+    h: &Heap,
+    blocks: Vec<NativeBlock>,
+    modules: Vec<(Module, Vec<u8>)>,
+) -> Snapshot {
     let mut img = h.image();
     img.set_native_blocks(blocks);
-    for m in modules {
+    // Each module's data is its own mapping, as in a real process.
+    for (m, data) in modules {
+        img.map(m.base, data);
         img.add_module(m);
     }
     let mut w = SnapshotWriter::new(SnapshotInfo::new_for_test()).unwrap();
@@ -932,8 +938,10 @@ fn native_blocks_become_objects_with_edges_and_roots() {
     h.module("app2", module_dict2);
     // E: only a C global points to it.
     let e = block(&mut h, 4);
-    let globals = h.alloc(32);
-    h.w64(globals + 8, e.start);
+    let globals = 0x7000_0000u64;
+    let mut data = vec![0u8; 32];
+    // past the allocator header
+    data[8..16].copy_from_slice(&(e.start + 8).to_le_bytes());
     let dll = Module {
         name: "ext.dll".into(),
         path: "C:/x/ext.dll".into(),
@@ -941,7 +949,7 @@ fn native_blocks_become_objects_with_edges_and_roots() {
         size: 32,
         build_id: None,
     };
-    let s = walk_with_native(&h, vec![a, b, c, d, e], vec![dll]);
+    let s = walk_with_native(&h, vec![a, b, c, d, e], vec![(dll, data)]);
 
     let native = |addr: u64| {
         let i = s

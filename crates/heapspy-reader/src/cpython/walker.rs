@@ -223,6 +223,11 @@ pub(super) struct Walker<'a> {
     /// Python objects bigger than a pymalloc block, `(address, size)`: they
     /// live in native heap blocks, which are then theirs, not native memory.
     big_objects: Vec<(u64, u64)>,
+    /// Out-of-line storage of Python objects whose layout the walker knows
+    /// (a list's item array, a dict's keys and values, a set's table, a
+    /// bytearray's buffer). Already counted in the owner's size, so the
+    /// native block holding one is the owner's memory too.
+    buffers: Vec<u64>,
 }
 
 /// Words of native heap block contents read in one walk: 2 GiB.
@@ -320,6 +325,7 @@ impl<'a> Walker<'a> {
             pools: HashSet::new(),
             native: Vec::new(),
             big_objects: Vec::new(),
+            buffers: Vec::new(),
             src,
             o,
             opts,
@@ -339,6 +345,29 @@ impl<'a> Walker<'a> {
     fn is_native_start(&self, addr: u64) -> bool {
         self.native_at(addr)
             .is_some_and(|b| self.native[b].start == addr)
+    }
+
+    /// Note `buf` as out-of-line storage of the object being described (see
+    /// `buffers`). Only needed when there are native blocks to match.
+    fn own_buffer(&mut self, buf: u64) {
+        if buf != 0 && !self.native.is_empty() {
+            self.buffers.push(buf);
+        }
+    }
+
+    /// Index of the native heap block a pointer `addr` refers to, as a
+    /// program's reference: anywhere in the block but its very start.
+    ///
+    /// The start is where the allocator's own header is, and what its own
+    /// bookkeeping points at: the links that chain the Windows heap's large
+    /// blocks together, glibc's free-list and chunk links. The program is
+    /// handed a pointer past that header, so its references land inside.
+    /// Counting the allocator's links would chain every large block to its
+    /// neighbours, and whichever of them something else held would then
+    /// appear to hold them all.
+    fn native_ref(&self, addr: u64) -> Option<usize> {
+        self.native_at(addr)
+            .filter(|&b| self.native[b].start != addr)
     }
 
     /// Index of the native heap block whose range holds `addr`.
@@ -433,8 +462,41 @@ impl<'a> Walker<'a> {
         if t == 0 || t & 7 != 0 {
             return false;
         }
-        self.raw_type_flags(t)
+        if !self
+            .raw_type_flags(t)
             .is_some_and(|f| f & TPFLAGS_TYPE_SUBCLASS != 0)
+        {
+            return false;
+        }
+        self.plausible_type(t)
+    }
+
+    /// Whether `t` looks like a type object beyond its own type pointer: a
+    /// known type, or one whose sizes are sane and whose name is readable
+    /// text. Code and data that merely happen to start with pointers (a
+    /// function's prologue, a table of handles) fail this, where the
+    /// metatype check alone let them through.
+    fn plausible_type(&self, t: u64) -> bool {
+        if let Some(ti) = self.types.get(&t) {
+            return !ti.id.is_unknown();
+        }
+        let o = &self.o;
+        let basic = self.i64(t + o.tp_basicsize).unwrap_or(-1);
+        let item = self.i64(t + o.tp_itemsize).unwrap_or(-1);
+        if !(16..=1 << 20).contains(&basic) || !(0..=1 << 12).contains(&item) {
+            return false;
+        }
+        let Ok(name) = self.ptr(t + o.tp_name) else {
+            return false;
+        };
+        match self.src.read_cstr(name, 128) {
+            Ok(b) => {
+                !b.is_empty()
+                    && b.iter()
+                        .all(|&c| c.is_ascii_alphanumeric() || b"_.<>-".contains(&c))
+            }
+            Err(_) => false,
+        }
     }
 
     /// Text of the str object at `addr` (at most `max` characters) and its
@@ -950,9 +1012,11 @@ impl<'a> Walker<'a> {
         // count it), and the keys object when this dict owns it alone.
         if values != 0 {
             out.extra_size += keys.shared_usable() * 8;
+            self.own_buffer(values);
         }
         if keys.refcnt == 1 {
             out.extra_size += keys.alloc_size(&o);
+            self.own_buffer(k);
         }
         let entries = match self.keys_entries(&keys, vals) {
             Ok(e) => e,
@@ -1111,7 +1175,7 @@ impl<'a> Walker<'a> {
             };
             value = (value << 30) | (d as u64 & 0x3FFF_FFFF);
         }
-        if let Some(b) = self.native_at(value) {
+        if let Some(b) = self.native_ref(value) {
             let label = self.out.intern("address")?;
             out.edges.push(Edge {
                 target: self.native[b].start,
@@ -1168,7 +1232,7 @@ impl<'a> Walker<'a> {
                 // A pointer into a native heap block that is not a Python
                 // object's own: the object holds that native memory (a
                 // buffer, a C struct, an array).
-                if let Some(b) = self.native_at(w) {
+                if let Some(b) = self.native_ref(w) {
                     let start = self.native[b].start;
                     if !out.edges.iter().any(|e| e.target == start) {
                         let label = self.out.intern(&format!("+{off}"))?;
@@ -1430,6 +1494,7 @@ impl<'a> Walker<'a> {
                 (Ok(n), Ok(items)) => {
                     let alloc = self.i64(addr + o.list_allocated).unwrap_or(n).max(0) as u64;
                     out.extra_size += alloc.min(MAX_ITEMS) * 8;
+                    self.own_buffer(items);
                     let n = (n.max(0) as u64).min(MAX_ITEMS);
                     if n > 0 && items != 0 {
                         match self.src.read_ptrs(items, n as usize) {
@@ -1476,6 +1541,7 @@ impl<'a> Walker<'a> {
                         let n = mask as u64 + 1;
                         if table != addr + o.set_smalltable {
                             out.extra_size += n * 16;
+                            self.own_buffer(table);
                         }
                         match self.src.read_vec(table, (n * 16) as usize) {
                             Ok(raw) => {
@@ -1499,7 +1565,12 @@ impl<'a> Walker<'a> {
                 }
             }
             Kind::ByteArray => match self.i64(addr + o.bytearray_alloc) {
-                Ok(n) if n >= 0 => out.extra_size += n as u64,
+                Ok(n) if n >= 0 => {
+                    out.extra_size += n as u64;
+                    if let Ok(buf) = self.ptr(addr + o.bytearray_bytes) {
+                        self.own_buffer(buf);
+                    }
+                }
                 _ => self.err(&mut out),
             },
             Kind::Module => {
@@ -2006,6 +2077,8 @@ impl<'a> Walker<'a> {
     fn emit_native(&mut self) -> Result<()> {
         let mut big = std::mem::take(&mut self.big_objects);
         big.sort_unstable();
+        let mut buffers = std::mem::take(&mut self.buffers);
+        buffers.sort_unstable();
         // Synthetic types. Their "addresses" are small numbers no real type
         // can have; nothing looks them up.
         let ty = |w: &mut SnapshotWriter, addr: u64, q: &str| w.add_type(addr, "native", q);
@@ -2020,6 +2093,13 @@ impl<'a> Walker<'a> {
             let inside = big[lo..].iter().take_while(|&&(a, _)| a < end);
             let python_bytes: u64 = inside.clone().map(|&(_, s)| s).sum();
             if b.kind != NativeBlockKind::SmallBlockContainer && inside.count() > 0 {
+                continue;
+            }
+            // Out-of-line storage of a Python object, counted in its size.
+            let bi_buf = buffers.partition_point(|&p| p < b.start);
+            if b.kind != NativeBlockKind::SmallBlockContainer
+                && buffers.get(bi_buf).is_some_and(|&p| p < end)
+            {
                 continue;
             }
             let mut edges = Vec::new();
@@ -2037,9 +2117,9 @@ impl<'a> Walker<'a> {
                     if w == 0 || w & 7 != 0 || (b.start..end).contains(&w) {
                         continue;
                     }
-                    let target = if self.is_object(w) {
+                    let target = if self.is_known_object(w) {
                         w
-                    } else if let Some(t) = self.native_at(w) {
+                    } else if let Some(t) = self.native_ref(w) {
                         self.native[t].start
                     } else {
                         continue;
@@ -2137,9 +2217,9 @@ impl<'a> Walker<'a> {
                     if w == 0 || w & 7 != 0 {
                         continue;
                     }
-                    let (target, python) = if let Some(b) = self.native_at(w) {
+                    let (target, python) = if let Some(b) = self.native_ref(w) {
                         (self.native[b].start, false)
-                    } else if self.is_object(w) && !self.is_immortal(w) {
+                    } else if self.is_known_object(w) && !self.is_immortal(w) {
                         (w, true)
                     } else {
                         continue;
@@ -2157,6 +2237,23 @@ impl<'a> Walker<'a> {
             }
         }
         Ok(())
+    }
+
+    /// [`Walker::is_object`] for words read from native memory after the
+    /// Python walk, which hold far more arbitrary values (code addresses,
+    /// handles, packed data) than an object's fields do: a GC-tracked object,
+    /// or one in heap memory whose type the walk already met. Every live
+    /// type has been seen by then, so a type pointer to anything else is a
+    /// coincidence, such as the bytes of a function that look like a type.
+    fn is_known_object(&self, addr: u64) -> bool {
+        if self.is_tracked(addr) {
+            return true;
+        }
+        if !self.in_heap(addr) || !self.is_object(addr) {
+            return false;
+        }
+        self.ptr(addr + 8)
+            .is_ok_and(|t| self.types.get(&t).is_some_and(|ti| !ti.id.is_unknown()))
     }
 
     fn is_immortal(&self, addr: u64) -> bool {
