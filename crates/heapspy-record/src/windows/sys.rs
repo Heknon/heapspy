@@ -178,6 +178,22 @@ fn props_buffer(system_logger: bool) -> Vec<u8> {
     v
 }
 
+/// A bare properties block for control calls (stop, query): sizes and
+/// name offsets only. Passing a start block (a GUID, kernel flags) to stop
+/// a system logger session fails with ERROR_INVALID_PARAMETER.
+fn control_buffer() -> Vec<u8> {
+    let head = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+    let names = 1024 * 2;
+    let size = head + 2 * names;
+    let mut v = vec![0u8; size];
+    // SAFETY: the buffer is large enough and zeroed.
+    let p = unsafe { &mut *(v.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
+    p.Wnode.BufferSize = size as u32;
+    p.LoggerNameOffset = head as u32;
+    p.LogFileNameOffset = (head + names) as u32;
+    v
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -232,7 +248,7 @@ pub enum StopSession {
 
 /// Stop the ETW session `name`.
 pub fn stop_session(name: &str) -> StopSession {
-    let mut props = props_buffer(false);
+    let mut props = control_buffer();
     let w = wide(name);
     // SAFETY: stopping by name with a sized properties buffer.
     let e = unsafe {
@@ -253,7 +269,7 @@ pub fn stop_session(name: &str) -> StopSession {
 /// Names of the running ETW sessions.
 pub fn list_sessions() -> Vec<String> {
     const N: usize = 64;
-    let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| props_buffer(false)).collect();
+    let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| control_buffer()).collect();
     let mut ptrs: Vec<*mut EVENT_TRACE_PROPERTIES> =
         bufs.iter_mut().map(|b| b.as_mut_ptr().cast()).collect();
     let mut count = 0u32;
@@ -411,7 +427,7 @@ impl Drop for EtwSession {
         // SAFETY: stopping the session we started, then joining the consumer
         // before freeing the context it uses.
         unsafe {
-            let mut props = props_buffer(false);
+            let mut props = control_buffer();
             ControlTraceW(
                 self.control,
                 std::ptr::null(),
