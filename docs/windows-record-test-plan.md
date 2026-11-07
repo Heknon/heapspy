@@ -6,6 +6,8 @@ unit-tested on Linux:
 - ETW and QPC clock conversion (`windows::clock`)
 - nearest-stack matching (`windows::matcher`)
 - the debugger's breakpoint state machine (`windows::debug`)
+- the guardian's protocol, cleanup plan, "still our patch" check and ETW
+  session names (`windows::guardian`)
 
 The Win32 glue runs on `windows-latest` in `.github/workflows/record.yml`
 (PR label `ci:record`), through `crates/heapspy/tests/record_live_windows.rs`.
@@ -16,10 +18,13 @@ hand on a real machine, and record the results at the end of this file.
 
 | step | test in `record_live_windows.rs` | checks |
 |---|---|---|
-| 2 (ETW) | `python31{2,3,4}_etw` | `mechanisms` is `["etw"]`, samples > 0, events `["arena"]`, `heapspy.skipped_events` names `large_object`, every sample and frame approximate, at least half the samples matched a stack, a top-5 stack is `build_payload` (line 5 or 6) under `handler:8`, more samples under `handler` than under `noise`, objects linked, no `NT Kernel Logger` left |
+| 2 (ETW) | `python31{2,3,4}_etw` | `mechanisms` is `["etw"]`, samples > 0, events `["arena"]`, `heapspy.skipped_events` names `large_object`, every sample and frame approximate, at least half the samples matched a stack, a top-5 stack is `build_payload` (line 5 or 6) under `handler:8`, more samples under `handler` than under `noise`, objects linked, no recorder session (`heapspy-<pid>` or `NT Kernel Logger`) left |
 | 3 (debugger) | `python31{2,3,4}_debugger` | `mechanisms` is `["debugger"]`, `total_pause_ns > 0`, no approximate frame, top stack `build_payload:5 <- handler:8`, a native return address on every sample, `leaked` linked to `build_payload:5`; afterwards the target runs, no debugger is attached, and `KERNELBASE!VirtualAlloc` has the same bytes as in the test process |
-| 4 (auto) | `python313_auto` | `mechanisms` is `["etw", "debugger"]`, top stack `build_payload:5 <- handler:8`, fewer than half the samples approximate |
-| 5.1 (kill) | `kill_mid_run_etw`, `kill_mid_run_debugger` | `TerminateProcess` on the recorder after 2.5 s; the target runs, no debugger attached, `VirtualAlloc` unchanged, no `NT Kernel Logger` left, no profile written |
+| 4 (auto) | `python313_auto` | `mechanisms` is `["etw"]` (auto is ETW alone on Windows), then the ETW checks above |
+| 5.1 (kill) | `kill_mid_run_etw`, `kill_mid_run_debugger` | `TerminateProcess` on the recorder after 2.5 s; the target runs, no debugger attached, `VirtualAlloc` unchanged, no recorder session left, no profile written. The guardian's log is printed (`GUARDIAN`) |
+| 5.1 (guardian idle) | `guardian_idle_after_clean_finish_{etw,debugger}` | after a clean finish the guardian prints nothing, writes no log, and has exited when the recorder's stderr closes |
+| 5.5 (sessions) | `stale_session_is_cleaned_up` | a `heapspy-<dead pid>` session is stopped by the next recording, which says so |
+| 5.5 (sessions) | `foreign_sessions_are_untouched` | `heapspy-foreign`, `heapspyx-<pid>` and `other-<pid>` survive a recording |
 | 5.2 (Ctrl-C) | `ctrl_break_etw`, `ctrl_break_debugger` | `CTRL_BREAK_EVENT` to the recorder's process group (Ctrl-C cannot be sent to one group): exit 0 within 5 s, a valid profile flagged truncated, the target clean as above |
 | 5.2 (Ctrl-C) | `stop_flag_etw`, `stop_flag_debugger` | the same through `heapspy_record::record` and its stop flag |
 | 7 (versions) | the `_etw` and `_debugger` tests | run on python-build-standalone 3.12, 3.13 and 3.14 |
@@ -131,12 +136,14 @@ Start it with `py -3.13 victim.py` and take its PID from Task Manager or
 
 1. **Kill mid-run.** Start a 60 s recording with `--mechanism debugger`.
    After 2 s, `taskkill /F /IM heapspy.exe`.
-   - Expect: the victim keeps running (`DebugSetProcessKillOnExit(FALSE)`).
-   - Known risk: an `int3` written by the dead debugger stays in
-     `VirtualAlloc`, and the next arena allocation then raises an
-     unhandled breakpoint and kills the victim. If that happens, it is a
-     real gap. A fix would be a watchdog process, or ETW only for the
-     unattended case. Record what happens.
+   - Expect: the victim keeps running, and within half a second the
+     guardian has restored `VirtualAlloc`, detached and stopped the ETW
+     session; stderr has one `heapspy guardian:` line and the profile's
+     directory a `.guardian.log`.
+   - Then `taskkill /T /F` the recorder's tree instead: the guardian dies
+     too (a documented limit). Expect the victim to crash at its next arena
+     with `STATUS_BREAKPOINT`, and the next recording to stop the leftover
+     `heapspy-<pid>` session.
 2. **Ctrl-C.** Start a 60 s recording in each mode and press Ctrl-C after
    2 s.
    - Expect: exit 0 within 2 s, a valid profile with `truncated: true`,
@@ -149,9 +156,10 @@ Start it with `py -3.13 victim.py` and take its PID from Task Manager or
      no profile written.
 5. **Kernel logger busy.** Start `xperf -on PROC_THREAD` first, then
    record with `--mechanism etw`.
-   - Expect: `unsupported` naming the NT Kernel Logger.
-   - With `auto`: the debugger alone runs, and meta
-     `heapspy.windows.mechanism_failed` says why ETW did not.
+   - Expect: the recording runs anyway in its own `heapspy-<pid>`
+     session (system logger mode does not need the NT Kernel Logger).
+   - Only where the system logger mode is refused (pre-Windows 8) is the
+     NT Kernel Logger used; then expect `unsupported` naming it.
 
 ## 6. EDR (spike item)
 
@@ -180,8 +188,30 @@ version).
 | 2 | | | pass, 3.12 to 3.14 | 84 to 119 samples in 3 s, all matched a stack, 0 dropped. Top stack `build_payload:6 <- handler:8` in 7 of 9 runs, `handler:8` or `main:20` in the other two |
 | 3 | | | pass, 3.12 to 3.14 | 163 to 179 samples, top stack `build_payload:5 <- handler:8` (139 to 154 samples), threads stopped about 2.9 s in a 3 s window. Needed the fix for single steps queued at detach (see 5.2) |
 | 4 | | | pass, 3.13 | 184 samples, 0 approximate: every arena ETW saw was also seen by the debugger |
-| 5.1 | | | **fail** | debugger: the target dies with `STATUS_BREAKPOINT` (0x80000003), the `int3` left in `VirtualAlloc`, the known risk above. ETW: the `NT Kernel Logger` session stays running after the recorder is killed, and the next recording fails with `unsupported` until `logman stop "NT Kernel Logger" -ets` |
+| 5.1 | | | pass (guardian) | see "Kill safety" below. Before the guardian: **fail** | debugger: the target dies with `STATUS_BREAKPOINT` (0x80000003), the `int3` left in `VirtualAlloc`, the known risk above. ETW: the `NT Kernel Logger` session stays running after the recorder is killed, and the next recording fails with `unsupported` until `logman stop "NT Kernel Logger" -ets` |
 | 5.2 | | | pass | Ctrl-Break stops in 0.1 to 0.2 s with a truncated profile; the stop flag in 2.6 s. Before the fix, the debugger left a queued `EXCEPTION_SINGLE_STEP` to the target, which died with 0x80000004 |
 | 5.3-5.5 | | | not automated | |
 | 6 | | | not checked | Defender's ETW sessions run on the runner (`logman`); whether real-time protection is on was not checked. Nothing blocked `DebugActiveProcess` |
 | 7 | | | pass | python-build-standalone 3.12, 3.13, 3.14 |
+
+### Kill safety (the guardian)
+
+Record workflow runs 42358155568 and 42359502629 on PR #37 (November 2026).
+Run 42359502629 passed all 17 `record_live_windows` tests on 3.12, 3.13 and
+3.14; the Linux job stayed green in both.
+
+| test | result |
+|---|---|
+| `kill_mid_run_debugger` | target running, no debugger attached, `VirtualAlloc` unchanged. Guardian log, run 1: restored `0xcc -> 0x48`, detached. Run 2: the same, plus thread 5372 with its trap flag set and a pending `EXCEPTION_SINGLE_STEP` (cleared, continued) |
+| `kill_mid_run_etw` | target running; the guardian stopped `heapspy-<recorder pid>`; no session left |
+| `guardian_idle_after_clean_finish_{etw,debugger}` | no guardian output, no log |
+| `stale_session_is_cleaned_up` | `heapspy-<dead pid>` stopped by the next recording, reported on stderr |
+| `foreign_sessions_are_untouched` | `heapspy-foreign`, `heapspyx-<pid>`, `other-<pid>` all still running |
+| `python313_auto` | `mechanisms: ["etw"]`, 117 samples, paused 0 ms |
+| ETW session | `heapspy-<pid>` in system logger mode starts and delivers events on windows-latest; `NT Kernel Logger` is not used |
+
+Run 1 failed every ETW test that stops a session: `ControlTraceW` with the
+start properties block (system trace GUID, kernel flags) returns
+`ERROR_INVALID_PARAMETER` (87) for a system logger session. Control calls now
+pass a bare block. In run 1 `python314_etw` also missed the statistical top-5
+check once; it passed in run 2.

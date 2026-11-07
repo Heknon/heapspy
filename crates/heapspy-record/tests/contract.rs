@@ -350,8 +350,10 @@ fn mechanism_selection() {
     );
     assert_eq!(
         names(MechanismChoice::Auto, Some(Os::Windows)),
-        ["windows-etw-debugger"]
+        ["windows-etw"]
     );
+    let auto = select(MechanismChoice::Auto, Some(Os::Windows)).unwrap();
+    assert_eq!(auto[0].mechanisms(), Mechanisms::of(&[Mechanism::Etw]));
     assert_eq!(
         names(MechanismChoice::Only(Mechanism::Etw), Some(Os::Windows)),
         ["windows-etw"]
@@ -362,6 +364,7 @@ fn mechanism_selection() {
     )
     .unwrap();
     assert_eq!(w[0].mechanisms(), Mechanisms::of(&[Mechanism::Debugger]));
+    assert_eq!(w[0].name(), "windows-debugger");
     for (c, os) in [
         (MechanismChoice::Only(Mechanism::Etw), Some(Os::Linux)),
         (MechanismChoice::Only(Mechanism::Ebpf), Some(Os::Windows)),
