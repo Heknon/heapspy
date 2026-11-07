@@ -514,8 +514,22 @@ impl<'a> Debugger<'a> {
             return;
         }
         self.machine.disarm(&mut self.io);
-        // Hits already queued on removed breakpoints are rewound.
-        while let Some(true) = self.pump(50) {}
+        // Hits already queued on removed breakpoints are rewound, and the
+        // single steps of threads that were stepping over one are handled.
+        // Wait for those steps (a stepping thread may not have run yet),
+        // but not forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match self.pump(50) {
+                Some(true) => {}
+                Some(false) => break,
+                None => {
+                    if !self.machine.steps_pending() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+        }
         // SAFETY: detaching; the target keeps running.
         unsafe { DebugActiveProcessStop(self.io.pid) };
         self.attached = false;
