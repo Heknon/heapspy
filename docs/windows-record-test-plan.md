@@ -1,4 +1,4 @@
-# Windows recorder: manual test plan
+# Windows recorder: test plan
 
 `heapspy record` on Windows (M7b, `crates/heapspy-record/src/windows*`) is
 compiled and clippy-checked for `x86_64-pc-windows-gnu`, and its logic is
@@ -7,8 +7,32 @@ unit-tested on Linux:
 - nearest-stack matching (`windows::matcher`)
 - the debugger's breakpoint state machine (`windows::debug`)
 
-The Win32 glue has never run. Do every step below on a real machine before
-calling M7b done, and record the results at the end of this file.
+The Win32 glue runs on `windows-latest` in `.github/workflows/record.yml`
+(PR label `ci:record`), through `crates/heapspy/tests/record_live_windows.rs`.
+The steps below marked **automated** are covered there; do the others by
+hand on a real machine, and record the results at the end of this file.
+
+## What the workflow automates
+
+| step | test in `record_live_windows.rs` | checks |
+|---|---|---|
+| 2 (ETW) | `python31{2,3,4}_etw` | `mechanisms` is `["etw"]`, samples > 0, events `["arena"]`, `heapspy.skipped_events` names `large_object`, every sample and frame approximate, at least half the samples matched a stack, a top-5 stack is `build_payload` (line 5 or 6) under `handler:8`, more samples under `handler` than under `noise`, objects linked, no `NT Kernel Logger` left |
+| 3 (debugger) | `python31{2,3,4}_debugger` | `mechanisms` is `["debugger"]`, `total_pause_ns > 0`, no approximate frame, top stack `build_payload:5 <- handler:8`, a native return address on every sample, `leaked` linked to `build_payload:5`; afterwards the target runs, no debugger is attached, and `KERNELBASE!VirtualAlloc` has the same bytes as in the test process |
+| 4 (auto) | `python313_auto` | `mechanisms` is `["etw", "debugger"]`, top stack `build_payload:5 <- handler:8`, fewer than half the samples approximate |
+| 5.1 (kill) | `kill_mid_run_etw`, `kill_mid_run_debugger` | `TerminateProcess` on the recorder after 2.5 s; the target runs, no debugger attached, `VirtualAlloc` unchanged, no `NT Kernel Logger` left, no profile written |
+| 5.2 (Ctrl-C) | `ctrl_break_etw`, `ctrl_break_debugger` | `CTRL_BREAK_EVENT` to the recorder's process group (Ctrl-C cannot be sent to one group): exit 0 within 5 s, a valid profile flagged truncated, the target clean as above |
+| 5.2 (Ctrl-C) | `stop_flag_etw`, `stop_flag_debugger` | the same through `heapspy_record::record` and its stop flag |
+| 7 (versions) | the `_etw` and `_debugger` tests | run on python-build-standalone 3.12, 3.13 and 3.14 |
+| setup | every test | the process is elevated (`TokenElevation`); the workflow also prints `logman query -ets` before and after |
+
+ETW frames are matched by time, so the ETW checks are statistical: see the
+module docs of `record_live_windows.rs` for why the top stack itself is not
+required to be `build_payload:5`.
+
+Not automated: step 1 (watching thread states in Process Explorer), 5.3
+(target exits mid-run), 5.4 (not elevated: the runner always is), 5.5
+(kernel logger busy), 6 (EDR), and Windows 10. Step 2.4 is measured: on
+`windows-latest` every ETW sample matched a stack within 20 ms.
 
 ## Setup
 
@@ -64,9 +88,11 @@ Start it with `py -3.13 victim.py` and take its PID from Task Manager or
    - Expect exit 0, `"mechanisms": ["etw"]`, and `samples > 0`. The victim
      maps about one arena per 5,000 iterations.
 2. `heapspy analyze etw.hpy --allocations etw.hpya --json`.
-   - Expect: `allocations.approximate` is true, and `top_stacks[0].frames`
-     contains `build_payload` (line 5) and `handler`, each with
-     `"approximate": true`.
+   - Expect: `allocations.approximate` is true, and the top stacks
+     contain `build_payload` and `handler`, each with `"approximate": true`.
+     The line is where the thread was at the nearest stack sample, usually
+     6 (the 64 KiB `bytes`), not the arena call at line 5; the top stack is
+     sometimes `handler:8` or `main:20` alone.
    - Expect: `allocations.sampling.events` is `["arena"]`, and the profile
      meta `heapspy.skipped_events` mentions `large_object`.
 3. Note `overhead.samples_dropped`, which is ETW `EventsLost` plus
@@ -144,13 +170,18 @@ Repeat steps 2 and 3 on 3.12, 3.13 and 3.14.
 
 ## Results
 
-| step | Windows 10 | Windows 11 | notes |
-|---|---|---|---|
-| 1 | | | |
-| 2 | | | |
-| 3 | | | |
-| 4 | | | |
-| 5.1 | | | |
-| 5.2-5.5 | | | |
-| 6 | | | |
-| 7 | | | |
+Results on `windows-latest` from the record workflow runs 42351820140,
+42352771607 and 42353444868 (November 2026; the job log prints the OS
+version).
+
+| step | Windows 10 | Windows 11 | windows-latest (CI) | notes |
+|---|---|---|---|---|
+| 1 | | | not automated | |
+| 2 | | | pass, 3.12 to 3.14 | 84 to 119 samples in 3 s, all matched a stack, 0 dropped. Top stack `build_payload:6 <- handler:8` in 7 of 9 runs, `handler:8` or `main:20` in the other two |
+| 3 | | | pass, 3.12 to 3.14 | 163 to 179 samples, top stack `build_payload:5 <- handler:8` (139 to 154 samples), threads stopped about 2.9 s in a 3 s window. Needed the fix for single steps queued at detach (see 5.2) |
+| 4 | | | pass, 3.13 | 184 samples, 0 approximate: every arena ETW saw was also seen by the debugger |
+| 5.1 | | | **fail** | debugger: the target dies with `STATUS_BREAKPOINT` (0x80000003), the `int3` left in `VirtualAlloc`, the known risk above. ETW: the `NT Kernel Logger` session stays running after the recorder is killed, and the next recording fails with `unsupported` until `logman stop "NT Kernel Logger" -ets` |
+| 5.2 | | | pass | Ctrl-Break stops in 0.1 to 0.2 s with a truncated profile; the stop flag in 2.6 s. Before the fix, the debugger left a queued `EXCEPTION_SINGLE_STEP` to the target, which died with 0x80000004 |
+| 5.3-5.5 | | | not automated | |
+| 6 | | | not checked | Defender's ETW sessions run on the runner (`logman`); whether real-time protection is on was not checked. Nothing blocked `DebugActiveProcess` |
+| 7 | | | pass | python-build-standalone 3.12, 3.13, 3.14 |

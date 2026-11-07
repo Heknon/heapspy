@@ -32,8 +32,9 @@
 //!   the thread happened to be within a few milliseconds of the arena call,
 //!   not the call itself: any point of the loop, weighted by the time spent
 //!   there. On windows-latest the top stack was `build_payload:6 <-
-//!   handler:8` in five runs out of six, and `handler:8` alone in the
-//!   sixth; line 5, where arenas are carved, is rarely matched because the
+//!   handler:8` in seven runs out of nine, and `handler:8` or `main:20`
+//!   in the other two; line 5, where arenas are carved, is rarely matched
+//!   because the
 //!   thread spends little time there. So the ETW checks are statistical
 //!   and hold whatever the order of the top stacks: one of the five top
 //!   stacks is `build_payload` (line 5 or 6) under `handler:8`, more
