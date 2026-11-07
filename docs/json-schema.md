@@ -329,18 +329,41 @@ window early: the profile is written and `truncated` is `true`.
 | `borrowed_edges_dropped` | integer | scanned edges (fields of a layout heapspy does not know) dropped because their target had more of them than owners |
 | `stale_edges_dropped` | integer | out-of-line pointers dropped because nothing about their target needed them. Without refcounts, every out-of-line pointer |
 | `out_of_line_edges` | integer | out-of-line references kept: objects held through memory their owner points at but does not lay out, such as a `deque`'s blocks |
+| `native_blocks` | integer | native heap blocks recorded (objects flagged `NATIVE`, type `native.*`): memory C code allocated, apart from Python objects. 0 when the source could not walk its heaps. Included in `objects`, `shallow_bytes` and, when reachable, `reachable_*` |
+| `native_bytes` | integer | their bytes |
+| `native_lost_blocks` | integer | native blocks nothing points to (no Python object, other block, module global or thread stack): leaked memory. Not counted in `unreachable_*` |
+| `native_lost_bytes` | integer | their bytes |
 
 Percentages in reports (`retained_pct`) are of everything held:
-`reachable_bytes + external_bytes`.
+`reachable_bytes + external_bytes`. A native block is reached through a
+Python object that points into it (a field, or an `int` whose value is an
+address in it: label `<address>`), another block, or a `native` root.
 
 `memory`:
 
 | field | type | meaning |
 |---|---|---|
 | `rss_bytes` | integer, nullable | process resident set size, if the source recorded it |
-| `graph_bytes` | integer | bytes in the object graph (`totals.shallow_bytes`) |
+| `graph_bytes` | integer | bytes of Python objects in the graph (`totals.shallow_bytes` less `totals.native_bytes`) |
 | `outside_graph_bytes` | integer, nullable | `rss_bytes - graph_bytes`, floored at 0 |
 | `outside_graph_pct` | float, nullable | `outside_graph_bytes / rss_bytes * 100` |
+| `breakdown` | array | what the process's memory is, by kind: `{part, bytes}` (below). Empty without a memory map |
+| `breakdown_basis` | string, nullable | `resident`, or `committed` where the source does not record residency (Windows minidumps); committed can exceed RSS |
+
+`breakdown[].part`:
+
+| part | meaning |
+|---|---|
+| `images` | code and data of loaded modules |
+| `mapped_files` | memory-mapped files |
+| `stacks` | thread stacks |
+| `python_small_objects` | blocks pymalloc has handed out, from its pool headers |
+| `pymalloc_free` | the rest of pymalloc's arenas: held by Python's allocator, not in use |
+| `python_large_objects` | Python objects too big for pymalloc, which come from `malloc` |
+| `native_heap` | native heap blocks something points to (with a heap walk) |
+| `native_lost` | native heap blocks nothing points to: leaked (with a heap walk) |
+| `native_other` | private memory outside any heap block: allocator overhead and free space, memory C code mapped itself (with a heap walk) |
+| `native_unknown` | all private memory C code allocated, when the heaps were not walked |
 
 Retainer (`top_retainers[]`):
 

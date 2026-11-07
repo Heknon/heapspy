@@ -25,7 +25,7 @@ pub mod render;
 pub mod report;
 pub mod source;
 
-use heapspy_snapshot::{RegionKind, Snapshot};
+use heapspy_snapshot::{ObjectFlags, RegionKind, Snapshot};
 
 use analysis::Analysis;
 pub use flame::{
@@ -189,10 +189,38 @@ fn rss_bytes(snap: &Snapshot) -> Result<Option<u64>> {
     }))
 }
 
-fn memory_totals(snap: &Snapshot, graph_bytes: u64) -> Result<MemoryTotals> {
+/// Native heap blocks in the graph: all of them, and those nothing reaches.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeCounts {
+    pub blocks: u64,
+    pub bytes: u64,
+    pub lost_blocks: u64,
+    pub lost_bytes: u64,
+}
+
+fn native_counts(a: &Analysis) -> NativeCounts {
+    let mut c = NativeCounts::default();
+    for i in 0..a.snap.object_count() as u32 {
+        let o = a.snap.object(i);
+        if !o.flags.contains(ObjectFlags::NATIVE) {
+            continue;
+        }
+        c.blocks += 1;
+        c.bytes += o.shallow_size;
+        if !a.reachable(i) {
+            c.lost_blocks += 1;
+            c.lost_bytes += o.shallow_size;
+        }
+    }
+    c
+}
+
+/// `graph_bytes` is the Python objects' bytes; native blocks are counted in
+/// the breakdown, from `native`.
+fn memory_totals(snap: &Snapshot, graph_bytes: u64, native: &NativeCounts) -> Result<MemoryTotals> {
     let rss = rss_bytes(snap)?;
     let outside = rss.map(|r| r.saturating_sub(graph_bytes));
-    let (breakdown, breakdown_basis) = memory_breakdown(snap, graph_bytes)?;
+    let (breakdown, breakdown_basis) = memory_breakdown(snap, graph_bytes, native)?;
     Ok(MemoryTotals {
         rss_bytes: rss,
         graph_bytes,
@@ -218,13 +246,18 @@ fn meta_u64(snap: &Snapshot, key: &str) -> Result<Option<u64>> {
 ///   and how much is held in reserve (`pymalloc_free`); Python objects too
 ///   large for pymalloc, which come from `malloc` (`python_large_objects`:
 ///   the object graph's bytes beyond what pymalloc holds); and the rest,
-///   which is memory C code allocated (`native_unknown`).
+///   which is memory C code allocated. When the heaps were walked, that rest
+///   splits into heap blocks something points to (`native_heap`), heap
+///   blocks nothing points to (`native_lost`), and private memory outside
+///   any heap block (`native_other`: allocator overhead and free space, and
+///   memory C code mapped itself). Otherwise it is one `native_unknown`.
 ///
 /// Counts resident bytes where every region knows them, committed bytes
 /// otherwise (a minidump does not record residency).
 fn memory_breakdown(
     snap: &Snapshot,
     graph_bytes: u64,
+    native_blocks: &NativeCounts,
 ) -> Result<(Vec<MemoryPart>, Option<String>)> {
     let Some(regions) = snap.memory_summary() else {
         return Ok((Vec::new(), None));
@@ -262,15 +295,26 @@ fn memory_breakdown(
         part: part.to_string(),
         bytes,
     };
-    let parts = vec![
+    let mut parts = vec![
         part("images", images),
         part("mapped_files", mapped),
         part("stacks", stacks),
         part("python_small_objects", used),
         part("pymalloc_free", arenas - used),
         part("python_large_objects", large),
-        part("native_unknown", native),
     ];
+    if native_blocks.blocks > 0 {
+        let lost = native_blocks.lost_bytes;
+        let held = native_blocks.bytes - lost;
+        parts.push(part("native_heap", held));
+        parts.push(part("native_lost", lost));
+        parts.push(part(
+            "native_other",
+            native.saturating_sub(native_blocks.bytes),
+        ));
+    } else {
+        parts.push(part("native_unknown", native));
+    }
     let basis = if resident { "resident" } else { "committed" };
     Ok((parts, Some(basis.to_string())))
 }
@@ -294,6 +338,7 @@ pub(crate) fn analyze_with(
     let reachable_bytes = a.reachable_bytes();
     let held_objects = a.reachable_objects();
     let rec = a.g.reconciliation;
+    let native = native_counts(a);
     let totals = Totals {
         objects: snap.object_count() as u64,
         edges: snap.edge_count() as u64,
@@ -304,15 +349,19 @@ pub(crate) fn analyze_with(
         reachable_bytes: reachable_bytes - a.external_bytes,
         external_objects: a.external_objects,
         external_bytes: a.external_bytes,
-        unreachable_objects: snap.object_count() as u64 - held_objects,
-        unreachable_bytes: a.shallow_total - reachable_bytes,
+        unreachable_objects: snap.object_count() as u64 - held_objects - native.lost_blocks,
+        unreachable_bytes: a.shallow_total - reachable_bytes - native.lost_bytes,
         dangling_edges: a.g.dangling_edges,
         refcounts_checked: rec.refcounts,
         borrowed_edges_dropped: rec.scanned_dropped,
         stale_edges_dropped: rec.speculative_dropped,
         out_of_line_edges: rec.speculative_kept,
+        native_blocks: native.blocks,
+        native_bytes: native.bytes,
+        native_lost_blocks: native.lost_blocks,
+        native_lost_bytes: native.lost_bytes,
     };
-    let memory = memory_totals(snap, a.shallow_total)?;
+    let memory = memory_totals(snap, a.shallow_total - native.bytes, &native)?;
 
     let mut top_retainers = Vec::new();
     let nodes = a.top_retainers(opts.top)?;
@@ -355,6 +404,12 @@ pub(crate) fn analyze_with(
         if out > rss / 2 {
             notes.push(notes::outside_graph(memory.graph_bytes, rss));
         }
+    }
+    if totals.native_lost_blocks > 0 {
+        notes.push(notes::native_lost(
+            totals.native_lost_blocks,
+            totals.native_lost_bytes,
+        ));
     }
     notes::header_notes(snap, &mut notes);
     if a.g.dangling_edges > 0 {

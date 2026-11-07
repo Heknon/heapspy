@@ -202,6 +202,7 @@ Object `flags`:
 | 1 | `PARTIAL` | some references could not be read; the edge list is incomplete |
 | 2 | `IMMORTAL` | immortal refcount (3.12+) |
 | 3 | `IS_TYPE` | the object is a type object (its address is also in the types section) |
+| 4 | `NATIVE` | not a Python object: a busy block of a native heap (what `malloc` handed out), recorded when the source could walk its heaps. Its type is `native.heap_block`, `native.large_allocation` (a block with its own mapping) or `native.small_block_container` (a Windows LFH subsegment, its small allocations not listed); `addr` is the block start, `shallow_size` its size less any Python objects inside; it has no refcount. Blocks that are a Python object's own memory are not recorded |
 
 Untracked objects (str, bytes, int, float, and containers the GC untracked)
 appear only when a recorded object references them, and have bit 0 clear.
@@ -336,6 +337,7 @@ capture.
 | 2 | `thread_locals` | per-thread state (thread dict, current exception) | `thread 4021 dict` |
 | 3 | `frame_local` | the value of a live frame's local variable | `frame worker:run local 'pending'` |
 | 4 | `interp` | interpreter-wide state (builtins, `sys` attributes, caches) | `interp builtins` |
+| 5 | `native` | a native heap block or a mortal Python object pointed at from a loaded module's writable data (C globals) or a thread's stack. The analyzer reaches these after every Python root | `python312.dll globals`, `thread 4021 stack` |
 
 Roots are not sorted and an address may appear more than once with
 different labels. A root address may be missing from the objects section

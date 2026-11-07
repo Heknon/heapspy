@@ -13,7 +13,7 @@ use super::text;
 use super::WalkStats;
 use crate::dump::DumpOptions;
 use crate::error::Result;
-use crate::source::{MemorySource, MemorySourceExt};
+use crate::source::{MemorySource, MemorySourceExt, NativeBlock, NativeBlockKind};
 
 /// Hard caps that keep garbage from causing huge allocations or long loops.
 const MAX_ITEMS: u64 = 1 << 28;
@@ -217,7 +217,18 @@ pub(super) struct Walker<'a> {
     /// a small object. Checked against the pool headers at the end of the
     /// walk (see [`Walker::pymalloc_usage`]).
     pools: HashSet<u64>,
+    /// The source's native heap blocks, sorted by start, if it could walk
+    /// its heaps. Pointers into them become edges (see [`Walker::emit_native`]).
+    native: Vec<NativeBlock>,
+    /// Python objects bigger than a pymalloc block, `(address, size)`: they
+    /// live in native heap blocks, which are then theirs, not native memory.
+    big_objects: Vec<(u64, u64)>,
 }
+
+/// Words of native heap block contents read in one walk: 2 GiB.
+const NATIVE_SCAN_TOTAL: u64 = 1 << 28;
+/// Words read from one native block at a time.
+const NATIVE_CHUNK_WORDS: u64 = 1 << 16;
 
 /// pymalloc's pool size on 64-bit builds of 3.12 to 3.14 (`POOL_BITS` 14),
 /// and its arena size (`ARENA_BITS` 20). Pools are aligned to their size.
@@ -307,6 +318,8 @@ impl<'a> Walker<'a> {
             heap_ranges: heap_ranges(src),
             out_of_line_left: OUT_OF_LINE_TOTAL,
             pools: HashSet::new(),
+            native: Vec::new(),
+            big_objects: Vec::new(),
             src,
             o,
             opts,
@@ -319,6 +332,20 @@ impl<'a> Walker<'a> {
             names: HashMap::new(),
             stats: WalkStats::default(),
         }
+    }
+
+    /// Whether `addr` is where a native heap block starts: an edge target
+    /// that is native memory, never to be walked as a Python object.
+    fn is_native_start(&self, addr: u64) -> bool {
+        self.native_at(addr)
+            .is_some_and(|b| self.native[b].start == addr)
+    }
+
+    /// Index of the native heap block whose range holds `addr`.
+    fn native_at(&self, addr: u64) -> Option<usize> {
+        let i = self.native.partition_point(|b| b.start <= addr);
+        let b = self.native.get(i.checked_sub(1)?)?;
+        (addr < b.start + b.size).then_some(i - 1)
     }
 
     /// Whether `addr` is in memory an out-of-line block can live in.
@@ -1059,6 +1086,42 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
+    /// An `int` whose value is an address inside a native heap block: a
+    /// pointer kept as a number (`ctypes` returns `malloc` results this way,
+    /// and handles to C objects are passed around as ints). The int then
+    /// holds the block, as far as anything in the process does.
+    fn int_address_edge(&mut self, addr: u64, out: &mut Out) -> Result<()> {
+        if self.native.is_empty() {
+            return Ok(());
+        }
+        let o = &self.o;
+        let Ok(tag) = self.src.read_u64(addr + o.long_tag) else {
+            return Ok(());
+        };
+        // `lv_tag`: digit count above bit 3, sign in the low two bits (0 is
+        // positive). A 64-bit address fits in three 30-bit digits.
+        let ndigits = tag >> 3;
+        if tag & 3 != 0 || !(1..=3).contains(&ndigits) {
+            return Ok(());
+        }
+        let mut value = 0u64;
+        for i in (0..ndigits).rev() {
+            let Ok(d) = self.src.read_u32(addr + o.long_digits + i * 4) else {
+                return Ok(());
+            };
+            value = (value << 30) | (d as u64 & 0x3FFF_FFFF);
+        }
+        if let Some(b) = self.native_at(value) {
+            let label = self.out.intern("address")?;
+            out.edges.push(Edge {
+                target: self.native[b].start,
+                label: EdgeLabel::Other(Some(label)),
+                origin: EdgeOrigin::Scanned,
+            });
+        }
+        Ok(())
+    }
+
     /// References of an object whose layout the walker does not know: every
     /// pointer-sized word of its body that points at an object.
     ///
@@ -1102,6 +1165,20 @@ impl<'a> Walker<'a> {
             }
             let off = 16 + i as u64 * 8;
             if !self.is_object(w) {
+                // A pointer into a native heap block that is not a Python
+                // object's own: the object holds that native memory (a
+                // buffer, a C struct, an array).
+                if let Some(b) = self.native_at(w) {
+                    let start = self.native[b].start;
+                    if !out.edges.iter().any(|e| e.target == start) {
+                        let label = self.out.intern(&format!("+{off}"))?;
+                        out.edges.push(Edge {
+                            target: start,
+                            label: EdgeLabel::Other(Some(label)),
+                            origin: EdgeOrigin::Scanned,
+                        });
+                    }
+                }
                 if w & 7 == 0 && self.in_heap(w) {
                     blocks.push((w, off));
                 }
@@ -1551,7 +1628,8 @@ impl<'a> Walker<'a> {
                     Err(_) => self.err(&mut out),
                 }
             }
-            Kind::Str | Kind::Bytes | Kind::Int | Kind::Float | Kind::WeakRef | Kind::Other => {}
+            Kind::Int => self.int_address_edge(addr, &mut out)?,
+            Kind::Str | Kind::Bytes | Kind::Float | Kind::WeakRef | Kind::Other => {}
         }
         if ti.heap || ti.flags & TPFLAGS_MANAGED_DICT != 0 || ti.dictoffset > 0 {
             self.instance_edges(addr, ti, t, &mut out)?;
@@ -1722,8 +1800,14 @@ impl<'a> Walker<'a> {
             self.type_info(addr)?;
         }
         let size = self.base_size(addr, &ti) + d.extra_size;
+        if size > 512 {
+            self.big_objects.push((addr, size));
+        }
         for e in &d.edges {
-            if !self.is_tracked(e.target) && self.untracked.insert(e.target) {
+            if !self.is_tracked(e.target)
+                && !self.is_native_start(e.target)
+                && self.untracked.insert(e.target)
+            {
                 self.queue.push(e.target);
             }
         }
@@ -1854,6 +1938,10 @@ impl<'a> Walker<'a> {
             .map(|r| r.iter().map(|m| m.size).sum::<u64>() / 32)
             .unwrap_or(1 << 32)
             .max(1 << 16);
+        // Known before the walk, so Python objects' pointers into native
+        // memory become edges as they are emitted. A heap walk that fails
+        // leaves native memory unlisted, as it was before heap walkers.
+        self.native = self.src.native_blocks().ok().flatten().unwrap_or_default();
 
         for &is in &interps {
             let gc = is + o.is_gc;
@@ -1877,6 +1965,11 @@ impl<'a> Walker<'a> {
             self.interp_roots(is)?;
         }
         self.drain()?;
+        if !self.native.is_empty() {
+            self.emit_native()?;
+            self.native_roots()?;
+            self.drain()?;
+        }
 
         let p = self.pymalloc_usage();
         if p.pools > 0 {
@@ -1891,6 +1984,183 @@ impl<'a> Walker<'a> {
                 .add_meta("pymalloc.arena_bytes", &p.arena_bytes().to_string())?;
         }
         Ok(self.stats)
+    }
+
+    /// Record the native heap blocks as objects of the graph, so native
+    /// memory has retaining paths like Python memory does.
+    ///
+    /// A block holding a Python object too big for pymalloc is that object's
+    /// memory, already recorded, and is skipped. Every other block becomes an
+    /// object flagged [`ObjectFlags::NATIVE`] with a synthetic `native.*`
+    /// type, whose edges are the words of its contents that point at a
+    /// Python object or into another block: a C struct holding a callback, a
+    /// buffer list, a linked node. Nothing says which words of native memory
+    /// are pointers, so this is conservative, the way a C leak checker scans:
+    /// a number that happens to equal an address makes an edge. Edges into
+    /// Python objects are still checked against their refcounts by the
+    /// analyzer; edges between blocks cannot be.
+    ///
+    /// A small-block container (a Windows LFH subsegment) holds many small
+    /// allocations nobody listed; it is recorded as one block, less the
+    /// Python objects found inside it.
+    fn emit_native(&mut self) -> Result<()> {
+        let mut big = std::mem::take(&mut self.big_objects);
+        big.sort_unstable();
+        // Synthetic types. Their "addresses" are small numbers no real type
+        // can have; nothing looks them up.
+        let ty = |w: &mut SnapshotWriter, addr: u64, q: &str| w.add_type(addr, "native", q);
+        let t_alloc = ty(self.out, 1, "heap_block")?;
+        let t_large = ty(self.out, 2, "large_allocation")?;
+        let t_small = ty(self.out, 3, "small_block_container")?;
+        let mut budget = NATIVE_SCAN_TOTAL;
+        for bi in 0..self.native.len() {
+            let b = self.native[bi];
+            let end = b.start + b.size;
+            let lo = big.partition_point(|&(a, _)| a < b.start);
+            let inside = big[lo..].iter().take_while(|&&(a, _)| a < end);
+            let python_bytes: u64 = inside.clone().map(|&(_, s)| s).sum();
+            if b.kind != NativeBlockKind::SmallBlockContainer && inside.count() > 0 {
+                continue;
+            }
+            let mut edges = Vec::new();
+            let mut seen = HashSet::new();
+            let mut off = 0u64;
+            let mut partial = false;
+            while off + 8 <= b.size && budget > 0 {
+                let n = ((b.size - off) / 8).min(NATIVE_CHUNK_WORDS).min(budget);
+                let Ok(words) = self.src.read_ptrs(b.start + off, n as usize) else {
+                    partial = true;
+                    break;
+                };
+                budget -= n;
+                for (i, &w) in words.iter().enumerate() {
+                    if w == 0 || w & 7 != 0 || (b.start..end).contains(&w) {
+                        continue;
+                    }
+                    let target = if self.is_object(w) {
+                        w
+                    } else if let Some(t) = self.native_at(w) {
+                        self.native[t].start
+                    } else {
+                        continue;
+                    };
+                    if !seen.insert(target) {
+                        continue;
+                    }
+                    let o = off + i as u64 * 8;
+                    let text = if o < 4096 {
+                        format!("+{o}")
+                    } else {
+                        "contents".to_string()
+                    };
+                    edges.push(Edge {
+                        target,
+                        label: EdgeLabel::Other(Some(self.out.intern(&text)?)),
+                        origin: EdgeOrigin::Scanned,
+                    });
+                }
+                off += n * 8;
+            }
+            for e in &edges {
+                if !self.is_tracked(e.target)
+                    && !self.is_native_start(e.target)
+                    && self.untracked.insert(e.target)
+                {
+                    self.queue.push(e.target);
+                }
+            }
+            let mut flags = ObjectFlags::NATIVE;
+            if partial || budget == 0 {
+                flags |= ObjectFlags::PARTIAL;
+            }
+            let obj = ObjectInput {
+                addr: b.start,
+                type_id: match b.kind {
+                    NativeBlockKind::Allocation => t_alloc,
+                    NativeBlockKind::Large => t_large,
+                    NativeBlockKind::SmallBlockContainer => t_small,
+                },
+                shallow_size: b.size.saturating_sub(python_bytes),
+                flags,
+                extras: ObjectExtras::default(),
+                refcount: None,
+            };
+            self.stats.edges += edges.len() as u64;
+            self.out.add_object(&obj, edges)?;
+            self.stats.objects += 1;
+        }
+        Ok(())
+    }
+
+    /// Roots in native memory the program reaches without any heap: each
+    /// loaded module's writable data (C globals) and each thread's stack.
+    ///
+    /// A pointer there into a native block, or at a mortal Python object,
+    /// roots it as [`RootKind::Native`], labelled by where it was found:
+    /// `python312.dll globals`, `thread 1234 stack`. The analyzer reaches
+    /// these after every Python root, so they only explain what nothing in
+    /// Python holds: native memory, and objects C code keeps alive. Stacks
+    /// hold stale words too, which can root something already dead; that
+    /// only moves it from "garbage" to "held by a thread's stack".
+    fn native_roots(&mut self) -> Result<()> {
+        let ranges = self.src.mapped_ranges().unwrap_or_default();
+        let modules = self.src.modules().unwrap_or_default();
+        let mut areas: Vec<(u64, u64, String)> = Vec::new();
+        for m in &modules {
+            let m_end = m.base.saturating_add(m.size);
+            for r in &ranges {
+                let (s, e) = (r.start.max(m.base), (r.start + r.size).min(m_end));
+                if r.perms.write && s < e {
+                    areas.push((s, e, format!("{} globals", m.name)));
+                }
+            }
+        }
+        for t in self.src.threads().unwrap_or_default() {
+            let Some(sp) = t.stack_pointer else { continue };
+            if let Some(r) = ranges
+                .iter()
+                .find(|r| r.start <= sp && sp < r.start + r.size)
+            {
+                areas.push((sp & !7, r.start + r.size, format!("thread {} stack", t.tid)));
+            }
+        }
+        for (start, end, label) in areas {
+            let l = self.out.intern(&label)?;
+            let mut done = HashSet::new();
+            let mut a = start;
+            while a + 8 <= end {
+                let n = ((end - a) / 8).min(NATIVE_CHUNK_WORDS);
+                let Ok(words) = self.src.read_ptrs(a, n as usize) else {
+                    break;
+                };
+                for &w in &words {
+                    if w == 0 || w & 7 != 0 {
+                        continue;
+                    }
+                    let (target, python) = if let Some(b) = self.native_at(w) {
+                        (self.native[b].start, false)
+                    } else if self.is_object(w) && !self.is_immortal(w) {
+                        (w, true)
+                    } else {
+                        continue;
+                    };
+                    if !done.insert(target) {
+                        continue;
+                    }
+                    self.out.add_root(target, RootKind::Native, l)?;
+                    self.stats.roots += 1;
+                    if python && !self.is_tracked(target) && self.untracked.insert(target) {
+                        self.queue.push(target);
+                    }
+                }
+                a += n * 8;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_immortal(&self, addr: u64) -> bool {
+        self.src.read_u64(addr).is_ok_and(|r| (r as u32 as i32) < 0)
     }
 
     /// How much pymalloc holds and how much of it is in use.

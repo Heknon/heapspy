@@ -32,7 +32,11 @@
     "refcounts_checked": true,
     "borrowed_edges_dropped": 0,
     "stale_edges_dropped": 0,
-    "out_of_line_edges": 0
+    "out_of_line_edges": 0,
+    "native_blocks": 0,
+    "native_bytes": 0,
+    "native_lost_blocks": 0,
+    "native_lost_bytes": 0
   },
   "memory": {
     "rss_bytes": 2040109465,

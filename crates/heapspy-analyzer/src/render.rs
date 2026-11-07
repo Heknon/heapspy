@@ -309,6 +309,16 @@ pub fn analyze(r: &AnalyzeReport) -> Result<String> {
             format_bytes(t.unreachable_bytes)
         );
     }
+    if t.native_blocks > 0 {
+        let _ = writeln!(
+            out,
+            "native heap: {} blocks ({}); nothing points to {} of them ({}): leaked",
+            t.native_blocks,
+            format_bytes(t.native_bytes),
+            t.native_lost_blocks,
+            format_bytes(t.native_lost_bytes)
+        );
+    }
 
     out.push_str("\nTop retainers by retained size\n\n");
     if r.top_retainers.is_empty() {
@@ -679,7 +689,9 @@ fn memory_part_text(part: &str) -> &str {
         "python_small_objects" => "Python objects in pymalloc (small objects)",
         "pymalloc_free" => "pymalloc free space: held by Python's allocator, not in use",
         "python_large_objects" => "Python objects from malloc (larger than 512 bytes)",
-        "native_heap" => "native heap: memory C code allocated",
+        "native_heap" => "native heap blocks something points to",
+        "native_lost" => "native heap blocks nothing points to (leaked)",
+        "native_other" => "other private memory (allocator overhead and free space, C mappings)",
         "native_unknown" => "native heap and other private memory C code allocated",
         other => other,
     }

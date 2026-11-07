@@ -92,6 +92,10 @@ impl MemorySource for PageCache<'_> {
         self.inner.memory_summary()
     }
 
+    fn native_blocks(&self) -> Result<Option<Vec<crate::source::NativeBlock>>> {
+        self.inner.native_blocks()
+    }
+
     fn find_symbol(&self, module: &Module, name: &str) -> Result<Option<u64>> {
         self.inner.find_symbol(module, name)
     }

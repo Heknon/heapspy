@@ -11,6 +11,8 @@ use crate::Result;
 pub const EXTERNAL_ROOT_LABEL: &str = "held outside the Python graph";
 /// `root_kind` of such a root in reports.
 pub const EXTERNAL_ROOT_KIND: &str = "external";
+/// Index of the external roots in `ObjectGraph::root_phases`.
+pub const EXTERNAL_PHASE: usize = 3;
 
 /// What reconciling edges against refcounts did. All zero for a snapshot
 /// without refcounts, where every edge is taken as it is.
@@ -49,9 +51,10 @@ pub struct ObjectGraph {
     pub root_entries: Vec<Root>,
     pub reconciliation: Reconciliation,
     /// Super-root edges by BFS phase: stable roots (modules, interpreter
-    /// state), then transient ones (frames, thread state), then external.
-    /// Each is a range of CSR edge indices.
-    pub root_phases: [std::ops::Range<u32>; 3],
+    /// state), transient ones (frames, thread state), native ones (C
+    /// globals, thread stacks), then external. Each is a range of CSR edge
+    /// indices; [`EXTERNAL_PHASE`] is the last.
+    pub root_phases: [std::ops::Range<u32>; 4],
 }
 
 impl ObjectGraph {
@@ -98,7 +101,8 @@ fn root_rank(kind: RootKind) -> u8 {
         RootKind::ThreadLocals => 2,
         RootKind::Interp => 3,
         RootKind::Other => 4,
-        RootKind::Unknown(_) => 5,
+        RootKind::Native => 5,
+        RootKind::Unknown(_) => 6,
     }
 }
 
@@ -179,11 +183,12 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     // Stable roots (modules, interpreter state) go before transient ones
     // (frame locals, thread state), and the BFS finishes the stable ones
     // before it starts the others (see `ObjectGraph::root_phases`). A path
-    // then starts at a frame only when nothing longer-lived holds the object.
-    keyed.sort_by(|a, b| {
-        (transient(a.3.kind), a.1, &a.2, a.0).cmp(&(transient(b.3.kind), b.1, &b.2, b.0))
-    });
-    let stable_roots = keyed.iter().filter(|k| !transient(k.3.kind)).count() as u32;
+    // then starts at a frame only when nothing longer-lived holds the object,
+    // and at native memory (C globals, a thread's stack) only when nothing in
+    // Python does.
+    keyed.sort_by(|a, b| (phase(a.3.kind), a.1, &a.2, a.0).cmp(&(phase(b.3.kind), b.1, &b.2, b.0)));
+    let in_phase = |p: u8| keyed.iter().filter(|k| phase(k.3.kind) == p).count() as u32;
+    let (stable_roots, transient_roots) = (in_phase(0), in_phase(1));
     let root_nodes: Vec<u32> = keyed.iter().map(|k| k.0).collect();
     let root_entries: Vec<Root> = keyed.into_iter().map(|k| k.3).collect();
 
@@ -223,6 +228,7 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
 
     let first = e as u32;
     let transient_start = first + stable_roots;
+    let native_start = transient_start + transient_roots;
     let external_start = first + root_nodes.len() as u32;
     let end = external_start + external.len() as u32;
     Ok(ObjectGraph {
@@ -235,15 +241,22 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
         reconciliation,
         root_phases: [
             first..transient_start,
-            transient_start..external_start,
+            transient_start..native_start,
+            native_start..external_start,
             external_start..end,
         ],
     })
 }
 
-/// Roots that exist only while a thread is running a function.
-fn transient(kind: RootKind) -> bool {
-    matches!(kind, RootKind::FrameLocal | RootKind::ThreadLocals)
+/// BFS phase of a root: 0 stable (modules, interpreter state), 1 transient
+/// (a running function's locals, thread state), 2 native (C globals, thread
+/// stacks).
+fn phase(kind: RootKind) -> u8 {
+    match kind {
+        RootKind::FrameLocal | RootKind::ThreadLocals => 1,
+        RootKind::Native => 2,
+        _ => 0,
+    }
 }
 
 /// The refcount of object `i`, if it can be compared with edge counts:

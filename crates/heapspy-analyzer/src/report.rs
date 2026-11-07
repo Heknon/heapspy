@@ -301,6 +301,21 @@ pub struct Totals {
     /// does not lay out, such as a deque's blocks).
     #[serde(default)]
     pub out_of_line_edges: u64,
+    /// Native heap blocks recorded (what `malloc` handed out, apart from
+    /// Python objects), and their bytes. 0 when the source could not walk
+    /// its heaps. They are counted in `objects` and `shallow_bytes`, and the
+    /// reachable ones in `reachable_*`.
+    #[serde(default)]
+    pub native_blocks: u64,
+    #[serde(default)]
+    pub native_bytes: u64,
+    /// Native blocks nothing points to: not from a Python object, another
+    /// block, a module's globals or a thread's stack. Memory whose address
+    /// the program no longer has anywhere: leaked. Not in `unreachable_*`.
+    #[serde(default)]
+    pub native_lost_blocks: u64,
+    #[serde(default)]
+    pub native_lost_bytes: u64,
 }
 
 /// Process memory vs. the Python graph (`memory`).

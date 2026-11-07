@@ -33,6 +33,19 @@ pub fn outside_graph(graph: u64, rss: u64) -> Note {
     )
 }
 
+pub fn native_lost(blocks: u64, bytes: u64) -> Note {
+    note(
+        "native_lost",
+        format!(
+            "{blocks} native heap blocks ({}) are not pointed to from anywhere: no Python \
+             object, other block, module global or thread stack holds their address. That \
+             memory is leaked. Run `heapspy record --events native` while it grows to see \
+             where it is allocated.",
+            format_bytes(bytes)
+        ),
+    )
+}
+
 pub fn keys_redacted() -> Note {
     note(
         "keys_redacted",

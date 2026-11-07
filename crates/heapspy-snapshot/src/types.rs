@@ -164,6 +164,11 @@ code_enum! {
         FrameLocal = 3 => "frame_local",
         /// Interpreter-wide state: builtins, `sys` attributes, caches, interned strings.
         Interp = 4 => "interp",
+        /// Found by a pointer in native memory the program reaches without
+        /// any heap: a loaded module's global data, or a thread's stack. The
+        /// root object is a native heap block, or a Python object C code
+        /// holds directly.
+        Native = 5 => "native",
     }
 }
 
@@ -255,6 +260,10 @@ impl ObjectFlags {
     pub const IMMORTAL: ObjectFlags = ObjectFlags(1 << 2);
     /// The object is a type object (its address also appears in the type table).
     pub const IS_TYPE: ObjectFlags = ObjectFlags(1 << 3);
+    /// Not a Python object: a block of a native heap (what `malloc` handed
+    /// out), recorded so native memory has retaining paths too. Its type is
+    /// one of the synthetic `native.*` types and it has no refcount.
+    pub const NATIVE: ObjectFlags = ObjectFlags(1 << 4);
 
     pub fn contains(self, other: ObjectFlags) -> bool {
         self.0 & other.0 == other.0

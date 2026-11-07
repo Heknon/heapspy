@@ -514,7 +514,7 @@ fn bfs(g: &ObjectGraph) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     // a module holds gets a path from that module even when a running
     // function's local is a hop closer. See `ObjectGraph::root_phases`.
     for (i, phase) in g.root_phases.iter().enumerate() {
-        if i == 2 {
+        if i == crate::graph::EXTERNAL_PHASE {
             external_from = queue.len();
         }
         for e in phase.clone() {

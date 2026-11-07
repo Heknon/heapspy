@@ -12,7 +12,7 @@ use super::offsets::*;
 use super::*;
 use crate::dump::DumpOptions;
 use crate::source::mem::MemImage;
-use crate::source::{Module, TargetInfo};
+use crate::source::{Module, NativeBlock, NativeBlockKind, TargetInfo};
 
 const BASE: u64 = 0x10_0000;
 const SIZE: usize = 1 << 20;
@@ -879,6 +879,105 @@ fn a_block_first_reached_from_the_wrong_neighbour_is_still_followed() {
     let (s, _) = walk_heap(&h, &DumpOptions::default());
     let spec: Vec<u64> = speculative_edges(&s, x).into_iter().map(|e| e.1).collect();
     assert!(spec.contains(&last), "{spec:?}");
+}
+
+/// Run the walker over `h` with native heap blocks and extra modules
+/// declared on the image.
+fn walk_with_native(h: &Heap, blocks: Vec<NativeBlock>, modules: Vec<Module>) -> Snapshot {
+    let mut img = h.image();
+    img.set_native_blocks(blocks);
+    for m in modules {
+        img.add_module(m);
+    }
+    let mut w = SnapshotWriter::new(SnapshotInfo::new_for_test()).unwrap();
+    walk(&img, &h.runtime_location(), &DumpOptions::default(), &mut w).unwrap();
+    Snapshot::from_bytes(w.finish_to_vec().unwrap()).unwrap()
+}
+
+#[test]
+fn native_blocks_become_objects_with_edges_and_roots() {
+    let mut h = Heap::new(12);
+    let block = |h: &mut Heap, words: u64| {
+        let a = h.alloc(words * 8);
+        NativeBlock {
+            start: a,
+            size: words * 8,
+            kind: NativeBlockKind::Allocation,
+            heap: 0,
+        }
+    };
+    // A: pointed at by an int (a ctypes-style handle); holds a pointer into
+    // B and to a Python string nothing else holds.
+    let a = block(&mut h, 8);
+    let b = block(&mut h, 8);
+    let only_native = h.str("held by C");
+    h.w64(a.start + 16, b.start + 24); // interior pointer into B
+    h.w64(a.start + 24, only_native);
+    let handle = h.int((a.start + 16) as u32);
+    let handles = h.list(&[handle]);
+    let module_dict = h.str_dict(&[("_HANDLES", handles)]);
+    h.module("app", module_dict);
+    // C: nothing points to it.
+    let c = block(&mut h, 4);
+    // D: holds a Python object too big for pymalloc, so it is that object.
+    let big = h.bytes_obj(&[7u8; 600]);
+    let d = NativeBlock {
+        start: big - 16,
+        size: 700,
+        kind: NativeBlockKind::Allocation,
+        heap: 0,
+    };
+    let holder = h.list(&[big]);
+    let module_dict2 = h.str_dict(&[("BIG", holder)]);
+    h.module("app2", module_dict2);
+    // E: only a C global points to it.
+    let e = block(&mut h, 4);
+    let globals = h.alloc(32);
+    h.w64(globals + 8, e.start);
+    let dll = Module {
+        name: "ext.dll".into(),
+        path: "C:/x/ext.dll".into(),
+        base: globals,
+        size: 32,
+        build_id: None,
+    };
+    let s = walk_with_native(&h, vec![a, b, c, d, e], vec![dll]);
+
+    let native = |addr: u64| {
+        let i = s
+            .find_object(addr)
+            .unwrap_or_else(|| panic!("no native object at {addr:#x}"));
+        assert!(s.object(i).flags.contains(ObjectFlags::NATIVE));
+        type_of(&s, addr)
+    };
+    assert_eq!(native(a.start), "native.heap_block");
+    native(b.start);
+    native(c.start);
+    native(e.start);
+    // D is the bytes object's memory, not a native block.
+    assert!(s.find_object(d.start).is_none());
+    assert_eq!(type_of(&s, big), "builtins.bytes");
+
+    assert_eq!(edges(&s, handle), vec![("<address>".to_string(), a.start)]);
+    let from_a = edges(&s, a.start);
+    assert!(
+        from_a.contains(&("<+16>".to_string(), b.start)),
+        "{from_a:?}"
+    );
+    assert!(
+        from_a.contains(&("<+24>".to_string(), only_native)),
+        "{from_a:?}"
+    );
+    assert!(s.find_object(only_native).is_some());
+
+    let r = roots(&s);
+    assert!(
+        r.iter().any(|(k, addr, l)| *k == RootKind::Native
+            && *addr == e.start
+            && l == "ext.dll globals"),
+        "{r:?}"
+    );
+    assert!(!r.iter().any(|(_, addr, _)| *addr == c.start));
 }
 
 #[test]
