@@ -117,6 +117,7 @@ fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
     for w in blocks.windows(2) {
         assert!(w[0].start + w[0].size <= w[1].start, "{what}: {w:?}");
     }
+    let all_blocks = &blocks;
     for (p, size, kind) in allocs {
         let b = blocks
             .iter()
@@ -140,9 +141,25 @@ fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
                     .filter_map(|t| t.stack_pointer)
                     .map(|sp| format!("{sp:#x}"))
                     .collect();
+                let all: Vec<_> = all_blocks.iter().filter(|b| b.kind == NativeBlockKind::Large).collect();
+                let mut heaps: std::collections::BTreeMap<u32, (u64, u64, usize)> = Default::default();
+                for b in all_blocks.iter().filter(|b| b.kind == NativeBlockKind::Allocation) {
+                    let e = heaps.entry(b.heap).or_insert((u64::MAX, 0, 0));
+                    e.0 = e.0.min(b.start);
+                    e.1 = e.1.max(b.start + b.size);
+                    e.2 += 1;
+                }
+                let anon: Vec<String> = src
+                    .mapped_ranges()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| r.file.is_none() && r.perms.read && r.perms.write && r.size > (16 << 20))
+                    .map(|r| format!("{:#x}+{:#x}", r.start, r.size))
+                    .collect();
                 panic!(
                     "{what}: {kind} malloc({size}) at {p:#x} is in no block\n\
-                     blocks near: {blocks:#x?}\nmaps near: {maps:#?}\nstack pointers: {sps:?}"
+                     blocks near: {blocks:#x?}\nmaps near: {maps:#?}\nstack pointers: {sps:?}\n\
+                     large blocks: {all:#x?}\nheaps (start, end, n): {heaps:#x?}\nbig anon: {anon:?}"
                 )
             });
         // The user pointer is the chunk plus 16, and the chunk holds it. A
