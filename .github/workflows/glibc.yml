@@ -1,0 +1,120 @@
+# The glibc heap walker against real processes on old and current glibc
+# releases, one distro image per malloc layout. Runs on request only:
+#
+#   - Label a PR `ci:glibc`.
+#   - Manual dispatch (Actions tab).
+#
+# The ignored test crates/heapspy-reader/tests/native_heap_live.rs is built
+# once, statically for musl, so it runs in any image. Each image builds the
+# C victim (tests/victims/glibc_heap.c) with its own gcc and glibc, installs
+# gdb for gcore, and runs the test live and against a core.
+name: glibc
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+concurrency:
+  # A literal prefix, not github.workflow (see ci.yml).
+  group: glibc-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the test (musl)
+    # On a `labeled` event, only react to the label this workflow cares
+    # about, so adding unrelated labels does not start a run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'ci:glibc') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci:glibc'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: glibc
+      - name: Build native_heap_live for musl
+        run: |
+          exe="$(cargo test --release --locked -p heapspy-reader --test native_heap_live \
+              --target x86_64-unknown-linux-musl --no-run --message-format=json |
+            jq -r 'select(.executable != null and .target.name == "native_heap_live") | .executable')"
+          mkdir -p out
+          cp "$exe" out/native_heap_live
+          file out/native_heap_live
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native_heap_live
+          path: out/native_heap_live
+          if-no-files-found: error
+
+  walk:
+    name: glibc ${{ matrix.glibc }} (${{ matrix.image }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # malloc_state without have_fastchunks, no tcache.
+          - { image: "ubuntu:12.04", glibc: "2.15", apt: old-releases }
+          - { image: "ubuntu:14.04", glibc: "2.19" }
+          # attached_threads added.
+          - { image: "ubuntu:16.04", glibc: "2.23" }
+          # tcache with char counts, have_fastchunks.
+          - { image: "ubuntu:18.04", glibc: "2.27" }
+          # uint16_t tcache counts.
+          - { image: "ubuntu:20.04", glibc: "2.31" }
+          # heap_info gains pagesize (48 bytes); safe-linking since 2.32.
+          - { image: "ubuntu:22.04", glibc: "2.35" }
+          - { image: "debian:12", glibc: "2.36" }
+          - { image: "ubuntu:24.04", glibc: "2.39" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: crates/heapspy-reader/tests/victims
+      - uses: actions/download-artifact@v4
+        with:
+          name: native_heap_live
+          path: bin
+      - name: Allow ptrace
+        # gcore attaches to the victim, which is not its descendant.
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+      - name: Walk glibc ${{ matrix.glibc }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          APT: ${{ matrix.apt }}
+        run: |
+          chmod +x bin/native_heap_live
+          docker run --rm --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            -e APT -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD/crates/heapspy-reader/tests/victims:/victims:ro" \
+            -v "$PWD/bin:/heapspy:ro" \
+            "$IMAGE" bash -euc '
+              if [ "$APT" = old-releases ]; then
+                sed -i -e "s|//[a-z.]*archive.ubuntu.com|//old-releases.ubuntu.com|" \
+                  -e "s|//security.ubuntu.com|//old-releases.ubuntu.com|" /etc/apt/sources.list
+              fi
+              apt-get -o Acquire::Check-Valid-Until=false update -qq
+              apt-get install -y -qq --no-install-recommends gcc libc6-dev gdb >/dev/null
+              ldd --version | head -n 1
+              gcc -O0 -o /tmp/victim /victims/glibc_heap.c -lpthread
+              cd /tmp
+              HEAPSPY_VICTIM=/tmp/victim /heapspy/native_heap_live \
+                --ignored --test-threads 1 --nocapture
+            '
