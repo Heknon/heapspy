@@ -22,11 +22,19 @@
 //! # Leaving
 //!
 //! [`Machine::disarm`] writes every original byte back and clears pending
-//! trap flags. The caller then drains debug events for a moment, passing
-//! each to [`Machine::handle`] (which, once disarmed, rewinds `rip` for a
-//! hit on a removed breakpoint instead of reporting it), and only then
-//! detaches. So no `int3` and no trap flag of ours is left for the target
-//! to trip over after `DebugActiveProcessStop`.
+//! trap flags. The caller then drains debug events, passing each to
+//! [`Machine::handle`] (which, once disarmed, rewinds `rip` for a hit on a
+//! removed breakpoint instead of reporting it), until
+//! [`Machine::steps_pending`] is false, and only then detaches. So no
+//! `int3` and no trap flag of ours is left for the target to trip over
+//! after `DebugActiveProcessStop`.
+//!
+//! A thread stepping over a breakpoint when `disarm` runs has usually
+//! executed its one instruction already, and its `EXCEPTION_SINGLE_STEP`
+//! is queued: clearing the trap flag no longer helps. `disarm` therefore
+//! keeps those threads in `stepping`, so that the queued step is handled
+//! as ours. Passing it to the target instead, as an unknown single step,
+//! killed it with `STATUS_SINGLE_STEP` (0x80000004).
 
 use std::collections::HashMap;
 
@@ -266,7 +274,9 @@ impl Machine {
                 bp.armed = false;
             }
         }
-        for (tid, _) in self.stepping.drain() {
+        // Keep the entries: the step exceptions of these threads may be
+        // queued already, and must be handled, not passed to the target.
+        for &tid in self.stepping.keys() {
             io.set_trap(tid, false);
         }
         for (tid, _) in std::mem::take(&mut self.pending) {
@@ -282,7 +292,13 @@ impl Machine {
 
     /// Every byte the machine wrote has its original value back.
     pub fn is_clean(&self) -> bool {
-        self.bps.values().all(|b| !b.armed) && self.stepping.is_empty()
+        self.bps.values().all(|b| !b.armed)
+    }
+
+    /// Threads were stepping over a breakpoint and their single-step event
+    /// has not been seen yet. Keep draining events before detaching.
+    pub fn steps_pending(&self) -> bool {
+        !self.stepping.is_empty()
     }
 }
 
@@ -465,11 +481,39 @@ mod tests {
             Reply::Handled
         );
         assert_eq!(f.regs[&2].rip, VA);
+        assert_eq!(m.handle(&mut f, Event::ExitProcess), Reply::Exited);
+    }
+
+    /// Regression: the CI run on windows-latest killed the target with
+    /// STATUS_SINGLE_STEP. A thread was stepping over the entry breakpoint
+    /// when the recording stopped; its step event was already queued, and
+    /// the drain passed it to the target because `disarm` had forgotten
+    /// the thread.
+    #[test]
+    fn step_queued_at_disarm_is_handled() {
+        let mut f = Fake::default();
+        let mut m = Machine::new(VA, ARENA, PY);
+        m.start(&mut f);
+        call(&mut f, 1, 4096, RET); // not an arena: only stepped over
+        m.handle(&mut f, Event::Breakpoint { tid: 1, addr: VA });
+        assert!(f.trap[&1]);
+        m.disarm(&mut f);
+        assert!(m.is_clean());
+        assert!(m.steps_pending(), "the step of thread 1 is still due");
+        assert_eq!(f.mem[&VA], 0x55);
+        assert_eq!(
+            m.handle(&mut f, Event::SingleStep { tid: 1 }),
+            Reply::Handled,
+            "the queued step is ours, not the target's"
+        );
+        assert!(!m.steps_pending());
+        assert_eq!(f.mem[&VA], 0x55, "not re-armed after disarm");
+        assert!(!f.trap[&1]);
+        // A later single step on that thread is not ours.
         assert_eq!(
             m.handle(&mut f, Event::SingleStep { tid: 1 }),
             Reply::NotHandled
         );
-        assert_eq!(m.handle(&mut f, Event::ExitProcess), Reply::Exited);
     }
 
     #[test]
