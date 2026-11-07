@@ -306,6 +306,7 @@ window early: the profile is written and `truncated` is `true`.
 | `memory` | object | below |
 | `top_retainers` | array of Retainer | objects with the largest `retained_bytes` |
 | `type_histogram` | array of TypeRow | types by `retained_bytes` |
+| `types_by_size` | array of TypeRow | types by `shallow_bytes`, unreachable instances included: what the memory is made of. Added in 0.3; empty in older documents |
 | `notes` | array of Note | |
 | `allocations` | Allocations, nullable | added in M7: the `--allocations` profile joined with the snapshot, see [Allocations](#allocations); `null` without `--allocations` |
 
@@ -404,7 +405,7 @@ Which objects are listed:
    dominated by an entry already listed is skipped. The entries are therefore
    disjoint: their retained sets do not overlap.
 
-TypeRow (`type_histogram[]`):
+TypeRow (`type_histogram[]`, `types_by_size[]`):
 
 | field | type | meaning |
 |---|---|---|
@@ -414,6 +415,10 @@ TypeRow (`type_histogram[]`):
 | `retained_bytes` | integer | retained size of the set of instances: sum of `retained_bytes` over instances not dominated by another instance of the same type |
 | `type_location` | SourceLocation, nullable | where the type is defined; when several type objects share the name, the first one with a location |
 | `type_location_reason` | string, nullable | why `type_location` is `null` |
+| `unreachable_count`, `unreachable_bytes` | integer, nullable | instances nothing reaches and their shallow bytes; for `native.*` types these are leaked blocks. Added in 0.3 |
+| `held_by` | string, nullable | root path of the `top_retainers` entry whose dominator subtree holds the most of this type's shallow bytes; `null` when no listed retainer holds any. Added in 0.3 |
+| `held_by_rank` | integer, nullable | that entry's `rank` |
+| `held_by_bytes` | integer, nullable | the shallow bytes of this type it holds |
 
 The `retained_bytes` rule means nested instances are not counted twice: for
 a dict of dicts, only the outer dict's retained size counts, since it already

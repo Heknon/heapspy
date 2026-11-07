@@ -88,10 +88,11 @@ pub enum Command {
     /// Live view of a process's memory: what it is, what holds it, what grows.
     #[command(
         long_about = "Live view of a process's memory: what it is, what holds it, what grows.\n\n\
-            The top panel splits the process's memory into Python objects, native memory in \
-            use, leaked native blocks, free memory the allocator keeps, and code/files/stacks, \
-            with a sparkline and a growth rate for each. Below it, tabs list holders (Python and \
-            native, ranked by what they retain), types, native blocks and threads.\n\n\
+            The main view is what is in memory: one row per kind of object (Python types, and \
+            native malloc blocks in use and leaked) with count, size, growth per minute and the \
+            holder that keeps most of them alive. Other tabs list the holders, native memory, \
+            threads and allocation stacks. Where the memory sits (Python, native, leaked, \
+            code/files) is one bar at the top.\n\n\
             How it reads the process:\n  \
             - Every second: memory totals from the OS and each thread's Python stack. These \
             reads do not stop the process.\n  \
@@ -102,7 +103,7 @@ pub enum Command {
             - With --alloc: allocation sampling (`heapspy record`) for a bounded window, so the \
             Allocated tab can say which code allocated what is still alive.",
         after_long_help = "\x1b[1;4mKeys\x1b[0m\n  \
-            1-5 / Tab   switch tab: Holders, Types, Native, Threads, Allocated\n  \
+            1-5 / Tab   switch tab: Objects, Holders, Native, Threads, Allocated\n  \
             ↑ ↓ / j k   move the selection        Enter   details of the selected row\n  \
             s           change the sort column    Esc     close details\n  \
             d           take a snapshot now       w       save the latest snapshot to a file\n  \
@@ -149,17 +150,17 @@ pub enum Command {
             sudo heapspy dump --pid 1234 --capture-contents --max-str 64 -o app.hpy"
     )]
     Dump(DumpArgs),
-    /// One readable report: what the memory is and what holds it.
+    /// One readable report: what the memory is and who holds it.
     #[command(
-        long_about = "One readable report: what the memory is and what holds it.\n\n\
+        long_about = "One readable report: what the memory is and who holds it.\n\n\
             Reads a snapshot file, or takes one from a live process with --pid (kept only with \
             --keep). The report shows:\n  \
-            - where the process's memory is: Python objects, native memory in use, leaked \
-            native blocks, allocator free space, pymalloc free space, code/files/stacks;\n  \
-            - what holds it: the objects with the largest retained size, split into Python and \
-            native bytes, with their path from a root;\n  \
-            - the biggest types, leaked native blocks by size, and, with --pid, what each \
-            thread is running.",
+            - what the memory is: objects by type, and native malloc blocks in use and leaked, \
+            with count, size and the holder that keeps most of them;\n  \
+            - who holds it: the objects that keep the most alive, split into Python and native \
+            bytes, and what they hold;\n  \
+            - one bar of where the memory sits, leaked native blocks by size, and, with --pid, \
+            what each thread is running.",
         after_long_help = "\x1b[1;4mExamples\x1b[0m\n  \
             sudo heapspy analyze --pid 1234\n  \
             sudo heapspy analyze --pid 1234 --keep app.hpy    # and keep the snapshot\n  \

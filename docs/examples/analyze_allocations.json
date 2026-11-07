@@ -200,7 +200,12 @@
       "shallow_bytes": 412090368,
       "retained_bytes": 412090368,
       "type_location": null,
-      "type_location_reason": null
+      "type_location_reason": null,
+      "unreachable_count": 0,
+      "unreachable_bytes": 0,
+      "held_by": null,
+      "held_by_rank": null,
+      "held_by_bytes": null
     },
     {
       "type": "app.session.Session",
@@ -208,9 +213,15 @@
       "shallow_bytes": 22400000,
       "retained_bytes": 434490368,
       "type_location": null,
-      "type_location_reason": null
+      "type_location_reason": null,
+      "unreachable_count": 0,
+      "unreachable_bytes": 0,
+      "held_by": null,
+      "held_by_rank": null,
+      "held_by_bytes": null
     }
   ],
+  "types_by_size": [],
   "notes": [
     {
       "code": "untracked_objects",

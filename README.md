@@ -40,14 +40,15 @@ sudo heapspy analyze --pid 1234             # one readable report, right now
 sudo heapspy watch --pid 1234 --every 30s   # is it growing, and what?
 ```
 
-`top` splits the process's memory into Python objects, native memory in use,
-leaked native blocks (nothing points to them), free memory malloc keeps, and
-code/files/stacks, with a growth rate for each, and lists what holds it,
-Python and native together. Memory totals and thread stacks refresh every
-second without stopping the process; the split and the holders come from a
+`top` is about what is in memory: one row per kind of object (Python types,
+and native malloc blocks in use and leaked) with how many there are, how
+big they are, how fast they grow, and which holder keeps most of them
+alive. Other tabs list the holders, native memory, threads and, with `a`
+or `--alloc`, which code allocated what is still alive. Where the memory
+sits is one bar at the top. Memory totals and thread stacks refresh every
+second without stopping the process; the object tables come from a
 snapshot taken every `--every` (10 s by default), which stops the process
-briefly unless `--no-stop`. `a` (or `--alloc`) samples allocations so the
-Allocated tab can say which code allocated what is still alive.
+briefly unless `--no-stop`.
 
 ![heapspy top on a process with a growing cache, a buffer list and a native leak](docs/images/top.png)
 
@@ -87,21 +88,23 @@ heapspy dump --pid 1234 --capture-contents --max-str 128 -o app.hpy
 heapspy analyze app.hpy
 ```
 
-Example output (abridged; the full report also lists the biggest types, leaked native blocks by size and allocator free space):
+Example output (abridged; the full report also lists leaked native blocks by size and allocator free space):
 
 ```
-Where the 1.91 GiB of resident memory is
-  ■ Python objects       448.0 MiB  23%   pymalloc 82.0 MiB · larger objects from malloc 366.0 MiB
-  ■ Native, in use       905.0 MiB  46%   malloc'd blocks something still points to
-  ■ Native, leaked       118.0 MiB   6%   malloc'd blocks nothing points to
-  ■ Allocator free       298.0 MiB  15%   freed by C code, kept by malloc in 16 arenas, not returned to the OS
-  ■ Code, files, stacks  118.0 MiB   6%   libraries 74.0 MiB · mapped files 38.0 MiB · thread stacks 6.0 MiB
+Memory 65.0 MiB resident
+  · Python objects 25.7 MiB 39%   · Native, in use 23.9 MiB 37%   · Native, leaked 4.6 MiB 7%
 
-What is holding memory                                     retained    python    native   share
- 1  sys.modules['app.features'].__dict__['EMBEDDINGS']    614.3 MiB   2.1 MiB 612.2 MiB   44.1%
-      builtins.list · 825 objects
- 2  sys.modules['app.cache'].__dict__['CACHE']            412.6 MiB 412.6 MiB         0   29.6%
-      builtins.dict · 301236 objects
+What the memory is                       count       size      each  keeps alive   mostly held by
+  native malloc blocks, in use            1483   23.5 MiB  16.2 KiB     23.5 MiB   app.native.BUFFERS 100%
+  bytes                                  11664   18.7 MiB   1.6 KiB     18.7 MiB   app.cache.CACHE 99%
+  native malloc blocks, leaked            1272    4.6 MiB   3.7 KiB      4.6 MiB   nothing: leaked
+  app.cache.Session                       9340  875.6 KiB      96 B     20.1 MiB   app.cache.CACHE 100%
+
+Who holds it                                                    retained    python    native   share
+ 1  app.native.BUFFERS                                          23.5 MiB  14.9 KiB  23.4 MiB   47.3%
+      list · 751 objects · holds native malloc blocks, in use 23.5 MiB
+ 2  app.cache.CACHE                                             20.8 MiB  20.8 MiB         0   42.0%
+      dict · 46534 objects · holds bytes 18.7 MiB, str 1.0 MiB, app.cache.Session 875.6 KiB
 ```
 
 ### Drill into a type or object

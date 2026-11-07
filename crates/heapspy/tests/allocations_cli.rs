@@ -369,7 +369,7 @@ fn matching_allocations_are_accepted() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout);
     println!("{text}");
-    assert!(text.contains("What is holding memory"));
+    assert!(text.contains("Who holds it"));
     assert!(
         text.contains("Allocated by (sampled while recording)"),
         "{text}"

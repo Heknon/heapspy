@@ -129,9 +129,9 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
                 KeyCode::Home | KeyCode::Char('g') => app.selected[ti] = 0,
                 KeyCode::Char('s') => {
                     app.sort[ti] = match (app.tab, app.sort[ti]) {
-                        (Tab::Types, Sort::Growth) => Sort::Size,
-                        (Tab::Types, Sort::Size) => Sort::Count,
-                        (Tab::Types, _) => Sort::Growth,
+                        (Tab::Objects, Sort::Size) => Sort::Growth,
+                        (Tab::Objects, Sort::Growth) => Sort::Count,
+                        (Tab::Objects, _) => Sort::Size,
                         (Tab::Holders, Sort::Size) => Sort::Growth,
                         (Tab::Holders, _) => Sort::Size,
                         (_, s) => s,
@@ -254,7 +254,7 @@ fn on_msg(
 fn rows(app: &App) -> usize {
     match app.tab {
         Tab::Holders => ui::holder_rows(app).len(),
-        Tab::Types => ui::type_rows(app).len(),
+        Tab::Objects => ui::object_rows(app).len(),
         Tab::Native => ui::native_rows(app).len(),
         Tab::Threads => app.threads.len(),
         Tab::Allocated => app
@@ -293,41 +293,51 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
                 ui::native_rows(app)
             };
             let Some((site, r)) = rows.get(i) else { return };
-            (site.clone(), Some(Ok(holder_detail(app, site, *r))))
-        }
-        Tab::Types => {
-            let rows = ui::type_rows(app);
-            let Some((name, ..)) = rows.get(i) else {
-                return;
+            let title = if r.is_some() {
+                heapspy_analyzer::render::summary::holder_name(site)
+            } else {
+                site.clone()
             };
-            let Some(s) = &app.latest else { return };
-            // query --type on the latest snapshot, off the UI thread.
-            let (path, name2, tx) = (s.path.clone(), name.clone(), tx.clone());
-            std::thread::spawn(move || {
-                let lines = (|| -> anyhow::Result<Vec<String>> {
-                    let snap = crate::cmd::open_snapshot(&path)?;
-                    let r = heapspy_analyzer::query_type(
-                        &snap,
-                        "latest snapshot",
-                        &name2,
-                        &QueryOptions {
-                            top: 15,
-                            max_paths: 1,
-                        },
-                    )?;
-                    Ok(heapspy_analyzer::render::type_query(&r)?
-                        .lines()
-                        .map(|l| match l {
-                            "Largest instances" | "Held by" => format!("# {l}"),
-                            l if l.starts_with("note:") => format!("~ {l}"),
-                            l => l.to_string(),
-                        })
-                        .collect())
-                })()
-                .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Msg::Detail { id, lines });
-            });
-            (name.clone(), None)
+            (title, Some(Ok(holder_detail(app, site, *r))))
+        }
+        Tab::Objects => {
+            let rows = ui::object_rows(app);
+            let Some(w) = rows.get(i) else { return };
+            if w.leaked {
+                (
+                    w.label.clone(),
+                    Some(Ok(holder_detail(app, ui::LEAKED_SITE, None))),
+                )
+            } else {
+                let Some(s) = &app.latest else { return };
+                // query --type on the latest snapshot, off the UI thread.
+                let (path, name2, tx) = (s.path.clone(), w.type_name.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    let lines = (|| -> anyhow::Result<Vec<String>> {
+                        let snap = crate::cmd::open_snapshot(&path)?;
+                        let r = heapspy_analyzer::query_type(
+                            &snap,
+                            "latest snapshot",
+                            &name2,
+                            &QueryOptions {
+                                top: 15,
+                                max_paths: 1,
+                            },
+                        )?;
+                        Ok(heapspy_analyzer::render::type_query(&r)?
+                            .lines()
+                            .map(|l| match l {
+                                "Largest instances" | "Held by" => format!("# {l}"),
+                                l if l.starts_with("note:") => format!("~ {l}"),
+                                l => readable_paths(l),
+                            })
+                            .collect())
+                    })()
+                    .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::Detail { id, lines });
+                });
+                (w.label.clone(), None)
+            }
         }
         Tab::Threads => {
             let Some(t) = app.threads.get(i) else { return };
@@ -514,4 +524,19 @@ fn short_location(f: &heapspy_analyzer::report::StackFrame) -> String {
         Some(l) => format!("{file}:{l}"),
         None => file,
     }
+}
+
+/// `l` with each `sys.modules[...]` path in it written the way code names
+/// it (see `holder_name`).
+fn readable_paths(l: &str) -> String {
+    let Some(i) = l.find("sys.modules[") else {
+        return l.to_string();
+    };
+    let end = l[i..].find(' ').map_or(l.len(), |j| i + j);
+    format!(
+        "{}{}{}",
+        &l[..i],
+        heapspy_analyzer::render::summary::holder_name(&l[i..end]),
+        &l[end..]
+    )
 }

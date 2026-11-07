@@ -2,6 +2,8 @@
 
 use heapspy_analyzer::render::format_bytes;
 use heapspy_analyzer::render::style::shorten;
+use heapspy_analyzer::render::summary::{holder_name, what_rows, WhatRow};
+use heapspy_analyzer::render::Paint;
 use heapspy_analyzer::report::Retainer;
 use heapspy_analyzer::root_path_string;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -13,16 +15,13 @@ use ratatui::Frame;
 use super::state::{sparkline, AllocState, App, Sort, Tab};
 use crate::live::thread_label;
 
-pub const LEAKED_SITE: &str = "(leaked) native blocks nothing points to";
+pub const LEAKED_SITE: &str = "(leaked native blocks)";
 
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 fn bold() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
-}
-fn bar_style() -> Style {
-    Style::default().bg(Color::Rgb(48, 54, 61)).fg(Color::White)
 }
 
 pub fn group_color(key: &str) -> Color {
@@ -75,8 +74,7 @@ fn spark_span(v: &[u64], growing: bool) -> Span<'static> {
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-    let groups = app.groups();
-    let mem_h = (groups.len().max(1) + 2) as u16;
+    let mem_h = 3u16;
     let [header, mem, tabs, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(mem_h),
@@ -89,8 +87,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_memory(f, app, mem);
     draw_tabs(f, app, tabs);
     match app.tab {
+        Tab::Objects => draw_objects(f, app, body),
         Tab::Holders => draw_holders(f, app, body),
-        Tab::Types => draw_types(f, app, body),
         Tab::Native => draw_native(f, app, body),
         Tab::Threads => draw_threads(f, app, body),
         Tab::Allocated => draw_allocated(f, app, body),
@@ -138,27 +136,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_memory(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    // Title line: RSS live, snapshot status on the right.
+    // Line 1: RSS live, and how old the split below is.
     let rss = app
         .mem
-        .map(|m| format_bytes(m.rss))
-        .unwrap_or_else(|| "?".into());
+        .map(|m| m.rss)
+        .or_else(|| app.latest.as_ref().and_then(|s| s.report.memory.rss_bytes))
+        .map_or_else(|| "?".into(), format_bytes);
     let mut left = vec![
-        Span::styled(" MEMORY  ", bold()),
-        Span::raw("RSS "),
+        Span::styled(" RSS ", bold()),
         Span::styled(rss, bold()),
         Span::raw("  "),
         rate_span(app.rss_rate(), app.mem.map_or(0, |m| m.rss)),
         Span::styled("/min  ", dim()),
         Span::styled(
-            sparkline(&app.rss_series(24)),
+            sparkline(&app.rss_series(30)),
             Style::default().fg(Color::Blue),
         ),
     ];
     let snap_text = if app.snapshot_running {
         "snapshot in progress…".to_string()
     } else if let Some(e) = &app.snapshot_error {
-        format!("snapshot failed: {}", shorten(e, 50))
+        format!("snapshot failed: {}", shorten(e, 60))
     } else if let Some(s) = &app.latest {
         let how = match s.pause {
             Some(p) => format!("stopped {} ms", p.as_millis()),
@@ -169,10 +167,9 @@ fn draw_memory(f: &mut Frame, app: &App, area: Rect) {
         let next = if app.paused {
             "paused".to_string()
         } else {
-            let left = app.every.as_secs().saturating_sub(age);
-            format!("next in {left}s")
+            format!("next in {}s", app.every.as_secs().saturating_sub(age))
         };
-        format!("split from snapshot {age}s ago, {how} · {next}")
+        format!("snapshot {age}s ago, {how} · {next}")
     } else {
         "taking the first snapshot…".to_string()
     };
@@ -180,61 +177,73 @@ fn draw_memory(f: &mut Frame, app: &App, area: Rect) {
     let pad = (area.width as usize).saturating_sub(used + snap_text.chars().count() + 1);
     left.push(Span::raw(" ".repeat(pad)));
     left.push(Span::styled(snap_text, dim()));
-    lines.push(Line::from(left).style(bar_style()));
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{:<26}{:>10}{:>7}   {:<18}{:>12}",
-            "", "NOW", "SHARE", "HISTORY", "Δ/min"
-        ),
-        dim(),
-    )]));
-    let groups = app.groups();
-    let total: u64 = groups.iter().map(|g| g.bytes).sum();
-    for g in &groups {
-        let key = g.key;
-        let r = app.rate(|p| p.groups.get(key).copied());
-        let series = app.series(18, |p| p.groups.get(key).copied());
-        let growing = r.is_some_and(|x| x > (total as f64) * 0.0005);
-        let share = if total > 0 {
-            g.bytes as f64 * 100.0 / total as f64
-        } else {
-            0.0
-        };
-        let mut spans = vec![
-            Span::styled(" ■ ", Style::default().fg(group_color(key))),
-            Span::raw(format!("{:<22}", g.label)),
-            Span::styled(format!("{:>11}", format_bytes(g.bytes)), bold()),
-            Span::raw(format!("{:>6.0}%   ", share)),
-            spark_span(&series, growing),
-            Span::raw(" ".repeat(19usize.saturating_sub(series.len()))),
-            Span::raw(format!("{:>12}", "")),
-        ];
-        // Replace the rate placeholder with the colored rate, right-aligned.
-        spans.pop();
-        let rs = rate_span(r, total);
-        let w = rs.content.chars().count();
-        spans.push(Span::raw(" ".repeat(12usize.saturating_sub(w))));
-        spans.push(rs);
-        if key == "leaked" && growing {
-            spans.push(Span::styled(
-                "   ◀ growing, nothing points to it",
-                Style::default().fg(Color::LightRed),
-            ));
-        } else if key == "free" && g.bytes > total / 10 {
-            spans.push(Span::styled(
-                "   fragmentation? see Native tab",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    if groups.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "   waiting for the first snapshot (the process may stop briefly while it is taken)",
+    lines.push(Line::from(left));
+
+    // Line 2: one bar of what kinds of memory, and the legend.
+    let all = app.groups();
+    let total: u64 = all.iter().map(|g| g.bytes).sum();
+    let groups: Vec<_> = all
+        .iter()
+        .filter(|g| g.bytes > 0 && (g.key == "leaked" || g.bytes * 200 >= total))
+        .collect();
+    let mut spans = vec![Span::raw(" ")];
+    if total == 0 {
+        spans.push(Span::styled(
+            "waiting for the first snapshot (the process may stop briefly while it is taken)",
             dim(),
-        )));
+        ));
+    } else {
+        let width = 24usize;
+        let (mut cells, mut cum) = (0usize, 0u64);
+        for g in &groups {
+            cum += g.bytes;
+            let end = (cum as f64 / total as f64 * width as f64).round() as usize;
+            spans.push(Span::styled(
+                "█".repeat(end.saturating_sub(cells)),
+                Style::default().fg(group_color(g.key)),
+            ));
+            cells = end.max(cells);
+        }
+        spans.push(Span::raw("  "));
+        for g in &groups {
+            let key = g.key;
+            let r = app.rate(|p| p.groups.get(key).copied());
+            spans.push(Span::styled("■ ", Style::default().fg(group_color(key))));
+            spans.push(Span::raw(format!("{} ", short_group(key))));
+            spans.push(Span::styled(compact(g.bytes), bold()));
+            if r.is_some_and(|x| x > total as f64 * 0.002) {
+                spans.push(Span::styled(
+                    format!(" ▲{}/m", compact(r.unwrap_or(0.0) as u64)),
+                    Style::default().fg(Color::LightRed),
+                ));
+            }
+            spans.push(Span::raw("  "));
+        }
     }
-    f.render_widget(Paragraph::new(lines), area);
+    lines.push(Line::from(spans));
+    f.render_widget(Paragraph::new(lines).style(Style::default()), area);
+}
+
+/// `46.4M`, `512K`: sizes for the legend, where space is short.
+fn compact(b: u64) -> String {
+    let s = format_bytes(b);
+    s.replace(" KiB", "K")
+        .replace(" MiB", "M")
+        .replace(" GiB", "G")
+        .replace(" TiB", "T")
+}
+
+/// Short legend names for the memory bar.
+fn short_group(key: &str) -> &'static str {
+    match key {
+        "python" => "python",
+        "native" => "native",
+        "leaked" => "leaked",
+        "free" => "malloc free",
+        "pymalloc_free" => "pymalloc free",
+        "mapped" => "code/files",
+        _ => "other",
+    }
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -335,11 +344,12 @@ pub fn holder_rate(app: &App, site: &str) -> Option<f64> {
 
 fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
     let rows_data = holder_rows(app);
-    let hot = app.hot_frames(1);
+    let what = app
+        .latest
+        .as_ref()
+        .map(|s| what_rows(&s.report))
+        .unwrap_or_default();
     let [tarea, foot] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
-    let site_w = (tarea.width as usize)
-        .saturating_sub(10 + 10 + 10 + 11 + 14 + 6)
-        .max(20);
     let rows: Vec<Row> = rows_data
         .iter()
         .map(|(site, r)| {
@@ -359,11 +369,21 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
             let py = ret - nat;
             let rate = holder_rate(app, site);
             let growing = rate.is_some_and(|x| x > 1024.0);
-            let series = app.series(12, holder_value(site));
+            let series = app.series(10, holder_value(site));
             let name = if r.is_none() {
-                Span::styled(shorten(site, site_w), Style::default().fg(Color::LightRed))
+                Span::styled(site.clone(), Style::default().fg(Color::LightRed))
             } else {
-                Span::raw(shorten(site, site_w))
+                Span::raw(holder_name(site))
+            };
+            let holds = match r {
+                Some(r) => what
+                    .iter()
+                    .filter(|w| w.held_by_rank == Some(r.rank))
+                    .take(2)
+                    .map(|w| format!("{} {}", w.label, format_bytes(w.bytes)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => "malloc blocks nothing points to".into(),
             };
             let cell_bytes = |b: u64, c: Color| {
                 if b == 0 {
@@ -374,31 +394,134 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
             };
             Row::new(vec![
                 Line::from(name),
-                Line::from(format_bytes(ret)).right_aligned(),
+                Line::from(Span::styled(format_bytes(ret), bold())).right_aligned(),
                 Line::from(cell_bytes(py, Color::Cyan)).right_aligned(),
                 Line::from(cell_bytes(nat, Color::Magenta)).right_aligned(),
                 Line::from(rate_span(rate, ret.max(1))).right_aligned(),
                 Line::from(spark_span(&series, growing)),
+                Line::from(Span::styled(holds, dim())),
             ])
         })
         .collect();
     table(
         f,
         tarea,
-        vec!["HOLDER", "RETAINED", "PYTHON", "NATIVE", "Δ/min", "  TREND"],
         vec![
-            Constraint::Min(20),
+            "HOLDER", "RETAINED", "PYTHON", "NATIVE", "Δ/min", " TREND", "HOLDS",
+        ],
+        vec![
+            Constraint::Percentage(34),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(11),
-            Constraint::Length(14),
+            Constraint::Length(11),
+            Constraint::Min(16),
         ],
         rows,
         app.selected[Tab::Holders.index()],
     );
-    // What the threads were doing: a lead for whatever is growing.
-    let (frames, of) = hot;
+    hot_line(f, app, foot);
+}
+
+/// Object rows (what the memory is) in display order.
+pub fn object_rows(app: &App) -> Vec<WhatRow> {
+    let Some(s) = &app.latest else {
+        return Vec::new();
+    };
+    let mut v = what_rows(&s.report);
+    let rate = |k: &str| {
+        app.rate(|p| p.types.get(k).map(|x| x.1))
+            .unwrap_or(f64::MIN)
+    };
+    match app.sort[Tab::Objects.index()] {
+        Sort::Growth => v.sort_by(|a, b| {
+            rate(&b.key)
+                .total_cmp(&rate(&a.key))
+                .then(b.bytes.cmp(&a.bytes))
+        }),
+        Sort::Count => v.sort_by_key(|b| std::cmp::Reverse(b.count)),
+        Sort::Size => v.sort_by_key(|b| std::cmp::Reverse(b.bytes)),
+    }
+    v
+}
+
+fn paint_color(p: Paint) -> Style {
+    match p {
+        Paint::Native => Style::default().fg(Color::Magenta),
+        Paint::Leaked => Style::default().fg(Color::LightRed),
+        Paint::Type => Style::default().fg(Color::LightCyan),
+        _ => Style::default(),
+    }
+}
+
+fn draw_objects(f: &mut Frame, app: &App, area: Rect) {
+    let [tarea, foot] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
+    let name_w = 30usize;
+    let rows: Vec<Row> = object_rows(app)
+        .into_iter()
+        .map(|w| {
+            let k = w.key.clone();
+            let rc = app.rate(|p| p.types.get(&k).map(|x| x.0));
+            let rb = app.rate(|p| p.types.get(&k).map(|x| x.1));
+            let series = app.series(10, |p| p.types.get(&k).map(|x| x.1));
+            let growing = rb.is_some_and(|x| x > 1024.0);
+            let held = if w.leaked {
+                Span::styled("nothing: leaked", Style::default().fg(Color::LightRed))
+            } else {
+                match &w.held_by {
+                    Some(h) => Span::raw(format!("{} {:.0}%", h, w.held_pct)),
+                    None => Span::styled("various", dim()),
+                }
+            };
+            Row::new(vec![
+                Line::from(Span::styled(
+                    shorten(&w.label, name_w),
+                    paint_color(w.paint),
+                )),
+                Line::from(w.count.to_string()).right_aligned(),
+                Line::from(count_rate_span(rc)).right_aligned(),
+                Line::from(Span::styled(format_bytes(w.bytes), bold())).right_aligned(),
+                Line::from(rate_span(rb, w.bytes.max(1))).right_aligned(),
+                Line::from(Span::styled(format_bytes(w.bytes / w.count.max(1)), dim()))
+                    .right_aligned(),
+                Line::from(spark_span(&series, growing)),
+                Line::from(held),
+            ])
+        })
+        .collect();
+    table(
+        f,
+        tarea,
+        vec![
+            "WHAT",
+            "COUNT",
+            "Δ/min",
+            "SIZE",
+            "Δ/min",
+            "EACH",
+            " TREND",
+            "MOSTLY HELD BY",
+        ],
+        vec![
+            Constraint::Length(name_w as u16),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Min(20),
+        ],
+        rows,
+        app.selected[Tab::Objects.index()],
+    );
+    hot_line(f, app, foot);
+}
+
+/// The line seen most often on thread stacks: a lead for whatever grows.
+fn hot_line(f: &mut Frame, app: &App, area: Rect) {
+    let (frames, of) = app.hot_frames(1);
     let line = match frames.first() {
         Some((frame, n)) if of > 0 => Line::from(vec![
             Span::styled(" most frequent line on thread stacks (10 min): ", dim()),
@@ -407,86 +530,7 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
         ]),
         _ => Line::from(Span::styled(" no Python frames sampled yet", dim())),
     };
-    f.render_widget(Paragraph::new(vec![Line::raw(""), line]), foot);
-}
-
-/// Type rows in display order: `(name, count, shallow, retained)`.
-pub fn type_rows(app: &App) -> Vec<(String, u64, u64, u64)> {
-    let Some(s) = &app.latest else {
-        return Vec::new();
-    };
-    let mut v: Vec<(String, u64, u64, u64)> = s
-        .report
-        .type_histogram
-        .iter()
-        .map(|t| {
-            (
-                t.type_name.clone(),
-                t.count,
-                t.shallow_bytes,
-                t.retained_bytes,
-            )
-        })
-        .collect();
-    match app.sort[Tab::Types.index()] {
-        Sort::Growth => {
-            let rate = |n: &str| {
-                app.rate(|p| p.types.get(n).map(|x| x.1))
-                    .unwrap_or(f64::MIN)
-            };
-            v.sort_by(|a, b| rate(&b.0).total_cmp(&rate(&a.0)).then(b.2.cmp(&a.2)));
-        }
-        Sort::Count => v.sort_by_key(|b| std::cmp::Reverse(b.1)),
-        Sort::Size => v.sort_by_key(|b| std::cmp::Reverse(b.2)),
-    }
-    v
-}
-
-fn draw_types(f: &mut Frame, app: &App, area: Rect) {
-    let rows: Vec<Row> = type_rows(app)
-        .into_iter()
-        .map(|(name, count, shallow, retained)| {
-            let n = name.clone();
-            let rc = app.rate(|p| p.types.get(&n).map(|x| x.0));
-            let rb = app.rate(|p| p.types.get(&n).map(|x| x.1));
-            let series = app.series(12, |p| p.types.get(&n).map(|x| x.1));
-            let growing = rb.is_some_and(|x| x > 1024.0);
-            let style = if name.starts_with("native.") {
-                Style::default().fg(Color::Magenta)
-            } else if name.starts_with("builtins.") {
-                Style::default()
-            } else {
-                Style::default().fg(Color::LightMagenta)
-            };
-            Row::new(vec![
-                Line::from(Span::styled(name, style)),
-                Line::from(count.to_string()).right_aligned(),
-                Line::from(count_rate_span(rc)).right_aligned(),
-                Line::from(format_bytes(shallow)).right_aligned(),
-                Line::from(rate_span(rb, shallow.max(1))).right_aligned(),
-                Line::from(format_bytes(retained)).right_aligned(),
-                Line::from(spark_span(&series, growing)),
-            ])
-        })
-        .collect();
-    table(
-        f,
-        area,
-        vec![
-            "TYPE", "COUNT", "Δ/min", "SHALLOW", "Δ/min", "RETAINED", "  TREND",
-        ],
-        vec![
-            Constraint::Min(24),
-            Constraint::Length(10),
-            Constraint::Length(9),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(14),
-        ],
-        rows,
-        app.selected[Tab::Types.index()],
-    );
+    f.render_widget(Paragraph::new(vec![Line::raw(""), line]), area);
 }
 
 /// Holders that retain native memory, most native first.
@@ -584,7 +628,7 @@ fn draw_native(f: &mut Frame, app: &App, area: Rect) {
             let rate = holder_rate(app, &site);
             let series = app.series(12, holder_value(&site));
             Row::new(vec![
-                Line::from(shorten(&site, 70)),
+                Line::from(shorten(&holder_name(&site), 70)),
                 Line::from(Span::styled(
                     format_bytes(nat),
                     Style::default().fg(Color::Magenta),
@@ -907,15 +951,15 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let r = popup(area, 78, 24);
     f.render_widget(Clear, r);
     let lines = vec![
-        Line::from(Span::styled("Memory panel", bold())),
-        Line::raw("  RSS refreshes every second. The split refreshes with each snapshot:"),
-        Line::raw("  Python objects, native memory in use, leaked native blocks (nothing"),
-        Line::raw("  points to them), free memory malloc keeps, other private memory,"),
-        Line::raw("  pymalloc's free space, and code/files/stacks."),
+        Line::from(Span::styled("Top lines", bold())),
+        Line::raw("  RSS refreshes every second. The bar below it (Python, native,"),
+        Line::raw("  leaked, malloc free, code/files) refreshes with each snapshot;"),
+        Line::raw("  ▲ marks kinds of memory that grow."),
         Line::raw(""),
         Line::from(Span::styled("Tabs", bold())),
-        Line::raw("  1 Holders    objects (and the leaked pseudo-row) by retained bytes"),
-        Line::raw("  2 Types      instances per type; Δ/min over the last 10 minutes"),
+        Line::raw("  1 Objects    what the memory is: per type, native blocks in use and"),
+        Line::raw("               leaked; count, size, growth, who holds most of them"),
+        Line::raw("  2 Holders    who keeps memory alive, Python and native, and what"),
         Line::raw("  3 Native     who holds native memory, malloc arenas and free space"),
         Line::raw("  4 Threads    what each thread runs now, and its most frequent lines"),
         Line::raw("  5 Allocated  with allocation sampling: who allocated what is alive"),

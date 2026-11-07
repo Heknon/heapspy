@@ -273,6 +273,52 @@ fn lost_by_size(a: &Analysis, top: usize) -> Vec<SizeGroup> {
     v
 }
 
+/// Fill `held_by` of each type row: the listed retainer whose dominator
+/// subtree holds the most of the type's shallow bytes. One pass over the
+/// dominator tree in preorder gives every node its listed ancestor.
+fn held_by(a: &Analysis, nodes: &[u32], retainers: &[Retainer], rows: &mut [report::TypeRow]) {
+    if nodes.is_empty() || rows.is_empty() {
+        return;
+    }
+    let n = a.root() as usize;
+    let mut holder = vec![u32::MAX; n + 1];
+    for (k, &v) in nodes.iter().enumerate() {
+        holder[v as usize] = k as u32;
+    }
+    for &v in &a.order[1..] {
+        if holder[v as usize] == u32::MAX {
+            let p = a.idom[v as usize];
+            if p != dominators::NONE {
+                holder[v as usize] = holder[p as usize];
+            }
+        }
+    }
+    let groups: std::collections::HashMap<u32, usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| a.types.find(&r.type_name).map(|g| (g, i)))
+        .collect();
+    let mut bytes = vec![vec![0u64; nodes.len()]; rows.len()];
+    for v in 0..n as u32 {
+        let h = holder[v as usize];
+        if h == u32::MAX {
+            continue;
+        }
+        if let Some(&i) = groups.get(&a.group(v)) {
+            bytes[i][h as usize] += a.snap.object(v).shallow_size;
+        }
+    }
+    for (row, b) in rows.iter_mut().zip(bytes) {
+        if let Some((k, &best)) = b.iter().enumerate().max_by_key(|(_, &x)| x) {
+            if best > 0 {
+                row.held_by = Some(root_path_string(&retainers[k].path));
+                row.held_by_rank = Some(retainers[k].rank);
+                row.held_by_bytes = Some(best);
+            }
+        }
+    }
+}
+
 /// Per node, the bytes of native heap blocks in its dominator subtree.
 pub(crate) fn native_retained(a: &Analysis) -> Vec<u64> {
     let n = a.root() as usize;
@@ -461,20 +507,32 @@ pub(crate) fn analyze_with(
         });
     }
 
-    let mut type_histogram = a.type_rows();
+    let all_types = a.type_rows();
+    let mut type_histogram = all_types.clone();
     type_histogram.sort_by(|x, y| {
         (y.retained_bytes, y.shallow_bytes)
             .cmp(&(x.retained_bytes, x.shallow_bytes))
             .then_with(|| x.type_name.cmp(&y.type_name))
     });
     type_histogram.truncate(opts.top);
-    for row in &mut type_histogram {
+    // What the memory is: types by their own bytes, unreachable ones (leaked
+    // native blocks) included.
+    let mut types_by_size = all_types;
+    types_by_size.sort_by(|x, y| {
+        y.shallow_bytes
+            .cmp(&x.shallow_bytes)
+            .then_with(|| x.type_name.cmp(&y.type_name))
+    });
+    types_by_size.truncate(opts.top);
+    for row in type_histogram.iter_mut().chain(types_by_size.iter_mut()) {
         let g = a
             .types
             .find(&row.type_name)
             .expect("row from the type table");
         (row.type_location, row.type_location_reason) = a.group_location(g)?;
     }
+    held_by(a, &nodes, &top_retainers, &mut type_histogram);
+    held_by(a, &nodes, &top_retainers, &mut types_by_size);
 
     let mut notes = vec![notes::untracked_objects()];
     if let (Some(rss), Some(out)) = (memory.rss_bytes, memory.outside_graph_bytes) {
@@ -504,6 +562,7 @@ pub(crate) fn analyze_with(
         memory,
         top_retainers,
         type_histogram,
+        types_by_size,
         notes,
         allocations: None,
     };

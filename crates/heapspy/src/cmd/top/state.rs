@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use heapspy_analyzer::render::summary::{memory_groups, MemoryGroup};
+use heapspy_analyzer::render::summary::{memory_groups, what_rows, MemoryGroup};
 use heapspy_analyzer::root_path_string;
 
 use super::workers::Snap;
@@ -19,8 +19,8 @@ const MAX_SECONDS: usize = 1800;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
+    Objects,
     Holders,
-    Types,
     Native,
     Threads,
     Allocated,
@@ -28,8 +28,8 @@ pub enum Tab {
 
 impl Tab {
     pub const ALL: [Tab; 5] = [
+        Tab::Objects,
         Tab::Holders,
-        Tab::Types,
         Tab::Native,
         Tab::Threads,
         Tab::Allocated,
@@ -39,8 +39,8 @@ impl Tab {
     }
     pub fn title(self) -> &'static str {
         match self {
+            Tab::Objects => "Objects",
             Tab::Holders => "Holders",
-            Tab::Types => "Types",
             Tab::Native => "Native",
             Tab::Threads => "Threads",
             Tab::Allocated => "Allocated",
@@ -73,7 +73,7 @@ pub struct SnapPoint {
     pub groups: HashMap<&'static str, u64>,
     /// Holder site → retained bytes.
     pub holders: HashMap<String, u64>,
-    /// Type → (count, shallow bytes).
+    /// Object row key (type, or `leaked:<type>`) → (count, bytes).
     pub types: HashMap<String, (u64, u64)>,
     pub leaked: u64,
 }
@@ -149,9 +149,9 @@ impl App {
             every,
             no_stop,
             started: Instant::now(),
-            tab: Tab::Holders,
+            tab: Tab::Objects,
             selected: [0; 5],
-            sort: [Sort::Size, Sort::Growth, Sort::Size, Sort::Size, Sort::Size],
+            sort: [Sort::Size; 5],
             paused: false,
             show_help: false,
             detail: None,
@@ -217,9 +217,8 @@ impl App {
             p.holders
                 .insert(root_path_string(&x.path), x.retained_bytes);
         }
-        for t in &r.type_histogram {
-            p.types
-                .insert(t.type_name.clone(), (t.count, t.shallow_bytes));
+        for w in what_rows(r) {
+            p.types.insert(w.key, (w.count, w.bytes));
         }
         self.history.push_back(p);
         while self.history.len() > MAX_SNAPS {

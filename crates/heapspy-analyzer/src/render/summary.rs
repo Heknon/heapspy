@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use super::style::{bar, pad_left, pad_right, shorten, Paint, Style};
+use super::style::{pad_left, pad_right, shorten, Paint, Style};
 use super::{allocated_at_lines, allocations_section, format_bytes, notes};
 use crate::report::{AnalyzeReport, MemoryTotals, Note};
 use crate::{root_path_string, Result};
@@ -127,6 +127,131 @@ pub fn memory_groups(m: &MemoryTotals) -> Vec<MemoryGroup> {
     g
 }
 
+/// A root path as a reader names it: `sys.modules['app.cache'].__dict__['CACHE']`
+/// becomes `app.cache.CACHE`, and `.__dict__['x']` becomes `.x` wherever
+/// `x` is an identifier. Other paths are kept as they are.
+pub fn holder_name(path: &str) -> String {
+    let mut s = match path.strip_prefix("sys.modules['") {
+        Some(rest) => match rest.find("']") {
+            Some(i) => format!("{}{}", &rest[..i], &rest[i + 2..]),
+            None => path.to_string(),
+        },
+        None => path.to_string(),
+    };
+    while let Some(i) = s.find(".__dict__['") {
+        let tail = &s[i + 11..];
+        let Some(j) = tail.find("']") else { break };
+        let key = &tail[..j];
+        if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        s = format!("{}.{}{}", &s[..i], key, &tail[j + 2..]);
+    }
+    s
+}
+
+/// How a type is shown: friendly names for native heap blocks.
+pub fn display_type(name: &str) -> (String, Paint) {
+    match name {
+        "native.heap_block" => ("native malloc blocks".into(), Paint::Native),
+        "native.large_allocation" => ("native large allocations (mmap)".into(), Paint::Native),
+        "native.small_block_container" => ("native small-block containers".into(), Paint::Native),
+        n if n.starts_with("native.") => (n.to_string(), Paint::Native),
+        n if n.starts_with("builtins.") => {
+            (n.trim_start_matches("builtins.").to_string(), Paint::Strong)
+        }
+        n => (n.to_string(), Paint::Type),
+    }
+}
+
+/// One row of "what the memory is": a type, or the leaked part of a native
+/// type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhatRow {
+    /// Stable key: the type name, or `leaked:<type>`.
+    pub key: String,
+    /// The type name as in reports (for queries).
+    pub type_name: String,
+    pub label: String,
+    pub paint: Paint,
+    pub count: u64,
+    /// Shallow bytes: what these objects themselves take.
+    pub bytes: u64,
+    /// What they keep alive, themselves included.
+    pub retained: u64,
+    /// Root path of the holder of most of them, and the share it holds.
+    pub held_by: Option<String>,
+    /// Rank of that holder in `top_retainers`.
+    pub held_by_rank: Option<u32>,
+    pub held_pct: f64,
+    pub leaked: bool,
+    pub location: Option<String>,
+}
+
+/// What the memory is made of: one row per type, native blocks split into
+/// in use and leaked, largest first.
+pub fn what_rows(r: &AnalyzeReport) -> Vec<WhatRow> {
+    let mut out = Vec::new();
+    let src = if r.types_by_size.is_empty() {
+        &r.type_histogram
+    } else {
+        &r.types_by_size
+    };
+    for t in src {
+        let (label, paint) = display_type(&t.type_name);
+        let lost_n = t.unreachable_count.unwrap_or(0).min(t.count);
+        let lost_b = t.unreachable_bytes.unwrap_or(0).min(t.shallow_bytes);
+        let native = t.type_name.starts_with("native.");
+        let split = native && lost_n > 0;
+        let (count, bytes) = if split {
+            (t.count - lost_n, t.shallow_bytes - lost_b)
+        } else {
+            (t.count, t.shallow_bytes)
+        };
+        if count > 0 {
+            out.push(WhatRow {
+                key: t.type_name.clone(),
+                type_name: t.type_name.clone(),
+                label: if split {
+                    format!("{label}, in use")
+                } else {
+                    label.clone()
+                },
+                paint,
+                count,
+                bytes,
+                retained: t.retained_bytes,
+                held_by: t.held_by.as_deref().map(holder_name),
+                held_by_rank: t.held_by_rank,
+                held_pct: t
+                    .held_by_bytes
+                    .map_or(0.0, |b| b as f64 * 100.0 / bytes.max(1) as f64)
+                    .min(100.0),
+                leaked: false,
+                location: t.type_location.as_ref().map(|l| l.display()),
+            });
+        }
+        if split {
+            out.push(WhatRow {
+                key: format!("leaked:{}", t.type_name),
+                type_name: t.type_name.clone(),
+                label: format!("{label}, leaked"),
+                paint: Paint::Leaked,
+                count: lost_n,
+                bytes: lost_b,
+                retained: lost_b,
+                held_by: None,
+                held_by_rank: None,
+                held_pct: 0.0,
+                leaked: true,
+                location: None,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.key.cmp(&b.key)));
+    out
+}
+
 /// A share of `total` as ` 12%`.
 fn share(part: u64, total: u64) -> String {
     if total == 0 {
@@ -155,11 +280,11 @@ pub fn analyze(r: &AnalyzeReport, st: &Style) -> Result<String> {
     let _ = writeln!(out, "{}", st.paint(Paint::Dim, head));
 
     memory_section(&mut out, r, st, w);
+    what_section(&mut out, r, st, w);
     holders_section(&mut out, r, st, w);
     if let Some(a) = &r.allocations {
         allocations_section(&mut out, a);
     }
-    types_section(&mut out, r, st);
     leaked_section(&mut out, r, st);
     free_section(&mut out, r, st);
 
@@ -190,79 +315,134 @@ pub fn analyze(r: &AnalyzeReport, st: &Style) -> Result<String> {
 
 fn memory_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
     let m = &r.memory;
-    let groups = memory_groups(m);
-    let total: u64 = groups.iter().map(|g| g.bytes).sum();
+    let all = memory_groups(m);
+    let total: u64 = all.iter().map(|g| g.bytes).sum();
+    // Leave out slivers, but never the leaked row.
+    let groups: Vec<MemoryGroup> = all
+        .into_iter()
+        .filter(|g| g.bytes > 0 && (g.key == "leaked" || g.bytes * 200 >= total))
+        .collect();
     out.push('\n');
     if groups.is_empty() || total == 0 {
-        let _ = writeln!(out, "{}", st.paint(Paint::Heading, "Memory"));
         let _ = writeln!(
             out,
-            "  Python graph {}{}",
+            "{} Python graph {}{}",
+            st.paint(Paint::Heading, "Memory"),
             st.paint(Paint::Strong, format_bytes(m.graph_bytes)),
             match m.rss_bytes {
                 Some(rss) => format!(" of {} RSS", format_bytes(rss)),
-                None => " (process RSS was not recorded)".into(),
+                None => String::new(),
             }
         );
         return;
     }
-    let basis = m.breakdown_basis.as_deref().unwrap_or("committed");
-    let title = if basis == "resident" {
-        format!("Where the {} of resident memory is", format_bytes(total))
+    let what = if m.breakdown_basis.as_deref() == Some("resident") {
+        "resident"
     } else {
-        format!("Where the {} of committed memory is", format_bytes(total))
+        "committed"
     };
-    let _ = writeln!(out, "{}", st.paint(Paint::Heading, title));
+    // One bar, a color per kind of memory, then the legend.
+    let mut line = format!(
+        "{} {} {}  ",
+        st.paint(Paint::Heading, "Memory"),
+        st.paint(Paint::Strong, format_bytes(total)),
+        st.paint(Paint::Dim, what)
+    );
+    let width = 40usize.min(w.saturating_sub(30));
     if st.color {
-        // One stacked bar, a color per group.
-        let width = (w - 4).min(80);
-        let mut line = String::from("  ");
-        let mut used = 0usize;
-        let mut cum = 0u64;
+        let (mut used, mut cum) = (0usize, 0u64);
         for g in &groups {
             cum += g.bytes;
             let end = ((cum as f64 / total as f64) * width as f64).round() as usize;
-            let n = end.saturating_sub(used);
-            used += n;
-            line.push_str(&st.paint(g.paint, "█".repeat(n)));
+            line.push_str(&st.paint(g.paint, "█".repeat(end.saturating_sub(used))));
+            used = end.max(used);
         }
-        let _ = writeln!(out, "{line}");
     }
+    let _ = writeln!(out, "{line}");
+    let mut legend = String::from(" ");
+    let mut col = 1usize;
     for g in &groups {
-        if g.bytes == 0 && matches!(g.key, "free" | "other") {
-            continue;
-        }
-        let marker = if st.color {
-            st.paint(g.paint, "■")
+        let item = format!(
+            "{} {} {} {}",
+            if st.color {
+                "■".to_string()
+            } else {
+                "·".to_string()
+            },
+            g.label,
+            format_bytes(g.bytes),
+            st.paint(Paint::Dim, share(g.bytes, total))
+        );
+        let item = if st.color {
+            item.replacen('■', &st.paint(g.paint, "■"), 1)
         } else {
-            let (f, e) = bar(g.bytes as f64 / total as f64, 10);
-            format!("{f}{e}")
+            item
+        };
+        let wv = super::style::visible_width(&item) + 3;
+        if col + wv > w && col > 1 {
+            legend.push_str("\n ");
+            col = 1;
+        }
+        legend.push_str(&format!(" {item}  "));
+        col += wv;
+    }
+    let _ = writeln!(out, "{}", legend.trim_end());
+}
+
+fn what_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
+    let rows = what_rows(r);
+    if rows.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let name_w = 34usize;
+    let held_w = w.saturating_sub(2 + name_w + 10 + 11 + 10 + 13 + 3).max(24);
+    let _ = writeln!(
+        out,
+        "{}{}{}{}{}   {}",
+        pad_right(&st.paint(Paint::Heading, "What the memory is"), name_w + 2),
+        pad_left(&st.paint(Paint::Dim, "count"), 10),
+        pad_left(&st.paint(Paint::Dim, "size"), 11),
+        pad_left(&st.paint(Paint::Dim, "each"), 10),
+        pad_left(&st.paint(Paint::Dim, "keeps alive"), 13),
+        st.paint(Paint::Dim, "mostly held by")
+    );
+    let shown = rows.len().min(15);
+    for x in &rows[..shown] {
+        let name = st.paint(x.paint, shorten(&x.label, name_w));
+        let each = format_bytes(x.bytes / x.count.max(1));
+        let held = if x.leaked {
+            st.paint(Paint::Leaked, "nothing: leaked")
+        } else {
+            match &x.held_by {
+                Some(h) => format!(
+                    "{} {}",
+                    shorten(h, held_w.saturating_sub(6)),
+                    st.paint(Paint::Dim, format!("{:.0}%", x.held_pct))
+                ),
+                None => st.paint(Paint::Dim, "various"),
+            }
         };
         let _ = writeln!(
             out,
-            "  {} {}{}{}   {}",
-            marker,
-            pad_right(g.label, 20),
-            pad_left(&format_bytes(g.bytes), 10),
-            pad_left(&share(g.bytes, total), 5),
-            st.paint(Paint::Dim, &g.what)
+            "  {}{}{}{}{}   {}",
+            pad_right(&name, name_w),
+            pad_left(&x.count.to_string(), 10),
+            pad_left(&st.paint(Paint::Strong, format_bytes(x.bytes)), 11),
+            pad_left(&st.paint(Paint::Dim, each), 10),
+            pad_left(&format_bytes(x.retained), 13),
+            held
         );
     }
-    if let Some(rss) = m.rss_bytes {
-        if basis == "resident" && rss.abs_diff(total) > rss / 20 {
-            let _ = writeln!(
-                out,
-                "  {}",
-                st.paint(
-                    Paint::Dim,
-                    format!(
-                        "(RSS {}: the map's resident pages and RSS were read at slightly \
-                         different moments)",
-                        format_bytes(rss)
-                    )
-                )
-            );
-        }
+    if rows.len() > shown {
+        let _ = writeln!(
+            out,
+            "  {}",
+            st.paint(
+                Paint::Dim,
+                format!("… {} more types (--top N, --json)", rows.len() - shown)
+            )
+        );
     }
 }
 
@@ -273,10 +453,7 @@ fn holders_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
     let cols = if native { 3 } else { 1 };
     // rank + two spaces, the numbers, the share column.
     let path_w = w.saturating_sub(4 + cols * num_w + 8).max(30);
-    let mut head = pad_right(
-        &st.paint(Paint::Heading, "What is holding memory"),
-        path_w + 4,
-    );
+    let mut head = pad_right(&st.paint(Paint::Heading, "Who holds it"), path_w + 4);
     head.push_str(&pad_left(&st.paint(Paint::Dim, "retained"), num_w));
     if native {
         head.push_str(&pad_left(&st.paint(Paint::Python, "python"), num_w));
@@ -288,8 +465,9 @@ fn holders_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         let _ = writeln!(out, "  (nothing)");
         return;
     }
-    for (i, x) in r.top_retainers.iter().enumerate() {
-        let path = shorten(&root_path_string(&x.path), path_w);
+    let what = what_rows(r);
+    for (i, x) in r.top_retainers.iter().take(10).enumerate() {
+        let path = shorten(&holder_name(&root_path_string(&x.path)), path_w);
         let rank = format!("{:>2}", x.rank);
         let rank = if i < 3 {
             st.paint(Paint::Warn, rank)
@@ -324,57 +502,27 @@ fn holders_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         }
         line.push_str(&pad_left(&format!("{:.1}%", x.retained_pct), 8));
         let _ = writeln!(out, "{line}");
-        let mut sub = format!("{} · {} objects", x.type_name, x.retained_objects);
-        if let Some(l) = &x.type_location {
+        // What it holds: the types it is the main holder of.
+        let holds: Vec<String> = what
+            .iter()
+            .filter(|w| w.held_by_rank == Some(x.rank))
+            .take(3)
+            .map(|w| format!("{} {}", w.label, format_bytes(w.bytes)))
+            .collect();
+        let mut sub = format!(
+            "{} · {} objects",
+            display_type(&x.type_name).0,
+            x.retained_objects
+        );
+        if !holds.is_empty() {
+            let _ = write!(sub, " · holds {}", holds.join(", "));
+        } else if let Some(l) = &x.type_location {
             let _ = write!(sub, " · {}", l.display());
         }
         let _ = writeln!(out, "      {}", st.paint(Paint::Dim, sub));
         if let Some(at) = &x.allocated_at {
             out.push_str(&allocated_at_lines(at, "      "));
         }
-    }
-}
-
-fn types_section(out: &mut String, r: &AnalyzeReport, st: &Style) {
-    if r.type_histogram.is_empty() {
-        return;
-    }
-    out.push('\n');
-    let _ = writeln!(
-        out,
-        "{}{}{}{}",
-        pad_right(&st.paint(Paint::Heading, "Biggest types"), 40),
-        pad_left(&st.paint(Paint::Dim, "count"), 12),
-        pad_left(&st.paint(Paint::Dim, "shallow"), 12),
-        pad_left(&st.paint(Paint::Dim, "retained"), 12)
-    );
-    for x in r.type_histogram.iter().take(10) {
-        let name = shorten(&x.type_name, 36);
-        let name = if x.type_name.starts_with("native.") {
-            st.paint(Paint::Native, name)
-        } else if x.type_name.starts_with("builtins.") {
-            name
-        } else {
-            st.paint(Paint::Type, name)
-        };
-        let _ = writeln!(
-            out,
-            "  {}{}{}{}",
-            pad_right(&name, 38),
-            pad_left(&x.count.to_string(), 12),
-            pad_left(&format_bytes(x.shallow_bytes), 12),
-            pad_left(&format_bytes(x.retained_bytes), 12)
-        );
-    }
-    if r.type_histogram.len() > 10 {
-        let _ = writeln!(
-            out,
-            "  {}",
-            st.paint(
-                Paint::Dim,
-                format!("… {} more in --json", r.type_histogram.len() - 10)
-            )
-        );
     }
 }
 
@@ -492,4 +640,27 @@ fn free_section(out: &mut String, r: &AnalyzeReport, st: &Style) {
         st.paint(Paint::Dim, "in the environment, or a periodic"),
         st.paint(Paint::Command, "malloc_trim(0)")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holder_names_read_like_code() {
+        assert_eq!(
+            holder_name("sys.modules['app.cache'].__dict__['CACHE']"),
+            "app.cache.CACHE"
+        );
+        assert_eq!(
+            holder_name("sys.modules['app.events'].__dict__['REGISTRY'].listeners"),
+            "app.events.REGISTRY.listeners"
+        );
+        assert_eq!(
+            holder_name("sys.modules['m'].__dict__['D']['user:1']"),
+            "m.D['user:1']"
+        );
+        assert_eq!(holder_name("python3.13 globals"), "python3.13 globals");
+        assert_eq!(holder_name("x.__dict__['a b']"), "x.__dict__['a b']");
+    }
 }

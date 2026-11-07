@@ -436,7 +436,7 @@ fn run_live_commands(minor: u8) {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("What is holding memory"), "{text}");
+    assert!(text.contains("Who holds it"), "{text}");
     assert!(text.contains("Threads"), "{text}");
     assert!(keep.exists());
 

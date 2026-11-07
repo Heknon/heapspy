@@ -252,6 +252,11 @@ pub struct AnalyzeReport {
     pub top_retainers: Vec<Retainer>,
     /// Types by retained bytes, largest first. At most `--top`.
     pub type_histogram: Vec<TypeRow>,
+    /// Types by their own (shallow) bytes, largest first, unreachable
+    /// instances included: what the memory is made of. At most `--top`.
+    /// Added in 0.3; empty in older documents.
+    #[serde(default)]
+    pub types_by_size: Vec<TypeRow>,
     pub notes: Vec<Note>,
     /// What an allocation profile (`--allocations`) says about where the
     /// memory came from. `null` without `--allocations`.
@@ -435,6 +440,23 @@ pub struct TypeRow {
     /// Why `type_location` is `null`.
     #[serde(default)]
     pub type_location_reason: Option<String>,
+    /// Instances nothing reaches, and their shallow bytes. For native heap
+    /// blocks (`native.*`) these are leaked: nothing points to them. Added
+    /// in 0.3; `null` in older documents.
+    #[serde(default)]
+    pub unreachable_count: Option<u64>,
+    #[serde(default)]
+    pub unreachable_bytes: Option<u64>,
+    /// The entry of `top_retainers` (by its root path) whose dominator
+    /// subtree holds the most of this type's shallow bytes, and those bytes.
+    /// `null` when no listed retainer holds any instance. Added in 0.3.
+    #[serde(default)]
+    pub held_by: Option<String>,
+    /// `rank` of that entry in `top_retainers`.
+    #[serde(default)]
+    pub held_by_rank: Option<u32>,
+    #[serde(default)]
+    pub held_by_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------- allocations
