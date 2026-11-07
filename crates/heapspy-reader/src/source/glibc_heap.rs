@@ -4,12 +4,24 @@
 //! are not exported). [`super::elf_core`] and [`super::linux_live`] use it
 //! for [`MemorySource::native_blocks`].
 //!
-//! Modelled on glibc 2.31 to 2.39 for 64-bit little-endian targets (x86_64
+//! Modelled on glibc 2.31 to 2.43 for 64-bit little-endian targets (x86_64
 //! and aarch64, where `SIZE_SZ` is 8 and `MALLOC_ALIGNMENT` is 16). The
 //! layouts below are cited from `malloc/malloc.c` and `malloc/arena.c` of
-//! those releases. **It has been tested on synthetic images laid out like
-//! those versions, not yet on a real Linux process**; the ignored test
-//! `tests/native_heap_live.rs` (run by the e2e workflow) checks it there.
+//! those releases. Tested on synthetic images laid out like them, and on
+//! real CPython processes with glibc 2.39 and 2.43 by the ignored test
+//! `tests/native_heap_live.rs` (run by the e2e workflow).
+//!
+//! Three layouts changed along the way, and the walker reads which one an
+//! image has from the image rather than from a version string:
+//!
+//! - the tcache struct grew from 64 bins to 76 in 2.42 (a 0x290 chunk
+//!   became a 0x300 one), so a tcache is recognised by its chunk size;
+//! - `malloc_state` lost its fastbins in 2.43 (0x898 bytes became 0x840),
+//!   so `main_arena` is tried in both layouts, and the one found decides
+//!   where a thread arena's chunks start; with none found, each thread
+//!   heap takes the start that tiles;
+//! - an mmapped chunk's `size` left out its header in 2.43, and goes with
+//!   the 2.43 `malloc_state`.
 //!
 //! # What is walked
 //!
@@ -45,13 +57,15 @@
 //!   mmap threshold (128 KiB by default, rising up to 32 MiB as such chunks
 //!   are freed) gets its own mapping. Its header has `IS_MMAPPED` alone, and
 //!   `prev_size` is the distance from the mapping start (0, or the lead
-//!   `_int_memalign` skipped for alignment). As `munmap_chunk` checks, the
-//!   mapping start and `prev_size + size` are page-aligned and the user
+//!   `_int_memalign` skipped for alignment). The mapping is `prev_size +
+//!   size` long until 2.42; from 2.43 (`mmap_size`) it is 16 bytes longer,
+//!   the header, and `prev_size` bit 0 marks huge pages. As `munmap_chunk`
+//!   checks, the mapping start and length are page-aligned and the user
 //!   pointer's offset in its page is 0 or a power of two. The kernel merges
 //!   neighbouring anonymous mappings, so every 4 KiB page of anonymous
 //!   memory outside the arenas is checked at the offsets such a header can
 //!   have (0 and `2^k - 16`). Reported as [`NativeBlockKind::Large`] covering
-//!   `prev_size` + `size` from the mapping start, with heap 0.
+//!   the whole mapping, with heap 0.
 //!
 //! # Free chunks that look busy
 //!
@@ -61,12 +75,15 @@
 //!
 //! - **tcache** (2.26+; layout of 2.30+): each thread's
 //!   `tcache_perthread_struct` (`uint16_t counts[64]; tcache_entry
-//!   *entries[64]`, a 0x290-byte chunk) is a busy chunk somewhere in the
-//!   arenas. A 0x290 chunk is taken for one when every list it describes
-//!   checks out: `entries[i]` is null exactly when `counts[i]` is 0, each
-//!   entry is the user pointer of a busy-looking chunk of size class `i`
-//!   (`csize2tidx`), the list ends after `counts[i]` entries, and no entry
-//!   repeats. `next` links are tried raw (before 2.32) and with safe-linking
+//!   *entries[64]`, a 0x290-byte chunk; from 2.42 `uint16_t
+//!   num_slots[76]; tcache_entry *entries[76]`, a 0x300-byte chunk) is a
+//!   busy chunk somewhere in the arenas. Such a chunk is taken for one when
+//!   every list it describes checks out: each entry is the user pointer of
+//!   a busy-looking chunk of size class `i` (`csize2tidx`; from 2.42, bins
+//!   64 to 75 hold one power of two each, `large_csize2tidx`), no entry
+//!   repeats, and the list ends. With `counts`, `entries[i]` is also null
+//!   exactly when `counts[i]` is 0 and the list ends after that many;
+//!   `num_slots`, the room left out of a tunable, is not checked. `next` links are tried raw (before 2.32) and with safe-linking
 //!   (`PROTECT_PTR (pos, ptr)` = `(pos >> 12) ^ ptr`, 2.32+). The `key`
 //!   field (the tcache's address until 2.33, the random `tcache_key` since
 //!   2.34) is not needed. The tcache struct is allocator bookkeeping and is
@@ -79,10 +96,11 @@
 //!   data for the brk heap's top chunk address and checking the state
 //!   around it: lock and flag words in range, and every one of the 127
 //!   `bins` either empty (both links point at the bin itself, `bin_at`) or
-//!   pointing at chunks of the heap. Layout since 2.27 (`have_fastchunks`):
-//!   `fastbinsY` at 0x10, `top` at 0x60, `bins` at 0x70, size 0x898. When
-//!   the state is not found or does not check out, fastbin chunks are
-//!   listed as busy.
+//!   pointing at chunks of the heap, and the arena list from it (`next`)
+//!   returns to it. Layout since 2.27 (`have_fastchunks`): `fastbinsY` at
+//!   0x10, `top` at 0x60, `bins` at 0x70, size 0x898. When the state is not
+//!   found or does not check out, fastbin chunks are listed as busy. 2.43
+//!   has no fastbins (`top` at 0x8, `bins` at 0x18, size 0x840).
 //!
 //! # Robustness
 //!
@@ -130,6 +148,8 @@ const ALIGN: u64 = 16;
 const PREV_INUSE: u64 = 1;
 const IS_MMAPPED: u64 = 2;
 const NON_MAIN_ARENA: u64 = 4;
+/// 2.43+: `prev_size` bit 0 of an mmapped chunk, for a huge-page mapping.
+const MMAP_HP: u64 = 1;
 const FLAGS: u64 = 7;
 /// `HEAP_MAX_SIZE` on 64-bit: `2 * DEFAULT_MMAP_THRESHOLD_MAX`, where the
 /// latter is `4 * 1024 * 1024 * sizeof (long)`.
@@ -137,20 +157,100 @@ const HEAP_MAX_SIZE: u64 = 64 << 20;
 /// Granularity of page checks. Linux pages are 4 KiB, or 16/64 KiB on some
 /// aarch64 kernels; anything aligned to those is aligned to 4 KiB.
 const PAGE: u64 = 4096;
-/// `sizeof (struct malloc_state)` and field offsets, 2.27+ on 64-bit.
-const MSTATE_SIZE: u64 = 0x898;
-const MSTATE_FASTBINS: u64 = 0x10;
-const MSTATE_TOP: u64 = 0x60;
-const MSTATE_BINS: u64 = 0x70;
+/// `struct malloc_state` on 64-bit: its size and field offsets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mstate {
+    pub size: u64,
+    /// `fastbinsY`, gone in 2.43.
+    pub fastbins: Option<u64>,
+    pub top: u64,
+    pub bins: u64,
+    /// `next`, the arena list link.
+    pub next: u64,
+    /// The mmapped chunks of the same releases: `true` when `size` leaves
+    /// out the header and `prev_size` bit 0 marks huge pages (2.43+).
+    pub mmap_hdr_apart: bool,
+}
+/// 2.27 to 2.42: `mutex`, `flags`, `have_fastchunks`, `fastbinsY[10]`,
+/// `top`, `last_remainder`, `bins[254]`, ...
+pub(crate) const MSTATE_2_27: Mstate = Mstate {
+    size: 0x898,
+    fastbins: Some(0x10),
+    top: 0x60,
+    bins: 0x70,
+    next: 0x870,
+    mmap_hdr_apart: false,
+};
+/// 2.43+: fastbins removed, so `top` follows `flags`.
+pub(crate) const MSTATE_2_43: Mstate = Mstate {
+    size: 0x840,
+    fastbins: None,
+    top: 0x08,
+    bins: 0x18,
+    next: 0x818,
+    mmap_hdr_apart: true,
+};
+const MSTATES: [Mstate; 2] = [MSTATE_2_27, MSTATE_2_43];
 /// `NFASTBINS`: `fastbin_index (request2size (MAX_FAST_SIZE)) + 1`.
 const NFASTBINS: u64 = 10;
 /// `NBINS * 2 - 2` pointers, as 127 (fd, bk) pairs.
 const NBIN_PAIRS: u64 = 127;
-/// `TCACHE_MAX_BINS`, and the chunk holding a `tcache_perthread_struct`
-/// with `uint16_t` counts (2.30+): `request2size (64 * 2 + 64 * 8)`.
-const TCACHE_BINS: usize = 64;
-const TCACHE_CHUNK: u64 = 0x290;
-const TCACHE_STRUCT: usize = 0x280;
+
+/// A `tcache_perthread_struct` layout: `uint16_t` per bin, then a pointer
+/// per bin, in a chunk of `request2size (bins * 10)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Tcache {
+    pub bins: usize,
+    pub chunk: u64,
+    /// The `uint16_t` is `num_slots`, the room left (2.42+), not `counts`,
+    /// the entries held (2.30 to 2.41).
+    pub slots: bool,
+}
+impl Tcache {
+    pub const fn struct_size(&self) -> usize {
+        self.bins * 10
+    }
+    pub const fn entries(&self) -> u64 {
+        2 * self.bins as u64
+    }
+}
+/// 2.30 to 2.41: 64 bins of counts.
+pub(crate) const TCACHE_2_30: Tcache = Tcache {
+    bins: 64,
+    chunk: 0x290,
+    slots: false,
+};
+/// 2.42+: 64 small bins and 12 large ones (`TCACHE_LARGE_BINS`, chunks up
+/// to 4 MiB by power of two), of slots left.
+pub(crate) const TCACHE_2_42: Tcache = Tcache {
+    bins: 76,
+    chunk: 0x300,
+    slots: true,
+};
+/// The tcache struct a busy chunk of `size` would hold.
+fn tcache_of(size: u64) -> Option<Tcache> {
+    [TCACHE_2_30, TCACHE_2_42]
+        .into_iter()
+        .find(|t| t.chunk == size)
+}
+/// `TCACHE_SMALL_BINS`, and the largest chunk they hold
+/// (`MAX_TCACHE_SMALL_SIZE`, `tidx2csize (63)`).
+const TCACHE_SMALL_BINS: u64 = 64;
+const TCACHE_SMALL_MAX: u64 = 63 * ALIGN + MINSIZE;
+/// Whether a chunk of `size` belongs in tcache bin `i` (`csize2tidx`, and
+/// from 2.42 `large_csize2tidx`: one bin per power of two above the small
+/// bins).
+fn tcache_bin_holds(i: u64, size: u64) -> bool {
+    if i < TCACHE_SMALL_BINS {
+        size >= MINSIZE && (size - MINSIZE) / ALIGN == i
+    } else {
+        // large_csize2tidx: 64 + clz (0x410) - clz (nb), on 32-bit clz.
+        let lg = |x: u64| 63 - u64::from(x.leading_zeros());
+        size > TCACHE_SMALL_MAX
+            && size < 1 << 32
+            && TCACHE_SMALL_BINS + lg(size) - lg(TCACHE_SMALL_MAX) == i
+    }
+}
 /// Offsets in a page where an mmapped chunk header can be: the user
 /// pointer is page-aligned or at a power of two in its page.
 const MMAP_OFFSETS: [u64; 8] = [0, 48, 112, 240, 496, 1008, 2032, 4080];
@@ -218,41 +318,12 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     };
     let mut heaps: Vec<Heap> = Vec::new();
 
-    // Thread arenas, by their heap_info headers.
+    // Thread arenas' headers first: the brk heap is not among them.
     let infos = w.find_thread_heaps(&merged);
     let mut keys: Vec<u64> = infos.iter().map(|h| h.ar_ptr).collect();
     keys.sort_unstable();
     keys.dedup();
     let firsts: HashSet<u64> = infos.iter().filter(|h| h.first).map(|h| h.base).collect();
-    for h in &infos {
-        let arena_base = h.ar_ptr & !(HEAP_MAX_SIZE - 1);
-        let hi = h.ar_ptr - arena_base;
-        if hi != 32 && hi != 48 {
-            continue;
-        }
-        let start = if h.first {
-            align_up(h.ar_ptr + MSTATE_SIZE, ALIGN)
-        } else {
-            h.base + hi
-        };
-        // A later heap whose arena's first heap is not in the image has
-        // only its own header to vouch for it: it must tile exactly.
-        let strict = !h.first && !firsts.contains(&arena_base);
-        let walk = w.walk(start, h.base + h.size, false);
-        if strict && !walk.complete() {
-            w.refund(&walk);
-            continue;
-        }
-        let arena = 1 + keys.binary_search(&h.ar_ptr).unwrap_or(0) as u32;
-        heaps.push(Heap {
-            arena,
-            first_chunk: h.first.then_some(start),
-            walk,
-        });
-    }
-
-    // The main arena's brk heap.
-    let mut main_state = None;
     let thread_spans: Vec<Span> = infos
         .iter()
         .map(|h| Span {
@@ -260,6 +331,10 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
             end: h.base.saturating_add(HEAP_MAX_SIZE),
         })
         .collect();
+
+    // The main arena's brk heap. `main_arena`, when found, says which
+    // `malloc_state` layout this glibc has.
+    let mut main_state: Option<(u64, Mstate)> = None;
     let mut main_spans: Vec<Span> = Vec::new();
     if let Some((s, e)) = hints.brk {
         if let Some(span) = Span::new(s, e) {
@@ -298,8 +373,10 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
             let state = w.find_main_arena(&libc_data, top, &walk.chunks);
             let tcache_first = walk.chunks.first().is_some_and(|c| {
                 c.addr == start
-                    && c.size == TCACHE_CHUNK
-                    && w.tcache_entries(c.addr + CHUNK_HDR, &walk.chunks).is_some()
+                    && tcache_of(c.size).is_some_and(|t| {
+                        w.tcache_entries(t, c.addr + CHUNK_HDR, &walk.chunks)
+                            .is_some()
+                    })
             });
             if walk.chunks.is_empty() || (state.is_none() && !tcache_first) {
                 w.refund(&walk);
@@ -314,6 +391,76 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
             });
         }
     }
+    // The layouts still possible.
+    let mstates: Vec<Mstate> = match main_state {
+        Some((_, l)) => vec![l],
+        None => MSTATES.to_vec(),
+    };
+
+    // Thread arenas. A first heap's chunks follow its `malloc_state`, whose
+    // size depends on the layout: with it unknown, the one that tiles wins.
+    let mut thread_mstate: Vec<(u64, Mstate)> = Vec::new();
+    for h in &infos {
+        let arena_base = h.ar_ptr & !(HEAP_MAX_SIZE - 1);
+        let hi = h.ar_ptr - arena_base;
+        if hi != 32 && hi != 48 {
+            continue;
+        }
+        // A later heap whose arena's first heap is not in the image has
+        // only its own header to vouch for it: it must tile exactly.
+        let strict = !h.first && !firsts.contains(&arena_base);
+        let starts: Vec<(u64, Option<Mstate>)> = if h.first {
+            mstates
+                .iter()
+                .map(|&l| (align_up(h.ar_ptr + l.size, ALIGN), Some(l)))
+                .collect()
+        } else {
+            vec![(h.base + hi, None)]
+        };
+        let mut best: Option<(HeapWalk, u64, Option<Mstate>)> = None;
+        for (start, l) in starts {
+            let walk = w.walk(start, h.base + h.size, false);
+            let better = best.as_ref().is_none_or(|(b, _, _)| {
+                (walk.complete(), walk.chunks.len()) > (b.complete(), b.chunks.len())
+            });
+            if better {
+                if let Some((old, _, _)) = best.take() {
+                    w.refund(&old);
+                }
+                best = Some((walk, start, l));
+            } else {
+                w.refund(&walk);
+            }
+        }
+        let Some((walk, start, l)) = best else {
+            continue;
+        };
+        if strict && !walk.complete() {
+            w.refund(&walk);
+            continue;
+        }
+        if let Some(l) = l {
+            thread_mstate.push((h.ar_ptr, l));
+        }
+        let arena = 1 + keys.binary_search(&h.ar_ptr).unwrap_or(0) as u32;
+        heaps.push(Heap {
+            arena,
+            first_chunk: h.first.then_some(start),
+            walk,
+        });
+    }
+    // The layout the thread arenas agree on, if the main arena said none.
+    let mstates: Vec<Mstate> = if mstates.len() > 1 {
+        let mut agreed: Vec<Mstate> = thread_mstate.iter().map(|t| t.1).collect();
+        agreed.dedup();
+        if agreed.len() == 1 {
+            agreed
+        } else {
+            mstates
+        }
+    } else {
+        mstates
+    };
 
     if heaps.is_empty() {
         return Ok(None);
@@ -337,9 +484,13 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
 
     let mut free: HashSet<u64> = HashSet::new();
     let mut bookkeeping: HashSet<u64> = HashSet::new();
-    // tcache: every busy 0x290 chunk that checks out as a tcache struct.
-    for c in all.iter().filter(|c| c.busy && c.size == TCACHE_CHUNK) {
-        if let Some(entries) = w.tcache_entries(c.addr + CHUNK_HDR, &all) {
+    // tcache: every busy chunk of a tcache struct's size that checks out
+    // as one.
+    for c in all.iter().filter(|c| c.busy) {
+        let Some(t) = tcache_of(c.size) else {
+            continue;
+        };
+        if let Some(entries) = w.tcache_entries(t, c.addr + CHUNK_HDR, &all) {
             if !entries.is_empty() || firsts.contains(&c.addr) {
                 bookkeeping.insert(c.addr);
             }
@@ -347,15 +498,18 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
         }
     }
     // fastbins, for each arena whose malloc_state checks out.
-    let mut states: Vec<(u32, u64)> = keys
+    let mut states: Vec<(u32, u64, Mstate)> = keys
         .iter()
         .enumerate()
-        .map(|(i, &k)| (1 + i as u32, k))
+        .flat_map(|(i, &k)| mstates.iter().map(move |&l| (1 + i as u32, k, l)))
         .collect();
-    if let Some(m) = main_state {
-        states.push((0, m));
+    if let Some((m, l)) = main_state {
+        states.push((0, m, l));
     }
-    for (arena, ms) in states {
+    for (arena, ms, l) in states {
+        let Some(_) = l.fastbins else {
+            continue;
+        };
         let chunks: Vec<Chunk> = all
             .iter()
             .zip(&arena_of)
@@ -363,8 +517,8 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
             .map(|(c, _)| *c)
             .collect();
         let arena_tops: Vec<u64> = tops.iter().filter(|t| t.0 == arena).map(|t| t.1).collect();
-        if w.check_mstate(ms, &arena_tops, &chunks) {
-            free.extend(w.fastbin_chunks(ms, &chunks));
+        if w.check_mstate(ms, l, &arena_tops, &chunks) {
+            free.extend(w.fastbin_chunks(ms, l, &chunks));
         }
     }
 
@@ -386,7 +540,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     excluded.extend(main_spans);
     let mut pages = MAX_SCAN_PAGES;
     for seg in subtract(&merged, &excluded) {
-        w.scan_mmapped(seg, &stacks, &mut pages, &mut out);
+        w.scan_mmapped(seg, &mstates, &stacks, &mut pages, &mut out);
     }
 
     out.sort_unstable_by_key(|b| b.start);
@@ -685,30 +839,33 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
     /// The tcache entries (as chunk addresses) of the `tcache_perthread_struct`
     /// at user pointer `mem`, if it checks out. `chunks` is what the entries
     /// may point at.
-    fn tcache_entries(&self, mem: u64, chunks: &[Chunk]) -> Option<Vec<u64>> {
-        let mut b = vec![0u8; TCACHE_STRUCT];
+    fn tcache_entries(&self, t: Tcache, mem: u64, chunks: &[Chunk]) -> Option<Vec<u64>> {
+        let mut b = vec![0u8; t.struct_size()];
         self.src.read(mem, &mut b).ok()?;
         let count = |i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as usize;
         let entry = |i: usize| {
-            let o = 2 * TCACHE_BINS + 8 * i;
+            let o = t.entries() as usize + 8 * i;
             u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
         };
-        for i in 0..TCACHE_BINS {
-            if (count(i) == 0) != (entry(i) == 0) {
-                return None;
-            }
+        // With counts, a list is null exactly when its count is 0 and ends
+        // after that many entries. Slots left say nothing so exact (their
+        // start is a tunable), so a list just has to end within the chunks.
+        if !t.slots && (0..t.bins).any(|i| (count(i) == 0) != (entry(i) == 0)) {
+            return None;
         }
         'mode: for link in [Link::Raw, Link::Protected] {
             let mut out = Vec::new();
             let mut seen = HashSet::new();
-            for i in 0..TCACHE_BINS {
+            for i in 0..t.bins {
                 let mut x = entry(i);
-                for k in 0..count(i) {
+                let mut k = 0usize;
+                while x != 0 {
                     let ok = x % ALIGN == 0
                         && x >= CHUNK_HDR
                         && find(chunks, x - CHUNK_HDR)
-                            .is_some_and(|c| c.busy && (c.size - MINSIZE) / ALIGN == i as u64)
-                        && seen.insert(x);
+                            .is_some_and(|c| c.busy && tcache_bin_holds(i as u64, c.size))
+                        && seen.insert(x)
+                        && (t.slots || k < count(i));
                     if !ok {
                         continue 'mode;
                     }
@@ -716,11 +873,11 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
                     let Some(stored) = self.word(x) else {
                         continue 'mode;
                     };
-                    let next = link.decode(x, stored);
-                    if (k + 1 == count(i)) != (next == 0) {
-                        continue 'mode;
-                    }
-                    x = next;
+                    x = link.decode(x, stored);
+                    k += 1;
+                }
+                if !t.slots && k != count(i) {
+                    continue 'mode;
                 }
             }
             return Some(out);
@@ -730,8 +887,8 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
 
     /// Check the `malloc_state` at `ms`: its `top` is one of `tops`, the lock
     /// and flags are in range, and every bin is empty or points at `chunks`.
-    fn check_mstate(&self, ms: u64, tops: &[u64], chunks: &[Chunk]) -> bool {
-        let mut b = vec![0u8; MSTATE_SIZE as usize];
+    fn check_mstate(&self, ms: u64, l: Mstate, tops: &[u64], chunks: &[Chunk]) -> bool {
+        let mut b = vec![0u8; l.size as usize];
         if self.src.read(ms, &mut b).is_err() {
             return false;
         }
@@ -740,18 +897,19 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
             let o = o as usize;
             u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
         };
-        if u32_at(0) > 2 || u32_at(4) & !7 != 0 || u32_at(8) > 1 {
+        if u32_at(0) > 2 || u32_at(4) & !7 != 0 {
             return false;
         }
-        if !tops.contains(&u64_at(MSTATE_TOP)) {
+        // have_fastchunks, a bool, where there are fastbins.
+        if l.fastbins.is_some() && u32_at(8) > 1 {
+            return false;
+        }
+        if !tops.contains(&u64_at(l.top)) {
             return false;
         }
         (0..NBIN_PAIRS).all(|j| {
-            let head = ms + MSTATE_BINS + 16 * j - CHUNK_HDR;
-            let (fd, bk) = (
-                u64_at(MSTATE_BINS + 16 * j),
-                u64_at(MSTATE_BINS + 16 * j + 8),
-            );
+            let head = ms + l.bins + 16 * j - CHUNK_HDR;
+            let (fd, bk) = (u64_at(l.bins + 16 * j), u64_at(l.bins + 16 * j + 8));
             (fd == head && bk == head)
                 || (fd != head
                     && bk != head
@@ -762,7 +920,7 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
 
     /// `main_arena`: a `malloc_state` in libc's writable data whose `top`
     /// is the brk heap's top chunk.
-    fn find_main_arena(&self, data: &[Span], top: u64, chunks: &[Chunk]) -> Option<u64> {
+    fn find_main_arena(&self, data: &[Span], top: u64, chunks: &[Chunk]) -> Option<(u64, Mstate)> {
         const MAX_DATA: u64 = 8 << 20;
         for s in data {
             let len = (s.end - s.start).min(MAX_DATA) as usize;
@@ -772,10 +930,18 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
             }
             for (i, w) in b.chunks_exact(8).enumerate() {
                 let off = i as u64 * 8;
-                if off >= MSTATE_TOP && u64::from_le_bytes(w.try_into().unwrap()) == top {
-                    let ms = s.start + off - MSTATE_TOP;
-                    if self.check_mstate(ms, &[top], chunks) {
-                        return Some(ms);
+                if u64::from_le_bytes(w.try_into().unwrap()) != top {
+                    continue;
+                }
+                for l in MSTATES {
+                    let Some(ms) = (s.start + off).checked_sub(l.top) else {
+                        continue;
+                    };
+                    if off >= l.top
+                        && self.check_mstate(ms, l, &[top], chunks)
+                        && self.in_ring(ms, l)
+                    {
+                        return Some((ms, l));
                     }
                 }
             }
@@ -783,11 +949,32 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
         None
     }
 
+    /// Whether the arena list (`next`) from `ms` comes back to `ms`, as
+    /// glibc's ring through `main_arena` does. Both layouts keep `top`,
+    /// `bins` and `next` the same distance apart, so a 2.43 state read as a
+    /// 2.27 one 0x58 bytes early passes the other checks; only the ring
+    /// tells them apart.
+    fn in_ring(&self, ms: u64, l: Mstate) -> bool {
+        const MAX_ARENAS: usize = 1024;
+        let mut n = ms;
+        for _ in 0..MAX_ARENAS {
+            match n.checked_add(l.next).and_then(|a| self.word(a)) {
+                Some(next) if next == ms => return true,
+                Some(next) if next != 0 && next % 8 == 0 => n = next,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The chunks in the fastbins of the `malloc_state` at `ms`, if every
     /// list checks out; otherwise none.
-    fn fastbin_chunks(&self, ms: u64, chunks: &[Chunk]) -> Vec<u64> {
+    fn fastbin_chunks(&self, ms: u64, l: Mstate, chunks: &[Chunk]) -> Vec<u64> {
+        let Some(fastbins) = l.fastbins else {
+            return Vec::new();
+        };
         let Some(heads): Option<Vec<u64>> = (0..NFASTBINS)
-            .map(|i| self.word(ms + MSTATE_FASTBINS + 8 * i))
+            .map(|i| self.word(ms + fastbins + 8 * i))
             .collect()
         else {
             return Vec::new();
@@ -820,7 +1007,14 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
 
     /// Find mmapped chunks in `seg`, page by page. None holds a stack
     /// pointer in `stacks`.
-    fn scan_mmapped(&self, seg: Span, stacks: &[u64], pages: &mut u64, out: &mut Vec<NativeBlock>) {
+    fn scan_mmapped(
+        &self,
+        seg: Span,
+        mstates: &[Mstate],
+        stacks: &[u64],
+        pages: &mut u64,
+        out: &mut Vec<NativeBlock>,
+    ) {
         let mut p = align_up(seg.start, PAGE);
         let mut min_block = seg.start;
         'pages: while p < seg.end && *pages > 0 {
@@ -833,13 +1027,16 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
                 let Some((ps, word)) = self.header(c) else {
                     continue;
                 };
-                let found = mmapped_at(c, ps, word, seg, min_block).filter(|&(b, t)| {
-                    let m = Span {
-                        start: b,
-                        end: b + t,
-                    };
-                    !stacks.iter().any(|&sp| m.contains(sp))
-                });
+                let found = mstates
+                    .iter()
+                    .find_map(|l| mmapped_at(c, ps, word, l.mmap_hdr_apart, seg, min_block))
+                    .filter(|&(b, t)| {
+                        let m = Span {
+                            start: b,
+                            end: b + t,
+                        };
+                        !stacks.iter().any(|&sp| m.contains(sp))
+                    });
                 if let Some((block, total)) = found {
                     out.push(NativeBlock {
                         start: block,
@@ -860,7 +1057,16 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
 
 /// The mapping (`start`, `length`) of an mmapped chunk whose header at `c`
 /// is (`ps`, `word`), if it is one and fits in `seg` at or after `min_block`.
-fn mmapped_at(c: u64, ps: u64, word: u64, seg: Span, min_block: u64) -> Option<(u64, u64)> {
+/// `hdr_apart` is the 2.43+ header: `size` leaves out the 16-byte header and
+/// `prev_size` bit 0 marks a huge-page mapping (`mmap_set_chunk`).
+fn mmapped_at(
+    c: u64,
+    ps: u64,
+    word: u64,
+    hdr_apart: bool,
+    seg: Span,
+    min_block: u64,
+) -> Option<(u64, u64)> {
     if word & FLAGS != IS_MMAPPED {
         return None;
     }
@@ -868,8 +1074,13 @@ fn mmapped_at(c: u64, ps: u64, word: u64, seg: Span, min_block: u64) -> Option<(
     if size < MINSIZE || size % ALIGN != 0 {
         return None;
     }
-    let block = c.checked_sub(ps)?;
-    let total = ps.checked_add(size)?;
+    let (offset, total) = if hdr_apart {
+        let offset = ps & !MMAP_HP;
+        (offset, offset.checked_add(size)?.checked_add(CHUNK_HDR)?)
+    } else {
+        (ps, ps.checked_add(size)?)
+    };
+    let block = c.checked_sub(offset)?;
     if block % PAGE != 0 || total % PAGE != 0 || block < min_block.max(seg.start) {
         return None;
     }
@@ -909,19 +1120,41 @@ pub(crate) mod testkit {
     pub struct Glibc {
         pub safe_linking: bool,
         pub heap_info_size: u64,
+        pub mstate: Mstate,
+        pub tcache: Tcache,
     }
     pub const V2_31: Glibc = Glibc {
         safe_linking: false,
         heap_info_size: 32,
+        mstate: MSTATE_2_27,
+        tcache: TCACHE_2_30,
     };
     pub const V2_33: Glibc = Glibc {
         safe_linking: true,
         heap_info_size: 32,
+        mstate: MSTATE_2_27,
+        tcache: TCACHE_2_30,
     };
     pub const V2_35: Glibc = Glibc {
         safe_linking: true,
         heap_info_size: 48,
+        mstate: MSTATE_2_27,
+        tcache: TCACHE_2_30,
     };
+    pub const V2_42: Glibc = Glibc {
+        safe_linking: true,
+        heap_info_size: 48,
+        mstate: MSTATE_2_27,
+        tcache: TCACHE_2_42,
+    };
+    pub const V2_43: Glibc = Glibc {
+        safe_linking: true,
+        heap_info_size: 48,
+        mstate: MSTATE_2_43,
+        tcache: TCACHE_2_42,
+    };
+    /// Every layout the tests build.
+    pub const ALL: [Glibc; 5] = [V2_31, V2_33, V2_35, V2_42, V2_43];
 
     impl Glibc {
         pub fn protect(&self, pos: u64, ptr: u64) -> u64 {
@@ -1026,9 +1259,17 @@ pub(crate) mod testkit {
         /// Write a `tcache_perthread_struct` at user pointer `mem` holding
         /// `lists` (size-class index, chunk addresses, head first).
         pub fn tcache(&mut self, g: Glibc, mem: u64, lists: &[(usize, Vec<u64>)], key: u64) {
+            let t = g.tcache;
+            if t.slots {
+                // num_slots: room left of `tcache_count` (7 by default).
+                for i in 0..t.bins as u64 {
+                    self.poke_u16(mem + 2 * i, 7);
+                }
+            }
             for (idx, list) in lists {
-                self.poke_u16(mem + 2 * *idx as u64, list.len() as u16);
-                self.poke(mem + 128 + 8 * *idx as u64, list[0] + CHUNK_HDR);
+                let n = list.len() as u16;
+                self.poke_u16(mem + 2 * *idx as u64, if t.slots { 7 - n } else { n });
+                self.poke(mem + t.entries() + 8 * *idx as u64, list[0] + CHUNK_HDR);
                 for (k, &c) in list.iter().enumerate() {
                     let e = c + CHUNK_HDR;
                     let next = list.get(k + 1).map_or(0, |n| n + CHUNK_HDR);
@@ -1050,21 +1291,24 @@ pub(crate) mod testkit {
             unsorted: &[u64],
             next: u64,
         ) {
-            for (idx, list) in fast {
-                self.poke(ms + MSTATE_FASTBINS + 8 * *idx as u64, list[0]);
+            let l = g.mstate;
+            // No fastbins (2.43+): the lists are left out, and their chunks
+            // look busy.
+            for (idx, list) in fast.iter().filter(|_| l.fastbins.is_some()) {
+                self.poke(ms + l.fastbins.unwrap() + 8 * *idx as u64, list[0]);
                 for (k, &c) in list.iter().enumerate() {
                     let next = list.get(k + 1).copied().unwrap_or(0);
                     self.poke(c + 16, g.protect(c + 16, next));
                 }
             }
-            self.poke(ms + MSTATE_TOP, top);
+            self.poke(ms + l.top, top);
             for j in 0..NBIN_PAIRS {
-                let head = ms + MSTATE_BINS + 16 * j - CHUNK_HDR;
+                let head = ms + l.bins + 16 * j - CHUNK_HDR;
                 self.poke(head + 16, head);
                 self.poke(head + 24, head);
             }
             if !unsorted.is_empty() {
-                let head = ms + MSTATE_BINS - CHUNK_HDR;
+                let head = ms + l.bins - CHUNK_HDR;
                 let ring: Vec<u64> = std::iter::once(head)
                     .chain(unsorted.iter().copied())
                     .collect();
@@ -1075,8 +1319,9 @@ pub(crate) mod testkit {
                     self.poke(n + 24, bk);
                 }
             }
-            self.poke(ms + 0x870, next);
-            self.poke(ms + 0x880, 1);
+            self.poke(ms + l.next, next);
+            // attached_threads, two words on.
+            self.poke(ms + l.next + 0x10, 1);
         }
     }
 
@@ -1090,7 +1335,7 @@ pub(crate) mod testkit {
             base,
             base + len,
             &[
-                (TCACHE_CHUNK, St::Busy),
+                (g.tcache.chunk, St::Busy),
                 (0x30, St::Busy),
                 (0x30, St::Cached),
                 (0x110, St::Busy),
@@ -1269,19 +1514,19 @@ mod tests {
             BRK,
             BRK + BRK_LEN,
             &[
-                (TCACHE_CHUNK, St::Busy), // 0: the main thread's tcache
-                (0x30, St::Busy),         // 1
-                (0x30, St::Cached),       // 2: tcache
-                (0x30, St::Cached),       // 3: tcache
-                (0x110, St::Busy),        // 4
-                (0x20, St::Cached),       // 5: fastbin 0
-                (0x420, St::Free),        // 6: unsorted
-                (0x50, St::Busy),         // 7
-                (0x20, St::Cached),       // 8: fastbin 0
-                (0x70, St::Cached),       // 9: fastbin 5
-                (0x1010, St::Busy),       // 10
-                (TCACHE_CHUNK, St::Busy), // 11: a user's zeroed 640 bytes
-                (0x40, St::Busy),         // 12
+                (g.tcache.chunk, St::Busy), // 0: the main thread's tcache
+                (0x30, St::Busy),           // 1
+                (0x30, St::Cached),         // 2: tcache
+                (0x30, St::Cached),         // 3: tcache
+                (0x110, St::Busy),          // 4
+                (0x20, St::Cached),         // 5: fastbin 0
+                (0x420, St::Free),          // 6: unsorted
+                (0x50, St::Busy),           // 7
+                (0x20, St::Cached),         // 8: fastbin 0
+                (0x70, St::Cached),         // 9: fastbin 5
+                (0x1010, St::Busy),         // 10
+                (g.tcache.chunk, St::Busy), // 11: a user's zeroed bytes
+                (0x40, St::Busy),           // 12
             ],
             Tail::Top,
             false,
@@ -1304,7 +1549,14 @@ mod tests {
                 MAIN_ARENA,
             );
         }
-        let with = [1, 4, 7, 10, 11, 12].map(|i| alloc(ch[i], 0)).to_vec();
+        // Without fastbins (2.43+) the would-be fastbin chunks look busy.
+        let with = if g.mstate.fastbins.is_some() {
+            [1, 4, 7, 10, 11, 12].map(|i| alloc(ch[i], 0)).to_vec()
+        } else {
+            [1, 4, 5, 7, 8, 9, 10, 11, 12]
+                .map(|i| alloc(ch[i], 0))
+                .to_vec()
+        };
         let without = [1, 4, 5, 7, 8, 9, 10, 11, 12]
             .map(|i| alloc(ch[i], 0))
             .to_vec();
@@ -1317,6 +1569,8 @@ mod tests {
             (V2_31, TargetInfo::LINUX_X86_64),
             (V2_33, TargetInfo::LINUX_X86_64),
             (V2_35, AARCH64),
+            (V2_42, TargetInfo::LINUX_X86_64),
+            (V2_43, AARCH64),
         ] {
             let (w, want, _) = main_heap_world(g, t, true);
             let img = w.img();
@@ -1336,7 +1590,7 @@ mod tests {
 
     #[test]
     fn without_main_arena_fastbin_chunks_count_as_busy() {
-        for g in [V2_31, V2_35] {
+        for g in ALL {
             let (w, _, want) = main_heap_world(g, TargetInfo::LINUX_X86_64, false);
             assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
         }
@@ -1344,11 +1598,13 @@ mod tests {
 
     #[test]
     fn a_corrupt_main_arena_is_ignored() {
-        let (mut w, _, want) = main_heap_world(V2_35, TargetInfo::LINUX_X86_64, true);
-        // A bin pointing nowhere: the state does not check out.
-        w.bytes
-            .poke(MAIN_ARENA + MSTATE_BINS + 16 * 40, 0xdead_0000);
-        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+        for g in [V2_35, V2_43] {
+            let (mut w, _, want) = main_heap_world(g, TargetInfo::LINUX_X86_64, true);
+            // A bin pointing nowhere: the state does not check out.
+            w.bytes
+                .poke(MAIN_ARENA + g.mstate.bins + 16 * 40, 0xdead_0000);
+            assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want), "{g:?}");
+        }
     }
 
     /// Two thread arenas: A with two heaps (the older ends in fenceposts),
@@ -1374,12 +1630,12 @@ mod tests {
         let a_ms = A + hi;
         w.bytes.region(A, 0x8000);
         info(&mut w, A, a_ms, 0, 0x8000, 0x8000);
-        let a_start = align_up(a_ms + MSTATE_SIZE, 16);
+        let a_start = align_up(a_ms + g.mstate.size, 16);
         let a = w.bytes.heap(
             a_start,
             A + 0x8000,
             &[
-                (TCACHE_CHUNK, St::Busy),
+                (g.tcache.chunk, St::Busy),
                 (0x40, St::Busy),
                 (0x40, St::Cached),
                 (0x100, St::Busy),
@@ -1406,15 +1662,18 @@ mod tests {
         w.bytes.region(C, 0x4000);
         info(&mut w, C, c_ms, 0, 0x4000, 0x4000);
         let c = w.bytes.heap(
-            align_up(c_ms + MSTATE_SIZE, 16),
+            align_up(c_ms + g.mstate.size, 16),
             C + 0x4000,
-            &[(TCACHE_CHUNK, St::Busy), (0x30, St::Busy)],
+            &[(g.tcache.chunk, St::Busy), (0x30, St::Busy)],
             Tail::Top,
             true,
         );
         w.bytes.mstate(g, c_ms, c[2].0, &[], &[], a_ms);
         want.extend([alloc(a[1], 1), alloc(a[3], 1)]);
         want.extend([alloc(b[0], 1), alloc(b[2], 1)]);
+        if g.mstate.fastbins.is_none() {
+            want.push(alloc(b[1], 1));
+        }
         want.push(alloc(c[1], 2));
         want.sort_by_key(|b| b.start);
         (w, want)
@@ -1422,7 +1681,7 @@ mod tests {
 
     #[test]
     fn thread_arenas_are_found_by_heap_info() {
-        for g in [V2_31, V2_33, V2_35] {
+        for g in ALL {
             let (w, want) = thread_world(g);
             assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want), "{g:?}");
         }
@@ -1432,12 +1691,17 @@ mod tests {
     fn the_first_thread_heap_chunk_follows_malloc_state() {
         // 2.31: 0x20 + 0x898, rounded up: the familiar ...8c0.
         assert_eq!(
-            align_up(0x7f00_0000_0020 + MSTATE_SIZE, 16),
+            align_up(0x7f00_0000_0020 + MSTATE_2_27.size, 16),
             0x7f00_0000_08c0
         );
         assert_eq!(
-            align_up(0x7f00_0000_0030 + MSTATE_SIZE, 16),
+            align_up(0x7f00_0000_0030 + MSTATE_2_27.size, 16),
             0x7f00_0000_08d0
+        );
+        // 2.43, without fastbins: 0x30 + 0x840.
+        assert_eq!(
+            align_up(0x7f00_0000_0030 + MSTATE_2_43.size, 16),
+            0x7f00_0000_0870
         );
     }
 
@@ -1496,6 +1760,19 @@ mod tests {
                 M + 4080,
                 4080,
                 0x1010 | 2,
+                false,
+                Span::new(M, M + 0x10000).unwrap(),
+                M
+            ),
+            Some((M, 0x2000))
+        );
+        // 2.43: size leaves the header out, and bit 0 is the huge-page flag.
+        assert_eq!(
+            mmapped_at(
+                M + 4080,
+                4080 | MMAP_HP,
+                0x1000 | 2,
+                true,
                 Span::new(M, M + 0x10000).unwrap(),
                 M
             ),
@@ -1503,14 +1780,88 @@ mod tests {
         );
         assert_eq!(
             mmapped_at(
+                M,
+                0,
+                0xff0 | 2,
+                false,
+                Span::new(M, M + 0x10000).unwrap(),
+                M
+            ),
+            None
+        );
+        assert_eq!(
+            mmapped_at(
                 M + 4080,
                 4080,
                 0x1010 | 2,
+                false,
                 Span::new(M, M + 0x10000).unwrap(),
                 M + 1
             ),
             None
         );
+    }
+
+    #[test]
+    fn mmapped_chunks_of_2_43_are_large_blocks() {
+        // glibc 2.43, as on a real process: malloc (1 MiB) gives prev_size 0
+        // and size 0x100ff0 | IS_MMAPPED in a 0x101000 mapping, with
+        // main_arena in the 2.43 layout naming the layout.
+        const M: u64 = 0x7f20_0000_0000;
+        let (mut w, mut want, _) = main_heap_world(V2_43, TargetInfo::LINUX_X86_64, true);
+        w.bytes.region(M, 0x103000);
+        w.bytes.poke(M + 8, (0x101000 - CHUNK_HDR) | IS_MMAPPED);
+        // A memalign (4096) one after it: 4080 bytes of lead.
+        let c = M + 0x101000 + 4080;
+        w.bytes.poke(c, 4080);
+        w.bytes
+            .poke(c + 8, (0x2000 - 4080 - CHUNK_HDR) | IS_MMAPPED);
+        want.extend([large(M, 0x101000), large(M + 0x101000, 0x2000)]);
+        want.sort_by_key(|b| b.start);
+        let hints = HeapHints {
+            brk: Some((BRK, BRK + BRK_LEN)),
+        };
+        assert_eq!(blocks(&w.img(), &hints), Some(want.clone()));
+        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+    }
+
+    #[test]
+    fn tcache_bins_by_size() {
+        assert!(tcache_bin_holds(0, 0x20) && tcache_bin_holds(63, 0x410));
+        assert!(!tcache_bin_holds(1, 0x20) && !tcache_bin_holds(63, 0x420));
+        // 2.42 large bins: one per power of two above 0x410.
+        assert!(tcache_bin_holds(64, 0x420) && tcache_bin_holds(64, 0x7f0));
+        assert!(tcache_bin_holds(65, 0x800) && tcache_bin_holds(75, 0x3f_fff0));
+        assert!(!tcache_bin_holds(64, 0x410) && !tcache_bin_holds(65, 0x7f0));
+        assert_eq!(tcache_of(0x290), Some(TCACHE_2_30));
+        assert_eq!(tcache_of(0x300), Some(TCACHE_2_42));
+        assert_eq!(TCACHE_2_42.struct_size(), 0x2f8);
+    }
+
+    #[test]
+    fn a_2_42_tcache_large_bin_is_read() {
+        let mut w = World::new(TargetInfo::LINUX_X86_64);
+        w.bytes.region(BRK, 0x4000);
+        let ch = w.bytes.heap(
+            BRK,
+            BRK + 0x4000,
+            &[
+                (TCACHE_2_42.chunk, St::Busy),
+                (0x30, St::Busy),
+                (0x500, St::Cached),
+                (0x30, St::Busy),
+            ],
+            Tail::Top,
+            false,
+        );
+        w.bytes
+            .tcache(V2_42, BRK + CHUNK_HDR, &[(64, vec![ch[2].0])], 0);
+        let hints = HeapHints {
+            brk: Some((BRK, BRK + 0x4000)),
+        };
+        let want: Vec<_> = [1, 3].map(|i| alloc(ch[i], 0)).to_vec();
+        assert_eq!(blocks(&w.img(), &hints), Some(want.clone()));
+        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
     }
 
     #[test]
@@ -1575,11 +1926,13 @@ mod tests {
         let f2 = without[2].start; // ch[5]
         w.bytes.poke(f2 + 16, V2_35.protect(f2 + 16, f1));
         // And a tcache entry links to itself.
-        let t = BRK + TCACHE_CHUNK + 0x30 + 0x30; // ch[3]
+        let t = BRK + V2_35.tcache.chunk + 0x30 + 0x30; // ch[3]
         w.bytes.poke(t + 16, V2_35.protect(t + 16, t + 16));
         let got = blocks(&w.img(), &HeapHints::default()).unwrap();
         // The tcache no longer checks out: its entries and itself count busy.
-        assert!(got.iter().any(|b| b.start == BRK && b.size == TCACHE_CHUNK));
+        assert!(got
+            .iter()
+            .any(|b| b.start == BRK && b.size == V2_35.tcache.chunk));
         assert!(got.iter().any(|b| b.start == t));
         // Fastbins: neither list mode validates, so they count busy.
         assert!(got.iter().any(|b| b.start == f1) && got.iter().any(|b| b.start == f2));
