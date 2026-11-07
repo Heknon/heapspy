@@ -7,8 +7,9 @@ use heapspy_snapshot::{EdgeLabel, Snapshot};
 use crate::analysis::Analysis;
 use crate::dominators::NONE;
 use crate::report::{
-    self, Address, Holder, Instance, PathQuery, PathQueryBy, RetainingPath, RetainingPathKind,
-    RetainingPathReport, SchemaVersion, TypeLocation, TypeQueryKind, TypeQueryReport,
+    self, Address, Holder, Instance, KeptBy, PathQuery, PathQueryBy, RetainingPath,
+    RetainingPathKind, RetainingPathReport, SchemaVersion, SizeGroup, TypeLocation, TypeQueryKind,
+    TypeQueryReport,
 };
 use crate::{format_address, notes, snapshot_summary, Error, PathTarget, QueryOptions, Result};
 
@@ -104,6 +105,8 @@ pub(crate) fn query_type(
     });
     holders.truncate(opts.top);
 
+    let (kept_by, by_size) = kept_by(a, &inst, opts.top)?;
+
     let total = inst.len() as u64;
     rank_by_retained(a, &mut inst, opts.top);
     inst.truncate(opts.top);
@@ -153,9 +156,181 @@ pub(crate) fn query_type(
         retained_bytes,
         top_instances,
         holders,
+        kept_by,
+        by_size,
         notes,
     };
     Ok((report, inst))
+}
+
+/// Holders a type's instances are attributed to: the heap's largest
+/// disjoint holders, as `top_retainers` picks them.
+const KEEPERS: usize = 64;
+/// Instances per group whose paths are rendered to find the common one.
+const THROUGH_SAMPLES: usize = 256;
+
+#[derive(Default)]
+struct KeptAgg {
+    instances: u64,
+    bytes: u64,
+    sizes: HashMap<u64, (u64, u64)>,
+    samples: Vec<u32>,
+}
+
+/// Size groups from `(size → (count, bytes))`, most bytes first.
+fn size_groups(m: &HashMap<u64, (u64, u64)>, top: usize) -> Vec<SizeGroup> {
+    let mut v: Vec<SizeGroup> = m
+        .iter()
+        .map(|(&size, &(blocks, bytes))| SizeGroup {
+            size,
+            blocks,
+            bytes,
+        })
+        .collect();
+    v.sort_by(|x, y| y.bytes.cmp(&x.bytes).then(x.size.cmp(&y.size)));
+    v.truncate(top);
+    v
+}
+
+/// The instances grouped by what keeps them alive (`kept_by`), and by size
+/// (`by_size`).
+fn kept_by(a: &Analysis, inst: &[u32], top: usize) -> Result<(Vec<KeptBy>, Vec<SizeGroup>)> {
+    let snap = a.snap;
+    let keepers = a.top_retainers(KEEPERS)?;
+    // Each node's listed ancestor in the dominator tree (or itself).
+    let n = a.root() as usize;
+    let mut holder = vec![u32::MAX; n + 1];
+    for (k, &v) in keepers.iter().enumerate() {
+        holder[v as usize] = k as u32;
+    }
+    for &v in &a.order[1..] {
+        if holder[v as usize] == u32::MAX {
+            let p = a.idom[v as usize];
+            if p != NONE {
+                holder[v as usize] = holder[p as usize];
+            }
+        }
+    }
+    // Group key: keeper index, or OTHER, or UNREACHABLE.
+    const OTHER: u32 = u32::MAX - 1;
+    const UNREACHABLE: u32 = u32::MAX;
+    let mut groups: HashMap<u32, KeptAgg> = HashMap::new();
+    let mut all_sizes: HashMap<u64, (u64, u64)> = HashMap::new();
+    for &v in inst {
+        let size = snap.object(v).shallow_size;
+        let key = if !a.reachable(v) {
+            UNREACHABLE
+        } else if holder[v as usize] == u32::MAX {
+            OTHER
+        } else {
+            holder[v as usize]
+        };
+        let g = groups.entry(key).or_default();
+        g.instances += 1;
+        g.bytes += size;
+        let e = g.sizes.entry(size).or_default();
+        e.0 += 1;
+        e.1 += size;
+        if g.samples.len() < THROUGH_SAMPLES {
+            g.samples.push(v);
+        }
+        let e = all_sizes.entry(size).or_default();
+        e.0 += 1;
+        e.1 += size;
+    }
+    let mut out = Vec::new();
+    for (key, g) in groups {
+        let (kind, keeper) = match key {
+            UNREACHABLE => ("unreachable", None),
+            OTHER => ("other", None),
+            k => ("holder", Some(keepers[k as usize])),
+        };
+        let (through, through_pct) = if key == UNREACHABLE {
+            (None, None)
+        } else {
+            let mut paths: HashMap<String, u64> = HashMap::new();
+            for &v in &g.samples {
+                *paths.entry(through_path(a, keeper, v)?).or_default() += 1;
+            }
+            let best = paths
+                .into_iter()
+                .max_by(|x, y| x.1.cmp(&y.1).then_with(|| y.0.cmp(&x.0)));
+            match best {
+                Some((p, c)) => (
+                    Some(p),
+                    Some((c * 100 / g.samples.len().max(1) as u64) as u32),
+                ),
+                None => (None, None),
+            }
+        };
+        let (holder_path, holder_address) = match keeper {
+            Some(k) => (
+                a.path(k)?.map(|p| crate::root_path_string(&p)),
+                Some(Address(snap.object(k).addr)),
+            ),
+            None => (None, None),
+        };
+        out.push(KeptBy {
+            kind: kind.to_string(),
+            holder: holder_path,
+            holder_address,
+            through,
+            through_pct,
+            instances: g.instances,
+            bytes: g.bytes,
+            sizes: size_groups(&g.sizes, 3),
+        });
+    }
+    out.sort_by(|x, y| y.bytes.cmp(&x.bytes).then_with(|| x.holder.cmp(&y.holder)));
+    out.truncate(top);
+    Ok((out, size_groups(&all_sizes, top)))
+}
+
+/// The path from `keeper` to `v`, generalised: `[<key>] app.Session → .payload`.
+/// Taken from `v`'s shortest path, from just after `keeper`; if that path
+/// does not pass through `keeper` (or there is no keeper), the whole path
+/// from its root.
+fn through_path(a: &Analysis, keeper: Option<u32>, v: u32) -> Result<String> {
+    let chain = a.bfs_chain(v);
+    let start = keeper
+        .and_then(|k| chain.iter().position(|&(x, _)| x == k))
+        .map_or(0, |i| i + 1);
+    let mut out = String::new();
+    for (i, &(x, e)) in chain.iter().enumerate().skip(start) {
+        match a.edge_label(e) {
+            Some(l) => {
+                let label = generalised_label(a.snap, l)?;
+                if !out.is_empty() {
+                    out.push_str(" → ");
+                }
+                out.push_str(&label);
+            }
+            None => {
+                if let Some((label, _)) = a.g.root_label(a.snap, e)? {
+                    out.push_str(&label);
+                }
+            }
+        }
+        // Name the type reached after each hop but the last (that is the
+        // queried type itself).
+        if i + 1 < chain.len() {
+            let t = a.type_name(x);
+            out.push(' ');
+            out.push_str(t.strip_prefix("builtins.").unwrap_or(t));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("(directly)");
+    }
+    // A module's namespace reads as code does: `sys.modules['m'] module →
+    // .__dict__ dict → [<key>]` is `m.<global>`.
+    if let Some(rest) = out.strip_prefix("sys.modules['") {
+        const NS: &str = "'] module → .__dict__ dict → [<key>]";
+        if let Some(i) = rest.find(NS) {
+            out = format!("{}.<global>{}", &rest[..i], &rest[i + NS.len()..]);
+        }
+    }
+    Ok(out)
 }
 
 /// Up to `max` distinct shortest paths to each target: the BFS path, then

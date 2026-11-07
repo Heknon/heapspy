@@ -636,7 +636,43 @@ pub struct TypeQueryReport {
     /// Who holds the instances: direct referrers grouped by referrer type and
     /// edge label, by count, largest first.
     pub holders: Vec<Holder>,
+    /// The instances grouped by what keeps them alive: the holder whose
+    /// dominator subtree they are in, and the path from it to them. Most
+    /// bytes first, at most `--top`. Added in 0.3; empty in older documents.
+    #[serde(default)]
+    pub kept_by: Vec<KeptBy>,
+    /// The instances grouped by shallow size, most bytes first, at most
+    /// `--top`. Added in 0.3.
+    #[serde(default)]
+    pub by_size: Vec<SizeGroup>,
     pub notes: Vec<Note>,
+}
+
+/// One entry of `kept_by`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptBy {
+    /// `"holder"`: in the dominator subtree of `holder`, one of the largest
+    /// disjoint holders of the heap (as `top_retainers` lists them).
+    /// `"other"`: reachable, but under none of those (held by many small
+    /// holders). `"unreachable"`: nothing reaches them (for native blocks:
+    /// leaked; for Python objects: garbage awaiting collection).
+    pub kind: String,
+    /// Root path of the holder; `null` unless `kind` is `"holder"`.
+    pub holder: Option<String>,
+    pub holder_address: Option<Address>,
+    /// The most common path from the holder to the instances, with keys
+    /// and indices generalised and the type reached after each hop, e.g.
+    /// `"[<key>] app.session.Session → .payload"`. For `"other"`, the most
+    /// common path from a root. `null` for `"unreachable"`.
+    pub through: Option<String>,
+    /// Share of the sampled instances that `through` describes, in whole
+    /// percent.
+    pub through_pct: Option<u32>,
+    pub instances: u64,
+    /// Their shallow bytes.
+    pub bytes: u64,
+    /// Their sizes, most bytes first, at most 3.
+    pub sizes: Vec<SizeGroup>,
 }
 
 /// One entry of `top_instances`.

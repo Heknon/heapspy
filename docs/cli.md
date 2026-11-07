@@ -128,7 +128,12 @@ A full-screen view that keeps refreshing:
      over the last 10 minutes.
   5. **Allocated**: with allocation sampling, the Python stacks that
      allocated the most and how much of it is still alive.
-- **Enter** opens details: a type's largest instances and what holds them,
+- **Enter** opens details. On an object row: what keeps those objects
+  alive, grouped by holder, with the path from each holder to them and
+  their sizes (`92% app.cache.CACHE 2081 B ×660, through [<key>]
+  app.cache.Session → .payload`), then their sizes, largest instances and
+  direct referrers; this is `heapspy query --type` on the latest snapshot.
+  Elsewhere:
   a holder's path from its root, a thread's whole stack, an allocation
   stack.
 
@@ -240,10 +245,17 @@ and costs.
 
 ```sh
 heapspy query app.hpy --type app.session.Session
+heapspy query app.hpy --type native.heap_block      # who keeps native blocks, and how
 heapspy query app.hpy --retaining-path 0x7f3a2c41b0d0
 heapspy query app.hpy --retaining-path-type Session --top 3
 heapspy query app.hpy --locate app.cache.Store.get
 ```
+
+`--type` groups the instances by what keeps them alive: the holder whose
+dominator subtree they are in, the most common path from it to them, and
+their sizes. Instances nothing reaches are their own group (leaked for
+native blocks). Then come their sizes, the largest instances, and the direct
+referrers.
 
 ## diff
 

@@ -335,7 +335,10 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
                         Ok(heapspy_analyzer::render::type_query(&r)?
                             .lines()
                             .map(|l| match l {
-                                "Largest instances" | "Held by" => format!("# {l}"),
+                                "Kept alive by" | "Sizes" | "Largest instances"
+                                | "Referenced by" => {
+                                    format!("# {l}")
+                                }
                                 l if l.starts_with("note:") => format!("~ {l}"),
                                 l => readable_paths(l),
                             })

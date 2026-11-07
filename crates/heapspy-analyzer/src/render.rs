@@ -339,6 +339,7 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
         format_bytes(r.shallow_bytes),
         format_bytes(r.retained_bytes)
     );
+    kept_by_section(&mut out, r);
     out.push_str("\nLargest instances\n\n");
     // Instances that are functions, classes, modules or code objects get a
     // column with their own location.
@@ -384,7 +385,7 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
         })
         .collect();
     table_with_extra(&mut out, &header, &rows, &[0, 1, 2], &extra);
-    out.push_str("\nHeld by\n\n");
+    out.push_str("\nReferenced by\n\n");
     if r.holders.is_empty() {
         out.push_str("  (no references from other objects)\n");
     } else {
@@ -397,6 +398,84 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
     }
     notes(&mut out, &r.notes);
     Ok(out)
+}
+
+/// "Kept alive by": the instances grouped by the holder that keeps them,
+/// with the path from it and their sizes; then the sizes of all of them.
+fn kept_by_section(out: &mut String, r: &TypeQueryReport) {
+    if r.kept_by.is_empty() {
+        return;
+    }
+    out.push_str("\nKept alive by\n\n");
+    let rows: Vec<Vec<String>> = r
+        .kept_by
+        .iter()
+        .map(|k| {
+            let who = match (k.kind.as_str(), &k.holder) {
+                ("holder", Some(h)) => summary::holder_name(h),
+                ("unreachable", _) if r.matched_types.iter().all(|t| t.starts_with("native.")) => {
+                    "nothing: leaked (no pointer to them anywhere)".to_string()
+                }
+                ("unreachable", _) => "nothing: garbage awaiting collection".to_string(),
+                _ => "smaller holders".to_string(),
+            };
+            vec![
+                format!(
+                    "{:.0}%",
+                    k.bytes as f64 * 100.0 / r.shallow_bytes.max(1) as f64
+                ),
+                who,
+                k.instances.to_string(),
+                format_bytes(k.bytes),
+                k.sizes
+                    .iter()
+                    .take(2)
+                    .map(|g| format!("{} B ×{}", g.size, g.blocks))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ]
+        })
+        .collect();
+    let extra: Vec<String> = r
+        .kept_by
+        .iter()
+        .map(|k| match (&k.through, k.through_pct) {
+            (Some(t), Some(p)) if p >= 99 => {
+                format!(
+                    "        through {}\n",
+                    style::shorten(&summary::holder_name(t), 90)
+                )
+            }
+            (Some(t), Some(p)) => format!(
+                "        through {}  ({p}% of them)\n",
+                style::shorten(&summary::holder_name(t), 90)
+            ),
+            _ => String::new(),
+        })
+        .collect();
+    table_with_extra(
+        out,
+        &["share", "kept by", "instances", "bytes", "sizes"],
+        &rows,
+        &[0, 2, 3],
+        &extra,
+    );
+    if r.by_size.len() > 1 {
+        out.push_str("\nSizes\n\n");
+        let rows: Vec<Vec<String>> = r
+            .by_size
+            .iter()
+            .take(8)
+            .map(|g| {
+                vec![
+                    format!("{} B", g.size),
+                    g.blocks.to_string(),
+                    format_bytes(g.bytes),
+                ]
+            })
+            .collect();
+        table(out, &["size", "instances", "bytes"], &rows, &[0, 1, 2]);
+    }
 }
 
 /// `heapspy query --retaining-path` text output.

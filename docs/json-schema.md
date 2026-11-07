@@ -447,7 +447,22 @@ name, so two type objects with the same `module.qualname` are one row.
 | `retained_bytes` | integer | retained size of the set, as for TypeRow |
 | `top_instances` | array of Instance | largest by `retained_bytes` |
 | `holders` | array of Holder | direct referrers, grouped, by `count` |
+| `kept_by` | array of KeptBy | the instances grouped by what keeps them alive, most bytes first, at most `--top` (below). Added in 0.3 |
+| `by_size` | array | the instances grouped by shallow size, `{size, blocks, bytes}` (`blocks` counts instances), most bytes first, at most `--top`. Added in 0.3 |
 | `notes` | array of Note | |
+
+KeptBy (`kept_by[]`):
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | string | `holder`: in the dominator subtree of `holder`, one of the heap's 64 largest disjoint holders (as `top_retainers` picks them); `other`: reachable but under none of them; `unreachable`: nothing reaches them (leaked for `native.*`, garbage awaiting collection for Python objects) |
+| `holder` | string, nullable | the holder's root path; `null` unless `kind` is `holder` |
+| `holder_address` | string, nullable | the holder's address |
+| `through` | string, nullable | the most common path from the holder to the instances (from a root for `other`), keys and indices generalised, the type reached after each hop: `"[<key>] app.session.Session → .payload"`. `null` for `unreachable` |
+| `through_pct` | integer, nullable | percent of sampled instances (up to 256 per group) that `through` describes |
+| `instances` | integer | instances in the group |
+| `bytes` | integer | their shallow bytes |
+| `sizes` | array | their sizes, `{size, blocks, bytes}`, most bytes first, at most 3 |
 
 Instance:
 
