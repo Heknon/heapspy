@@ -207,6 +207,7 @@ Codes defined so far:
 | `unreachable_target` | a retaining-path target has no path from any root |
 | `image_incomplete` | dump: `image.missing_bytes` is non-zero |
 | `read_errors` | dump: `read_errors` is non-zero |
+| `recaptured` | dump `--pid`: the first capture's GC lists could not be followed, so the target was captured again (up to 3 captures in all) |
 | `allocations_pid_mismatch` | `--allocations`: the profile was recorded from another pid than the (live-process) snapshot |
 | `allocations_python_mismatch` | `--allocations`: the profile and the snapshot name different CPython versions |
 | `allocations_after_snapshot` | `--allocations`: the snapshot was taken before recording started, so no sampled allocation can be in it |
