@@ -248,7 +248,8 @@ mod imp {
     fn syscall_info(tid: i32) -> Option<[u8; 88]> {
         let mut b = [0u8; 88];
         // SAFETY: the kernel writes at most `b.len()` bytes into `b`.
-        let r = unsafe { libc::ptrace(PTRACE_GET_SYSCALL_INFO, tid, b.len(), b.as_mut_ptr()) };
+        // `as _`: glibc's ptrace takes the request as c_uint, musl's as c_int.
+        let r = unsafe { libc::ptrace(PTRACE_GET_SYSCALL_INFO as _, tid, b.len(), b.as_mut_ptr()) };
         (r > 0).then_some(b)
     }
 
