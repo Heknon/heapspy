@@ -108,7 +108,10 @@
 //!   big-endian targets, and glibc before 2.30 (one-byte tcache counts).
 //! - A brk heap merged by the kernel with the anonymous mapping before it
 //!   (no ASLR) is found only by a live source, which knows `[heap]`.
-//! - Anonymous mappings holding a thread's stack pointer are skipped.
+//! - Thread stacks are anonymous memory too, and the kernel may merge one
+//!   with a neighbouring mmapped chunk, so they are scanned like the rest;
+//!   a would-be mmapped chunk that holds a thread's stack pointer is
+//!   rejected.
 
 use std::collections::HashSet;
 
@@ -196,7 +199,6 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
         .iter()
         .filter(|r| r.file.is_none() && r.perms.read && r.perms.write && r.size > 0)
         .filter_map(|r| Span::new(r.start, r.start.checked_add(r.size)?))
-        .filter(|s| !stacks.iter().any(|&sp| s.contains(sp)))
         .collect();
     let merged = coalesce(&anon);
     // libc's writable data, where `main_arena` is.
@@ -379,7 +381,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     excluded.extend(main_spans);
     let mut pages = MAX_SCAN_PAGES;
     for seg in subtract(&merged, &excluded) {
-        w.scan_mmapped(seg, &mut pages, &mut out);
+        w.scan_mmapped(seg, &stacks, &mut pages, &mut out);
     }
 
     out.sort_unstable_by_key(|b| b.start);
@@ -811,8 +813,9 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
         Vec::new()
     }
 
-    /// Find mmapped chunks in `seg`, page by page.
-    fn scan_mmapped(&self, seg: Span, pages: &mut u64, out: &mut Vec<NativeBlock>) {
+    /// Find mmapped chunks in `seg`, page by page. None holds a stack
+    /// pointer in `stacks`.
+    fn scan_mmapped(&self, seg: Span, stacks: &[u64], pages: &mut u64, out: &mut Vec<NativeBlock>) {
         let mut p = align_up(seg.start, PAGE);
         let mut min_block = seg.start;
         'pages: while p < seg.end && *pages > 0 {
@@ -825,7 +828,14 @@ impl<S: MemorySource + ?Sized> Walker<'_, S> {
                 let Some((ps, word)) = self.header(c) else {
                     continue;
                 };
-                if let Some((block, total)) = mmapped_at(c, ps, word, seg, min_block) {
+                let found = mmapped_at(c, ps, word, seg, min_block).filter(|&(b, t)| {
+                    let m = Span {
+                        start: b,
+                        end: b + t,
+                    };
+                    !stacks.iter().any(|&sp| m.contains(sp))
+                });
+                if let Some((block, total)) = found {
                     out.push(NativeBlock {
                         start: block,
                         size: total,
@@ -1495,13 +1505,17 @@ mod tests {
     }
 
     #[test]
-    fn stacks_are_not_scanned() {
+    fn no_mmapped_chunk_holds_a_stack_pointer() {
         const S: u64 = 0x7ffd_0000_0000;
         let mut w = World::new(TargetInfo::LINUX_X86_64);
-        let (brk, want) = simple_brk_heap(V2_31, BRK, 0x4000);
+        let (brk, mut want) = simple_brk_heap(V2_31, BRK, 0x4000);
         w.bytes.regions.push((BRK, brk));
-        w.bytes.region(S, 0x4000);
+        // A stack whose bytes look like a chunk header, merged by the
+        // kernel with a real mmapped chunk right above it.
+        w.bytes.region(S, 0x6000);
         w.bytes.poke(S + 8, 0x4000 | IS_MMAPPED);
+        w.bytes.poke(S + 0x4000 + 8, 0x2000 | IS_MMAPPED);
+        want.push(large(S + 0x4000, 0x2000));
         w.threads.push(ThreadInfo {
             tid: 1,
             name: None,

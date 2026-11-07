@@ -77,6 +77,13 @@ jobs:
         run: uv python install "$PY_VERSION"
       - name: Build heapspy
         run: cargo build --release --locked -p heapspy
+      - name: Native heap walker (glibc) on a real CPython
+        # Live and gcore: every buffer the victim mallocs must be in a busy
+        # block. ptrace_scope is 0 (above) and gdb is installed.
+        run: |
+          py="$(uv python find --python-preference only-managed "$PY_VERSION")"
+          HEAPSPY_PY="$py" cargo test --release --locked -p heapspy-reader \
+              --test native_heap_live -- --ignored --test-threads 1 --nocapture
       - name: Check out heapspy-mcp
         if: inputs.mcp_ref != ''
         uses: actions/checkout@v4
