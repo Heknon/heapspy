@@ -114,6 +114,24 @@ fn sleeper() -> Child {
     Child(Command::new("sleep").arg("60").spawn().expect("run sleep"))
 }
 
+/// Whether this process may read a sibling process: root, or Yama
+/// `ptrace_scope` 0. GitHub's runners are neither by default.
+#[cfg(target_os = "linux")]
+fn may_read_siblings() -> bool {
+    let root = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(|u| u == "0"))
+        })
+        .unwrap_or(false);
+    let scope0 = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim() == "0")
+        .unwrap_or(true);
+    root || scope0
+}
+
 /// `--json` on a pid that is not CPython reports `not_python` and writes
 /// nothing: the recorders check the target before attaching.
 #[cfg(target_os = "linux")]
@@ -123,6 +141,14 @@ fn record_json_on_a_non_python_pid_is_not_python() {
     let pid = child.0.id().to_string();
     let (status, doc, written) = record_json(&["--pid", &pid, "--duration", "1s"]);
     assert_eq!(status, Some(1));
+    if error_code(&doc) == "permission_denied" && !may_read_siblings() {
+        eprintln!(
+            "skipped: not root and kernel.yama.ptrace_scope is not 0, so heapspy \
+             may not read a sibling process here (it reported permission_denied)"
+        );
+        assert!(!written);
+        return;
+    }
     assert_eq!(error_code(&doc), "not_python", "{doc}");
     let msg = doc["error"]["message"].as_str().unwrap();
     assert!(msg.contains("cannot record pid"), "{msg}");
