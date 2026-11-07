@@ -94,11 +94,13 @@ Example output (abridged; the full report also lists leaked native blocks by siz
 Memory 65.0 MiB resident
   · Python objects 25.7 MiB 39%   · Native, in use 23.9 MiB 37%   · Native, leaked 4.6 MiB 7%
 
-What the memory is                       count       size      each  keeps alive   mostly held by
-  native malloc blocks, in use            1483   23.5 MiB  16.2 KiB     23.5 MiB   app.native.BUFFERS 100%
-  bytes                                  11664   18.7 MiB   1.6 KiB     18.7 MiB   app.cache.CACHE 99%
-  native malloc blocks, leaked            1272    4.6 MiB   3.7 KiB      4.6 MiB   nothing: leaked
-  app.cache.Session                       9340  875.6 KiB      96 B     20.1 MiB   app.cache.CACHE 100%
+What the memory is                mostly held by              count       size     each  keeps alive
+  native malloc blocks, in use     98% app.native.BUFFERS      1483   23.5 MiB 16.2 KiB     23.5 MiB
+  bytes                            99% app.cache.CACHE        11664   18.7 MiB  1.6 KiB     18.7 MiB
+  native malloc blocks, leaked    nothing: leaked              1272    4.6 MiB  3.7 KiB      4.6 MiB
+  bytearray                       100% …EGISTRY.listeners       282    2.2 MiB  8.1 KiB      2.2 MiB
+  interpreter internals           the interpreter itself       1120  964.5 KiB    881 B    964.5 KiB
+  app.cache.Session               100% app.cache.CACHE         9340  875.6 KiB     96 B     20.1 MiB
 
 Who holds it                                                    retained    python    native   share
  1  app.native.BUFFERS                                          23.5 MiB  14.9 KiB  23.4 MiB   47.3%

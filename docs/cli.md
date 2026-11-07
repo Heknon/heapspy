@@ -55,12 +55,13 @@ Memory 65.0 MiB resident  ██████████████████
   ■ Python objects 25.7 MiB 39%   ■ Native, in use 23.9 MiB 37%   ■ Native, leaked 4.6 MiB 7%
   ■ Code, files, stacks 10.0 MiB 15%
 
-What the memory is                       count       size      each  keeps alive   mostly held by
-  native malloc blocks, in use            1483   23.5 MiB  16.2 KiB     23.5 MiB   app.native.BUFFERS 100%
-  bytes                                  11664   18.7 MiB   1.6 KiB     18.7 MiB   app.cache.CACHE 99%
-  native malloc blocks, leaked            1272    4.6 MiB   3.7 KiB      4.6 MiB   nothing: leaked
-  bytearray                                282    2.2 MiB   8.1 KiB      2.2 MiB   app.events.REGISTRY.listeners 100%
-  app.cache.Session                       9340  875.6 KiB      96 B     20.1 MiB   app.cache.CACHE 100%
+What the memory is                mostly held by              count       size     each  keeps alive
+  native malloc blocks, in use     98% app.native.BUFFERS      1483   23.5 MiB 16.2 KiB     23.5 MiB
+  bytes                            99% app.cache.CACHE        11664   18.7 MiB  1.6 KiB     18.7 MiB
+  native malloc blocks, leaked    nothing: leaked              1272    4.6 MiB  3.7 KiB      4.6 MiB
+  bytearray                       100% …EGISTRY.listeners       282    2.2 MiB  8.1 KiB      2.2 MiB
+  interpreter internals           the interpreter itself       1120  964.5 KiB    881 B    964.5 KiB
+  app.cache.Session               100% app.cache.CACHE         9340  875.6 KiB     96 B     20.1 MiB
 
 Who holds it                                                    retained    python    native   share
  1  app.native.BUFFERS                                          23.5 MiB  14.9 KiB  23.4 MiB   47.3%
@@ -70,7 +71,8 @@ Who holds it                                                    retained    pyth
 ```
 
 **What the memory is** has one row per type, by the bytes its objects take
-themselves (`size`). The interpreter's own objects (code, classes,
+themselves (`size`), and next to it the holder that keeps most of them
+alive and the share it keeps. The interpreter's own objects (code, classes,
 descriptors, modules) are folded into one `interpreter internals` row; in
 `top`, one that grows keeps its own row, and `i` lists them all. Native `malloc` blocks are rows too, split into blocks
 something points to and leaked blocks nothing points to. `keeps alive` is
