@@ -52,6 +52,48 @@ uvx ruff check tests/e2e && uvx ruff format --check tests/e2e
 See [tests/e2e/README.md](tests/e2e/README.md) for choosing interpreters and
 adding a fixture.
 
+Live `heapspy record` tests (`.github/workflows/record.yml`) record real
+CPython 3.12, 3.13 and 3.14 processes through every mechanism:
+
+| Trigger | What runs |
+|---|---|
+| PR label `ci:record` | Linux (eBPF, ptrace, as root) and Windows (ETW, debugger) |
+| tag push matching `v*` | both |
+| manual dispatch (Actions tab) | both, or one with `side: linux` or `side: windows` |
+
+On Linux the job prints what the runner's kernel supports
+(`scripts/record-kernel-check.sh`). If the eBPF recorder cannot run there,
+only the ptrace tests run, and the job summary lists the skipped eBPF tests
+and the reason; the job fails if any selected test did not pass.
+
+Run them locally. Linux, as root (or with `CAP_BPF`, `CAP_PERFMON` and
+`CAP_SYS_PTRACE`), with gdb for the `gcore` tests:
+
+```sh
+uv python install 3.12 3.13 3.14
+export HEAPSPY_PY312="$(uv python find --python-preference only-managed 3.12)"
+export HEAPSPY_PY313="$(uv python find --python-preference only-managed 3.13)"
+export HEAPSPY_PY314="$(uv python find --python-preference only-managed 3.14)"
+cargo test -p heapspy --test record_live -- --ignored --test-threads 1
+cargo test -p heapspy --test cpython_live -- --ignored --test-threads 1
+cargo test -p heapspy-record --test live_stack -- --ignored --test-threads 1
+```
+
+Run as a normal user, build first (`cargo test --no-run`) and run the test
+binaries with `sudo env HEAPSPY_PY312=... <binary> --ignored --test-threads 1`;
+`sudo -E` is ignored by the sudo of recent Ubuntu releases.
+
+Windows, from an elevated prompt, with the same `HEAPSPY_PY31X` variables
+(or uv on `PATH`):
+
+```sh
+cargo test -p heapspy --test record_live_windows -- --ignored --test-threads 1 --nocapture
+```
+
+Close xperf, WPR and Process Monitor first: the ETW tests need the
+`NT Kernel Logger` session. The two `kill_mid_run_*` tests fail today; see
+[docs/windows-record-test-plan.md](docs/windows-record-test-plan.md).
+
 ### Release workflow
 
 `.github/workflows/release.yml` builds the PyPI wheels and sdists and

@@ -401,7 +401,7 @@ impl ElfCore {
                 }
                 let path = self.paths[pid].clone();
                 Some(Module {
-                    name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+                    name: module_name(&path).to_string(),
                     build_id: symbols::elf::read_build_id(self, base),
                     path,
                     base,
@@ -640,6 +640,13 @@ impl MemorySource for ElfCore {
     }
 }
 
+/// The file name of a module path recorded in an ELF core. Cores record
+/// POSIX paths (`NT_FILE`), so the name is the part after the last `/`,
+/// whatever the host that reads the core uses as a separator.
+fn module_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +754,17 @@ mod tests {
     }
 
     #[test]
+    fn module_names_come_from_posix_paths() {
+        assert_eq!(
+            module_name("/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0"),
+            "libpython3.12.so.1.0"
+        );
+        assert_eq!(module_name("/usr/bin/python3.13"), "python3.13");
+        assert_eq!(module_name("python3"), "python3");
+        assert_eq!(module_name("/opt/app/"), "");
+    }
+
+    #[test]
     fn reads_segments_threads_and_modules() {
         let dir = tempfile::tempdir().unwrap();
         // A fake "library": an ELF header page followed by data that the core omits.
@@ -799,7 +817,9 @@ mod tests {
 
         let mods = core.modules().unwrap();
         assert_eq!(mods.len(), 1, "{mods:?}");
-        assert_eq!(mods[0].name, "libfake.so");
+        // The test records a host temp path; on Windows it has no `/`.
+        assert_eq!(mods[0].name, module_name(&lib.to_string_lossy()));
+        assert_eq!(mods[0].path, lib.to_string_lossy());
         assert_eq!(mods[0].base, 0x40_0000);
         assert_eq!(mods[0].size, 0x2000);
 

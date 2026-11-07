@@ -140,3 +140,29 @@ The parser is plain Rust with no Windows dependency. Copy the `.dmp` file and
 run `heapspy dump --minidump app.dmp -o app.hpy` on Linux or macOS. The file
 is memory-mapped, so converting a multi-GiB dump does not need that much RAM;
 it must not be modified while heapspy reads it.
+
+## Recording (`heapspy record`)
+
+`heapspy record` on Windows records pymalloc arenas through ETW: a real-time kernel session with `VirtualAlloc` events, and Python frames sampled every 5 ms and matched by time, so they are flagged approximate. It does not stop the target. `--mechanism auto` is ETW only.
+
+`--mechanism debugger` gives exact stacks: a breakpoint on `VirtualAlloc`, with the stack read while the thread is stopped. Every breakpoint stops every thread of the target. On windows-latest the target was stopped for 2.5 to 2.9 s of a 3 s recording, so this mechanism is used only when asked for, and heapspy prints a warning when it is. The design and results are in [allocation-sampling.md](allocation-sampling.md#windows-etw-plus-debugger-breakpoints) and [windows-record-test-plan.md](windows-record-test-plan.md).
+
+### When heapspy is killed
+
+If heapspy dies while recording (`TerminateProcess`, `taskkill /F`, a crash), a **guardian** process cleans up after it:
+
+- The recorder starts `heapspy __guardian <recorder pid>` before it changes anything. The guardian runs in its own process group, so Ctrl-Break to the recorder does not reach it. It breaks away from the recorder's job when the job allows that. It watches the recorder's process handle and its stdin pipe.
+- The recorder tells it what it changes: each byte, *before* writing `int3` there, and again after writing the original back; the ETW session it started; and a duplicate of its debug object. Because the guardian holds that handle, the debug object outlives a killed recorder. The target stays attached to it, with the dead recorder's pending debug state intact.
+- When the recorder ends without saying `done`, the guardian installs the debug object as its own and becomes the target's debugger. It writes back each original byte, but only where the byte still holds heapspy's `int3`; other bytes are skipped and reported. It then suspends each thread in turn. A thread stopped just after one of our `int3`s is rewound onto the restored instruction, a trap flag is cleared, and an event the recorder had read but not continued is continued. Events still queued are handled the same way until the target is quiet. Then it detaches, stops heapspy's ETW session by name, and writes one line to stderr and the details to `<profile>.guardian.log`. It never runs code inside the target.
+- On a clean finish, an error, or a panic, the recorder detaches and stops the session itself, then sends `done`. The guardian exits without acting. It also exits when the target exits, unless an ETW session still needs stopping.
+- **Found on windows-latest** (two `kill_mid_run_debugger` runs, `TerminateProcess` 2.5 s into a debugger recording):
+  - Always: the `int3` on `VirtualAlloc`'s first byte (restored, `0xcc -> 0x48`) and the debug attachment. The debug object outlived the recorder because the guardian held it, so the target stayed attached until the guardian detached it.
+  - In one run, also a thread in the middle of a step over the breakpoint: its trap flag was set and its `EXCEPTION_SINGLE_STEP` event had been read by the recorder and not continued. The thread was blocked in that event. The guardian cleared the flag and continued the event (`DBG_CONTINUE`). Left alone, the thread stays blocked until the debug object closes, and then the target dies with `STATUS_SINGLE_STEP` (0x80000004) or, from the `int3`, `STATUS_BREAKPOINT` (0x80000003).
+  - No thread was seen stopped right after an `int3` (`rip` one past a patched byte). The rewind is there for a kill that lands inside a breakpoint hit.
+
+**Limits.**
+- A process-tree kill (`taskkill /T /F`, a job object closed with kill-on-close where breakaway is not allowed) also kills the guardian. Then the `int3` stays in the target, and the ETW session keeps running until the next `heapspy record` stops it (see below) or `logman stop heapspy-<pid> -ets`.
+- A library embedding the recorder needs a `heapspy.exe`: `HEAPSPY_GUARDIAN_EXE`, or one next to its executable or one directory up. Without it the recording runs and warns that nothing will clean up after a kill.
+- The guardian treats any trap flag in the target as the recorder's. A target that single-steps itself under heapspy's debugger is not supported anyway.
+
+**ETW session.** The session is `heapspy-<recorder pid>`, a `SystemTraceProvider` session in `EVENT_TRACE_SYSTEM_LOGGER_MODE` (Windows 8 / Server 2012 and later; confirmed on windows-latest), so it does not take the single `NT Kernel Logger`, and two recordings or another kernel tracer can run side by side. Where Windows refuses the mode, heapspy falls back to `NT Kernel Logger`. At start, sessions named exactly `heapspy-<pid>` whose pid is not a running heapspy are stopped, and the stop is printed. No session of any other name is touched. A real conflict fails with `unsupported`, and the message names the session. Stopping a system logger session needs a bare properties block (sizes and name offsets): passing the start block, with its GUID and kernel flags, fails with `ERROR_INVALID_PARAMETER`.

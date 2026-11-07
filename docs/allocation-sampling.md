@@ -75,10 +75,12 @@ Arenas only, with exact stacks (`linux_ptrace.rs`). Every thread is seized with 
 
 ## Windows: ETW plus debugger breakpoints
 
-**As built** (`crates/heapspy-record/src/windows.rs`; compiled and unit-tested on Linux, not yet run on Windows, see [the test plan](windows-record-test-plan.md)):
+**As built** (`crates/heapspy-record/src/windows.rs`; run on `windows-latest` with CPython 3.12 to 3.14, see [the test plan](windows-record-test-plan.md)):
 - Arenas only, on both paths. Heap tracing applies only to processes started after `TracingFlags` is set in Image File Execution Options, so it cannot attach to a running process. Large objects go to `heapspy.skipped_events`.
-- ETW: the "NT Kernel Logger" with `EVENT_TRACE_FLAG_VIRTUAL_ALLOC`, `PageFault_VirtualAlloc` events of 1 MiB with `MEM_COMMIT | MEM_RESERVE`, no stack walks. A real-time consumer gets FILETIME timestamps. A side thread samples every Python thread's stack every 5 ms. An event takes the same thread's nearest sample within 20 ms (`windows::matcher`), else no frames. Events are held 2 s so that an arena the debugger also saw is written once, with exact frames. `EventsLost` and `RealTimeBuffersLost` count as dropped.
+- `--mechanism auto` is ETW alone; the debugger runs only with `--mechanism debugger`, which prints a warning (see Decisions).
+- ETW: heapspy's own session `heapspy-<recorder pid>` in system logger mode (falling back to the "NT Kernel Logger" where that mode is refused) with `EVENT_TRACE_FLAG_VIRTUAL_ALLOC`, `PageFault_VirtualAlloc` events of 1 MiB with `MEM_COMMIT | MEM_RESERVE`, no stack walks. A real-time consumer gets FILETIME timestamps. A side thread samples every Python thread's stack every 5 ms. An event takes the same thread's nearest sample within 20 ms (`windows::matcher`), else no frames. Events are held 2 s so that an arena the debugger also saw is written once, with exact frames. `EventsLost` and `RealTimeBuffersLost` count as dropped.
 - Debugger: a breakpoint on `VirtualAlloc` in `kernelbase.dll` (found through the export table, no PDBs). A hit is an arena call when the arguments match and `[rsp]` is in the Python DLL. The stack is read there, and a one-shot breakpoint at the return address gets the result. The event loop is a pure state machine (`windows::debug`) with unit tests. It removes every `int3` and trap flag and drains late hits before `DebugActiveProcessStop`, also on drop.
+- A guardian process restores the target and stops the session when the recorder is killed. See [When heapspy is killed](#when-heapspy-is-killed) below.
 - `live::open`: `ReadProcessMemory`, `EnumProcessModulesEx`, a Toolhelp thread snapshot. Nothing is suspended.
 
 The design as first written:
@@ -96,6 +98,26 @@ ETW records native stacks with low overhead, but it cannot run code at event tim
    - Detach with `DebugActiveProcessStop`. The target is never killed on exit.
 
 Both need an elevated process with `SeDebugPrivilege`. ETW heap tracing on an already running process needs to be confirmed on the Windows versions we support. Pinning that down is part of the spike.
+
+### When heapspy is killed
+
+If heapspy dies while recording (`TerminateProcess`, `taskkill /F`, a crash), a **guardian** process cleans up after it:
+
+- The recorder starts `heapspy __guardian <recorder pid>` before it changes anything. The guardian runs in its own process group, so Ctrl-Break to the recorder does not reach it. It breaks away from the recorder's job when the job allows that. It watches the recorder's process handle and its stdin pipe.
+- The recorder tells it what it changes: each byte, *before* writing `int3` there, and again after writing the original back; the ETW session it started; and a duplicate of its debug object. Because the guardian holds that handle, the debug object outlives a killed recorder. The target stays attached to it, with the dead recorder's pending debug state intact.
+- When the recorder ends without saying `done`, the guardian installs the debug object as its own and becomes the target's debugger. It writes back each original byte, but only where the byte still holds heapspy's `int3`; other bytes are skipped and reported. It then suspends each thread in turn. A thread stopped just after one of our `int3`s is rewound onto the restored instruction, a trap flag is cleared, and an event the recorder had read but not continued is continued. Events still queued are handled the same way until the target is quiet. Then it detaches, stops heapspy's ETW session by name, and writes one line to stderr and the details to `<profile>.guardian.log`. It never runs code inside the target.
+- On a clean finish, an error, or a panic, the recorder detaches and stops the session itself, then sends `done`. The guardian exits without acting. It also exits when the target exits, unless an ETW session still needs stopping.
+- **Found on windows-latest** (two `kill_mid_run_debugger` runs, `TerminateProcess` 2.5 s into a debugger recording):
+  - Always: the `int3` on `VirtualAlloc`'s first byte (restored, `0xcc -> 0x48`) and the debug attachment. The debug object outlived the recorder because the guardian held it, so the target stayed attached until the guardian detached it.
+  - In one run, also a thread in the middle of a step over the breakpoint: its trap flag was set and its `EXCEPTION_SINGLE_STEP` event had been read by the recorder and not continued. The thread was blocked in that event. The guardian cleared the flag and continued the event (`DBG_CONTINUE`). Left alone, the thread stays blocked until the debug object closes, and then the target dies with `STATUS_SINGLE_STEP` (0x80000004) or, from the `int3`, `STATUS_BREAKPOINT` (0x80000003).
+  - No thread was seen stopped right after an `int3` (`rip` one past a patched byte). The rewind is there for a kill that lands inside a breakpoint hit.
+
+**Limits.**
+- A process-tree kill (`taskkill /T /F`, a job object closed with kill-on-close where breakaway is not allowed) also kills the guardian. Then the `int3` stays in the target, and the ETW session keeps running until the next `heapspy record` stops it (see below) or `logman stop heapspy-<pid> -ets`.
+- A library embedding the recorder needs a `heapspy.exe`: `HEAPSPY_GUARDIAN_EXE`, or one next to its executable or one directory up. Without it the recording runs and warns that nothing will clean up after a kill.
+- The guardian treats any trap flag in the target as the recorder's. A target that single-steps itself under heapspy's debugger is not supported anyway.
+
+**ETW session.** The session is `heapspy-<recorder pid>`, a `SystemTraceProvider` session in `EVENT_TRACE_SYSTEM_LOGGER_MODE` (Windows 8 / Server 2012 and later; confirmed on windows-latest), so it does not take the single `NT Kernel Logger`, and two recordings or another kernel tracer can run side by side. Where Windows refuses the mode, heapspy falls back to `NT Kernel Logger`. At start, sessions named exactly `heapspy-<pid>` whose pid is not a running heapspy are stopped, and the stop is printed. No session of any other name is touched. A real conflict fails with `unsupported`, and the message names the session. Stopping a system logger session needs a bare properties block (sizes and name offsets): passing the start block, with its GUID and kernel flags, fails with `ERROR_INVALID_PARAMETER`.
 
 ## Sidecar format (`.hpya`)
 
@@ -189,7 +211,9 @@ Settled while building the shared contracts, before the recorders.
 
 **Mechanism selection.**
 - `--mechanism auto` on Linux tries eBPF, then ptrace. Each recorder's `probe` returns `Unsupported` or `PermissionDenied` to move on.
-- On Windows, `auto` runs ETW and debugger breakpoints together. `etw` or `debugger` runs one; with `debugger` alone, only arenas are recorded.
+- On Windows, `auto` is ETW alone. The debugger stopped the target's threads for 2.5 to 2.9 s of every 3 s recording on windows-latest (every arena call is a breakpoint, plus its return), which is not a default anyone should get without asking. `--mechanism debugger` still gives exact stacks, and prints a warning that names the pause and the guardian. Running both together (the old `auto`) is no longer offered. Only arenas are recorded either way.
+- **Killed recorder (Windows).** The recorder starts a guardian process that holds a duplicate of the debug object, is told of every patched byte before the patch is written, and knows the ETW session. If the recorder dies, the guardian takes over as debugger, restores only bytes that still hold heapspy's `int3`, repairs threads, detaches, and stops the session. A separate process was chosen over a job object or a kill-on-exit debugger because the target must survive and be repaired: nothing in Windows undoes a breakpoint written by a dead debugger. The pure parts (the protocol, the plan, the "still our patch" check, the session names) are in `windows::guardian` and unit-tested on Linux.
+- **ETW session name.** `heapspy-<recorder pid>` in system logger mode instead of the singleton `NT Kernel Logger`: a leftover session no longer blocks every later recording, sessions of dead recorders can be told from other tools' and stopped at start, and nothing else is ever touched.
 - The ptrace fallback records arenas only. It notes the event kinds it skipped in the `heapspy.skipped_events` meta key instead of failing.
 
 **Failure handling.** A recording that fails writes no file; the writer only renames its temporary file into place on success. SIGINT and SIGTERM (Ctrl-C, Ctrl-Break on Windows) end the window early: the recorder detaches and writes a valid profile flagged `truncated`. A recording that dropped samples or outlived its target is also flagged `truncated`.

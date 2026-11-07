@@ -8,7 +8,9 @@ use std::sync::mpsc::Sender;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, ERROR_ACCESS_DENIED,
-    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, HANDLE, LUID,
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_NO_SYSTEM_RESOURCES, ERROR_SUCCESS,
+    ERROR_WMI_INSTANCE_NOT_FOUND, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, HANDLE, LUID,
+    STILL_ACTIVE,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
@@ -22,19 +24,23 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT,
 };
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, OpenTraceW, PageFaultGuid, ProcessTrace, StartTraceW,
-    SystemTraceControlGuid, CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
-    EVENT_TRACE_FLAG_VIRTUAL_ALLOC, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, KERNEL_LOGGER_NAMEW, PROCESSTRACE_HANDLE,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
+    CloseTrace, ControlTraceW, OpenTraceW, PageFaultGuid, ProcessTrace, QueryAllTracesW,
+    StartTraceW, SystemTraceControlGuid, TraceSetInformation, TraceSystemTraceEnableFlagsInfo,
+    CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_VIRTUAL_ALLOC,
+    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+    EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
 use super::clock::filetime_to_unix_ns;
-use super::debug::{DebugIo, Event, Machine, Regs, Reply};
+use super::debug::{DebugIo, Event, Machine, Regs, Reply, INT3};
+use super::guardian::{self, Msg};
+use super::guardian_sys::Link;
 use super::live::{access_error, Handle};
 use crate::error::{Error, Result};
 
@@ -134,6 +140,9 @@ unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
 
 /// The kernel session; stopped on drop.
 pub struct EtwSession {
+    /// The session's name: `heapspy-<pid>`, or `NT Kernel Logger` where a
+    /// system logger session cannot be started.
+    pub name: String,
     control: CONTROLTRACE_HANDLE,
     trace: PROCESSTRACE_HANDLE,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -142,7 +151,7 @@ pub struct EtwSession {
     pub lost: u64,
 }
 
-fn props_buffer() -> Vec<u8> {
+fn props_buffer(system_logger: bool) -> Vec<u8> {
     let name_bytes = 1024 * 2;
     let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes;
     let mut v = vec![0u8; size];
@@ -150,9 +159,16 @@ fn props_buffer() -> Vec<u8> {
     let p = unsafe { &mut *(v.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
     p.Wnode.BufferSize = size as u32;
     p.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    p.Wnode.Guid = SystemTraceControlGuid;
     p.Wnode.ClientContext = 1; // QPC session clock; consumers get FILETIME
-    p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    if system_logger {
+        // Any GUID but SystemTraceControlGuid names a new session; the
+        // system logger mode makes it receive kernel events.
+        p.Wnode.Guid = session_guid();
+        p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
+    } else {
+        p.Wnode.Guid = SystemTraceControlGuid;
+        p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    }
     p.EnableFlags = EVENT_TRACE_FLAG_VIRTUAL_ALLOC;
     p.BufferSize = 64;
     p.MinimumBuffers = 16;
@@ -162,21 +178,189 @@ fn props_buffer() -> Vec<u8> {
     v
 }
 
-impl EtwSession {
-    /// Start the "NT Kernel Logger" with VirtualAlloc events and consume
-    /// it on a thread. Errors: access denied (not elevated), or the kernel
-    /// logger already in use by another tool.
-    pub fn start(pid: u32, arena_size: u64, tx: Sender<EtwAlloc>) -> Result<EtwSession> {
-        let mut props = props_buffer();
-        let mut control = CONTROLTRACE_HANDLE { Value: 0 };
-        // SAFETY: props is a properly sized EVENT_TRACE_PROPERTIES block.
-        let e = unsafe {
-            StartTraceW(
-                &mut control,
-                KERNEL_LOGGER_NAMEW,
-                props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+/// A bare properties block for control calls (stop, query): sizes and
+/// name offsets only. Passing a start block (a GUID, kernel flags) to stop
+/// a system logger session fails with ERROR_INVALID_PARAMETER.
+fn control_buffer() -> Vec<u8> {
+    let head = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+    let names = 1024 * 2;
+    let size = head + 2 * names;
+    let mut v = vec![0u8; size];
+    // SAFETY: the buffer is large enough and zeroed.
+    let p = unsafe { &mut *(v.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
+    p.Wnode.BufferSize = size as u32;
+    p.LoggerNameOffset = head as u32;
+    p.LogFileNameOffset = (head + names) as u32;
+    v
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A GUID for one session: unique enough from the pid and the clock.
+fn session_guid() -> windows_sys::core::GUID {
+    let t = crate::session::now_ns();
+    windows_sys::core::GUID {
+        data1: std::process::id(),
+        data2: (t >> 48) as u16,
+        data3: 0x4000 | ((t >> 32) as u16 & 0x0fff),
+        data4: (t as u32 as u64 | 0x8000_0000_0000_0000 | (0x6865_6170u64 << 32)).to_be_bytes(),
+    }
+}
+
+fn start_trace(name: &str, system_logger: bool, control: &mut CONTROLTRACE_HANDLE) -> u32 {
+    let mut props = props_buffer(system_logger);
+    let w = wide(name);
+    // SAFETY: props is a properly sized EVENT_TRACE_PROPERTIES block.
+    let e = unsafe {
+        StartTraceW(
+            control,
+            w.as_ptr(),
+            props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+        )
+    };
+    if e == ERROR_SUCCESS && system_logger {
+        // The documented way to select kernel events of a system logger:
+        // the group mask, whose first word is the classic EnableFlags.
+        let mut mask = [0u32; 8];
+        mask[0] = EVENT_TRACE_FLAG_VIRTUAL_ALLOC;
+        // SAFETY: an 8-word mask, as TraceSystemTraceEnableFlagsInfo takes.
+        unsafe {
+            TraceSetInformation(
+                *control,
+                TraceSystemTraceEnableFlagsInfo,
+                mask.as_ptr().cast(),
+                std::mem::size_of_val(&mask) as u32,
             )
         };
+    }
+    e
+}
+
+/// What stopping a session by name did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSession {
+    Stopped,
+    NotFound,
+    Failed(u32),
+}
+
+/// Stop the ETW session `name`.
+pub fn stop_session(name: &str) -> StopSession {
+    let mut props = control_buffer();
+    let w = wide(name);
+    // SAFETY: stopping by name with a sized properties buffer.
+    let e = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            w.as_ptr(),
+            props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+            EVENT_TRACE_CONTROL_STOP,
+        )
+    };
+    match e {
+        ERROR_SUCCESS => StopSession::Stopped,
+        ERROR_WMI_INSTANCE_NOT_FOUND => StopSession::NotFound,
+        e => StopSession::Failed(e),
+    }
+}
+
+/// Names of the running ETW sessions.
+pub fn list_sessions() -> Vec<String> {
+    const N: usize = 64;
+    let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| control_buffer()).collect();
+    let mut ptrs: Vec<*mut EVENT_TRACE_PROPERTIES> =
+        bufs.iter_mut().map(|b| b.as_mut_ptr().cast()).collect();
+    let mut count = 0u32;
+    // SAFETY: N sized property blocks with their name offsets set.
+    let e = unsafe { QueryAllTracesW(ptrs.as_mut_ptr(), N as u32, &mut count) };
+    if e != ERROR_SUCCESS && e != windows_sys::Win32::Foundation::ERROR_MORE_DATA {
+        return Vec::new();
+    }
+    bufs.iter()
+        .take(count as usize)
+        .filter_map(|b| {
+            // SAFETY: filled by QueryAllTracesW; the name is NUL-terminated
+            // within the buffer.
+            let p = unsafe { &*(b.as_ptr() as *const EVENT_TRACE_PROPERTIES) };
+            let off = p.LoggerNameOffset as usize;
+            if off == 0 || off >= b.len() {
+                return None;
+            }
+            let w: Vec<u16> = b[off..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&c| c != 0)
+                .collect();
+            Some(String::from_utf16_lossy(&w))
+        })
+        .collect()
+}
+
+/// `pid` is a running heapspy recorder (or this same program).
+fn is_live_heapspy(pid: u32) -> bool {
+    // SAFETY: plain OpenProcess / queries on the handle.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // Access denied: something runs there that we cannot see;
+            // leave its session alone.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let h = Handle(h);
+        let mut code = 0u32;
+        if GetExitCodeProcess(h.0, &mut code) != 0 && code != STILL_ACTIVE as u32 {
+            return false;
+        }
+        let mut buf = [0u16; 1024];
+        let mut n = buf.len() as u32;
+        if QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) == 0 {
+            return true;
+        }
+        let image = String::from_utf16_lossy(&buf[..n as usize]);
+        let me = std::env::current_exe().ok();
+        let stem = me
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned());
+        guardian::is_heapspy_image(&image, stem.as_deref())
+    }
+}
+
+/// Stop the `heapspy-<pid>` sessions of recorders that are gone. Returns
+/// their names. Sessions of any other name are never touched.
+pub fn stop_stale_sessions() -> Vec<String> {
+    let names = list_sessions();
+    guardian::stale_sessions(&names, std::process::id(), is_live_heapspy)
+        .into_iter()
+        .filter(|n| stop_session(n) == StopSession::Stopped)
+        .map(String::from)
+        .collect()
+}
+
+impl EtwSession {
+    /// Start heapspy's own kernel session, `heapspy-<this pid>`, in
+    /// system logger mode (Windows 8 / Server 2012 and later) with
+    /// VirtualAlloc events, and consume it on a thread. Sessions of dead
+    /// heapspy recorders are stopped first. Where the system logger mode is
+    /// refused (older Windows), the classic "NT Kernel Logger" is used.
+    /// Errors: access denied (not elevated), or a conflicting session,
+    /// named in the message.
+    pub fn start(pid: u32, arena_size: u64, tx: Sender<EtwAlloc>) -> Result<EtwSession> {
+        for n in stop_stale_sessions() {
+            eprintln!(
+                "heapspy: stopped ETW session {n} left by a heapspy that is no longer running"
+            );
+        }
+        let own = guardian::session_name(std::process::id());
+        let mut name = own.clone();
+        let mut control = CONTROLTRACE_HANDLE { Value: 0 };
+        let mut e = start_trace(&name, true, &mut control);
+        if e == ERROR_INVALID_PARAMETER {
+            name = "NT Kernel Logger".into();
+            e = start_trace(&name, false, &mut control);
+        }
         match e {
             ERROR_SUCCESS => {}
             ERROR_ACCESS_DENIED => {
@@ -184,10 +368,20 @@ impl EtwSession {
                     "starting the ETW kernel session was refused: run heapspy from an elevated prompt".into(),
                 ))
             }
+            ERROR_ALREADY_EXISTS if name == own => {
+                return Err(Error::Unsupported(format!(
+                    "the ETW session {name} already exists and belongs to a running process; stop it (logman stop {name} -ets) and retry"
+                )))
+            }
             ERROR_ALREADY_EXISTS => {
-                return Err(Error::Unsupported(
-                    "the NT Kernel Logger ETW session is in use by another tool (xperf, WPR, Process Monitor); stop it and retry".into(),
-                ))
+                return Err(Error::Unsupported(format!(
+                    "the ETW session \"{name}\" is in use by another tool (xperf, WPR, Process Monitor); stop it and retry"
+                )))
+            }
+            ERROR_NO_SYSTEM_RESOURCES => {
+                return Err(Error::Unsupported(format!(
+                    "no ETW system logger session is free for {name} (other tools hold them all; see logman query -ets)"
+                )))
             }
             e => return Err(Error::Io(std::io::Error::from_raw_os_error(e as i32))),
         }
@@ -196,19 +390,19 @@ impl EtwSession {
             arena_size,
             tx,
         }));
-        let mut name: Vec<u16> = "NT Kernel Logger\0".encode_utf16().collect();
+        let mut wname = wide(&name);
         // SAFETY: zeroed EVENT_TRACE_LOGFILEW, filled as documented.
         let trace = unsafe {
             let mut lf: EVENT_TRACE_LOGFILEW = std::mem::zeroed();
-            lf.LoggerName = name.as_mut_ptr();
+            lf.LoggerName = wname.as_mut_ptr();
             lf.Anonymous1.ProcessTraceMode =
                 PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
             lf.Anonymous2.EventRecordCallback = Some(on_event);
             lf.Context = ctx.cast();
             OpenTraceW(&mut lf)
         };
-        drop(props);
         let mut s = EtwSession {
+            name,
             control,
             trace,
             thread: None,
@@ -233,7 +427,7 @@ impl Drop for EtwSession {
         // SAFETY: stopping the session we started, then joining the consumer
         // before freeing the context it uses.
         unsafe {
-            let mut props = props_buffer();
+            let mut props = control_buffer();
             ControlTraceW(
                 self.control,
                 std::ptr::null(),
@@ -254,7 +448,7 @@ impl Drop for EtwSession {
 // ---- debugger -------------------------------------------------------------
 
 #[repr(C, align(16))]
-struct AlignedContext(CONTEXT);
+pub(super) struct AlignedContext(pub CONTEXT);
 
 /// What the debugger produced: arena entries waiting for their return,
 /// and finished samples for the main loop.
@@ -262,6 +456,8 @@ pub struct DebugTarget<'a> {
     pid: u32,
     process: Handle,
     threads: HashMap<u32, HANDLE>,
+    /// Told of every byte before it is patched and after it is restored.
+    guardian: Option<&'a Link>,
     /// Called at an arena entry with the thread id; reads the stack.
     pub on_entry: Box<dyn FnMut(u32, u64, u64) + 'a>,
     /// Called at the matching return with the arena address.
@@ -276,6 +472,23 @@ impl DebugTarget<'_> {
             let mut c: AlignedContext = std::mem::zeroed();
             c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
             (GetThreadContext(h, &mut c.0) != 0).then_some(c)
+        }
+    }
+
+    fn write_raw(&mut self, addr: u64, b: u8) -> bool {
+        let mut n = 0usize;
+        // SAFETY: one byte from `b`. Code pages are copy-on-write; the
+        // kernel makes them writable for a debugger with PROCESS_VM_OPERATION.
+        unsafe {
+            let ok = WriteProcessMemory(
+                self.process.0,
+                addr as *const _,
+                (&b as *const u8).cast(),
+                1,
+                &mut n,
+            );
+            FlushInstructionCache(self.process.0, addr as *const _, 1);
+            ok != 0 && n == 1
         }
     }
 
@@ -306,20 +519,19 @@ impl DebugIo for DebugTarget<'_> {
     }
 
     fn write_byte(&mut self, addr: u64, b: u8) -> bool {
-        let mut n = 0usize;
-        // SAFETY: one byte from `b`. Code pages are copy-on-write; the
-        // kernel makes them writable for a debugger with PROCESS_VM_OPERATION.
-        unsafe {
-            let ok = WriteProcessMemory(
-                self.process.0,
-                addr as *const _,
-                (&b as *const u8).cast(),
-                1,
-                &mut n,
-            );
-            FlushInstructionCache(self.process.0, addr as *const _, 1);
-            ok != 0 && n == 1
+        // The guardian learns of a patch before it is written, and of a
+        // restore after, so it never misses an int3 of ours.
+        if let (Some(g), INT3) = (self.guardian, b) {
+            match self.read_byte(addr) {
+                Some(orig) if orig != INT3 => g.send(&Msg::Patch { addr, orig }),
+                _ => {}
+            }
         }
+        let ok = self.write_raw(addr, b);
+        if let (Some(g), true) = (self.guardian, ok && b != INT3) {
+            g.send(&Msg::Unpatch(addr));
+        }
+        ok
     }
 
     fn read_u64(&mut self, addr: u64) -> Option<u64> {
@@ -391,6 +603,7 @@ impl<'a> Debugger<'a> {
     pub fn attach(
         pid: u32,
         machine: Machine,
+        guardian: Option<&'a Link>,
         on_entry: Box<dyn FnMut(u32, u64, u64) + 'a>,
         on_exit: Box<dyn FnMut(u32, u64) + 'a>,
     ) -> Result<Debugger<'a>> {
@@ -423,11 +636,17 @@ impl<'a> Debugger<'a> {
             }
             DebugSetProcessKillOnExit(0);
         }
+        // From here on the guardian holds the debug object too: if heapspy
+        // dies, the target stays attached to it and the guardian takes over.
+        if let Some(g) = guardian {
+            g.share_debug_object();
+        }
         let mut d = Debugger {
             io: DebugTarget {
                 pid,
                 process,
                 threads: HashMap::new(),
+                guardian,
                 on_entry,
                 on_exit,
             },
@@ -514,8 +733,22 @@ impl<'a> Debugger<'a> {
             return;
         }
         self.machine.disarm(&mut self.io);
-        // Hits already queued on removed breakpoints are rewound.
-        while let Some(true) = self.pump(50) {}
+        // Hits already queued on removed breakpoints are rewound, and the
+        // single steps of threads that were stepping over one are handled.
+        // Wait for those steps (a stepping thread may not have run yet),
+        // but not forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match self.pump(50) {
+                Some(true) => {}
+                Some(false) => break,
+                None => {
+                    if !self.machine.steps_pending() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+        }
         // SAFETY: detaching; the target keeps running.
         unsafe { DebugActiveProcessStop(self.io.pid) };
         self.attached = false;

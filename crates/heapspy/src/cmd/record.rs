@@ -20,6 +20,9 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
     opts.then_dump = args.then_dump;
     opts.mechanism = args.mechanism;
 
+    if let Some(w) = debugger_warning(opts.mechanism) {
+        eprintln!("{w}");
+    }
     let stop: &AtomicBool = heapspy_record::stop_on_signals();
     // The source context lets error_code() treat I/O errors on the target
     // as being about the process, as for `dump --pid`.
@@ -63,6 +66,17 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         print_json(&report(&opts, &stats))?;
     }
     Ok(())
+}
+
+/// The warning printed when the Windows debugger is chosen.
+fn debugger_warning(m: heapspy_record::MechanismChoice) -> Option<&'static str> {
+    (cfg!(windows) && m == heapspy_record::MechanismChoice::Only(heapspy_alloc::Mechanism::Debugger))
+        .then_some(
+            "heapspy: warning: --mechanism debugger stops every thread of the target at each \
+             breakpoint; on windows-latest the target was paused for 2.5-2.9 s of a 3 s recording. \
+             A guardian process puts the target back (breakpoint bytes, debugger) if heapspy is \
+             killed. Without --mechanism, Windows records with etw, which does not pause the target.",
+        )
 }
 
 fn report(opts: &RecordOptions, stats: &RecordStats) -> RecordReport {
@@ -126,6 +140,26 @@ mod tests {
             truncated: false,
             elapsed: Duration::from_millis(60_004),
             snapshot: None,
+        }
+    }
+
+    #[test]
+    fn debugger_warning_names_the_pause_and_the_guardian() {
+        use heapspy_record::MechanismChoice;
+        assert_eq!(debugger_warning(MechanismChoice::Auto), None);
+        assert_eq!(
+            debugger_warning(MechanismChoice::Only(Mechanism::Etw)),
+            None
+        );
+        let w = debugger_warning(MechanismChoice::Only(Mechanism::Debugger));
+        if cfg!(windows) {
+            let w = w.unwrap();
+            assert!(
+                w.contains("stops every thread") && w.contains("guardian"),
+                "{w}"
+            );
+        } else {
+            assert_eq!(w, None);
         }
     }
 

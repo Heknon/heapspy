@@ -163,7 +163,7 @@ heapspy query app.hpy --type Session --allocations app.hpya
 How it records, without running code in the target:
 - **Linux, eBPF** (default; root or `CAP_BPF` + `CAP_PERFMON`, kernel 5.8+): arenas from `mmap` and sampled large objects from allocator uprobes, each with the Python stack read in the kernel at the event.
 - **Linux, ptrace** (fallback, or `--mechanism ptrace`): arenas only, with exact stacks, stopping at system calls.
-- **Windows** (elevated): arenas from ETW, with approximate frames, and from debugger breakpoints, with exact frames. It is implemented but not yet tested on Windows.
+- **Windows** (elevated): arenas from ETW (the default), with approximate frames, without stopping the target. `--mechanism debugger` gives exact frames but stops the target's threads for most of the window. Tested on `windows-latest` with CPython 3.12 to 3.14 ([test plan and results](docs/windows-record-test-plan.md)). If heapspy is killed while recording, a guardian process restores the target and stops heapspy's ETW session (`heapspy-<pid>`). A process-tree kill (`taskkill /T`) takes the guardian down too; see [docs/windows.md](docs/windows.md#when-heapspy-is-killed).
 
 Pools are never recorded, because pool carving is inlined in every build checked. Large objects cost one uprobe trap per allocator call above 512 bytes (about 0.5 µs). On an extreme benchmark that slowed the target by 30-50%; arenas alone cost a few percent. Numbers are in [docs/allocation-sampling.md](docs/allocation-sampling.md#measurements). Ctrl-C ends a recording early with a valid profile flagged truncated.
 
@@ -275,7 +275,7 @@ See [docs/releasing.md](docs/releasing.md) for how releases are built and publis
 | M4 | Windows minidump backend | done |
 | M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
 | M6 | `heapspy-mcp` | done |
-| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | Linux done; Windows implemented, untested on Windows |
+| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | Linux done, CI job `ci:record`; Windows passes on `windows-latest` except the kill-mid-run safety checks |
 
 The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
 
