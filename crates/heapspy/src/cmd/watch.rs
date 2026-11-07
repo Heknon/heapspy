@@ -460,7 +460,7 @@ fn summary(
                 verdict: verdict(&ds, leaked),
             });
         }
-        holders.sort_by(|x, y| y.delta_retained_bytes.cmp(&x.delta_retained_bytes));
+        holders.sort_by_key(|y| std::cmp::Reverse(y.delta_retained_bytes));
     }
     let mut holders = outermost(holders);
     holders.truncate(args.top);

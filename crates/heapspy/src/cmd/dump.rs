@@ -20,7 +20,16 @@ pub fn run(args: DumpArgs) -> anyhow::Result<()> {
         source_kind: spec.kind(),
         source_ref: spec.reference(),
     };
-    let (stats, attempt) = capture(&spec, &opts, &args.output, false)?;
+    let (stats, attempt) = match (args.no_stop, args.pid) {
+        (true, Some(pid)) => {
+            eprintln!(
+                "heapspy: --no-stop: the process keeps running during the walk, so this \
+                 snapshot is approximate"
+            );
+            capture_unstopped(pid, &opts, &args.output)?
+        }
+        _ => capture(&spec, &opts, &args.output, false)?,
+    };
     if stats.image_missing_bytes > 0 {
         eprintln!(
             "heapspy: warning: the image is missing {} bytes of memory its headers describe \
@@ -75,6 +84,37 @@ pub(crate) fn capture(
                  could not follow them; capturing again (attempt {} of {LIVE_ATTEMPTS})",
                 attempt + 1
             );
+        }
+        attempt += 1;
+        std::thread::sleep(RECAPTURE_DELAY);
+    }
+}
+
+/// Snapshot `pid` without stopping it (`--no-stop`). The walk races with
+/// the target, so the snapshot is approximate; a walk that comes back
+/// truncated is tried again like a stopped one.
+pub(crate) fn capture_unstopped(
+    pid: u32,
+    opts: &DumpOptions,
+    out: &Path,
+) -> anyhow::Result<(DumpStats, u32)> {
+    let mut attempt = 1;
+    loop {
+        let src =
+            heapspy_reader::source::linux_live::LiveProcess::open_unstopped(pid).map_err(|e| {
+                anyhow::Error::from(e).context(DumpSource {
+                    kind: heapspy_snapshot::SourceKind::Pid,
+                    text: format!("cannot read pid {pid}"),
+                })
+            })?;
+        let stats = heapspy_reader::dump(&src, opts, out).map_err(|e| {
+            anyhow::Error::from(e).context(DumpSource {
+                kind: heapspy_snapshot::SourceKind::Pid,
+                text: format!("snapshot of pid {pid} without stopping it failed"),
+            })
+        })?;
+        if !stats.truncated || attempt >= LIVE_ATTEMPTS {
+            return Ok((stats, attempt));
         }
         attempt += 1;
         std::thread::sleep(RECAPTURE_DELAY);

@@ -104,6 +104,29 @@ impl LiveProcess {
         }
     }
 
+    /// Read `pid` without stopping it, for an approximate snapshot: as
+    /// [`LiveProcess::open_running`], plus the memory summary from
+    /// `/proc/<pid>/smaps`. The walk races with the target, so objects can
+    /// be missed or half-read and the GC lists can change under it.
+    pub fn open_unstopped(pid: u32) -> Result<LiveProcess> {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = imp::Inner::open_running_with_summary(pid)?;
+            Ok(LiveProcess {
+                pid,
+                target: inner.target(),
+                heap_stats: Default::default(),
+                inner,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::Unsupported(format!(
+                "a snapshot without stopping pid {pid} is only implemented on Linux"
+            )))
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }

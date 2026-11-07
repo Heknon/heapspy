@@ -247,6 +247,11 @@ pub struct DumpArgs {
     /// Output snapshot path.
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: PathBuf,
+    /// With --pid: do not stop the process (Linux). The walk races with it,
+    /// so the snapshot is approximate: objects can be missed, sizes can be
+    /// off, and a walk can fail. Use when even a short pause is not an option.
+    #[arg(long, requires = "pid")]
+    pub no_stop: bool,
     /// Record string and bytes contents and ordinary dict keys (size-capped).
     #[arg(long)]
     pub capture_contents: bool,

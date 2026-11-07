@@ -373,6 +373,14 @@ impl Inner {
         Ok(inner)
     }
 
+    /// [`Inner::open_running`] with the memory summary: for a snapshot
+    /// taken without stopping the target.
+    pub(super) fn open_running_with_summary(pid: u32) -> Result<Inner> {
+        let mut inner = Inner::open_running(pid)?;
+        inner.summary = inner.build_summary();
+        Ok(inner)
+    }
+
     pub(super) fn target(&self) -> TargetInfo {
         self.target
     }
