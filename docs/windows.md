@@ -122,6 +122,11 @@ are unknown.
   (`python313t.dll`) and `_d` for debug builds (`python313_d.dll`).
   `python3.dll` is the stable-ABI forwarder and does not contain the runtime.
   `symbols::pe::python_dll` parses these names.
+- **venv launchers.** A venv's `Scripts\python.exe` is not the interpreter:
+  it is a small launcher that loads no `python3XY.dll` and starts the base
+  `python.exe` as a child process. Dump the child's pid, not the launcher's.
+  heapspy says so when it is given a launcher
+  (`symbols::is_windows_launcher`).
 - **`_PyRuntime`.** Exported by `python3XY.dll`. heapspy reads the DLL's PE
   headers and export directory from the dump's memory (the image headers are
   part of every full-memory dump) and resolves the name to `base + RVA`.

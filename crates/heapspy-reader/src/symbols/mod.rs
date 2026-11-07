@@ -62,6 +62,18 @@ pub fn find_python_module(modules: &[Module]) -> Option<&Module> {
         .or_else(|| modules.first().filter(|m| lower(m).starts_with("python")))
 }
 
+/// Whether `modules` look like a Windows venv launcher rather than an
+/// interpreter: the main executable is `python.exe` / `pythonw.exe` but no
+/// `python3XY.dll` is loaded. A venv's `Scripts\python.exe` is such a
+/// launcher; it starts the base interpreter as a child process, and that
+/// child is the one to read. CPython on Windows is never linked statically,
+/// so a real interpreter always loads the DLL.
+pub fn is_windows_launcher(modules: &[Module]) -> bool {
+    let main = modules.first().map(|m| m.name.to_ascii_lowercase());
+    matches!(main.as_deref(), Some("python.exe" | "pythonw.exe"))
+        && !modules.iter().any(|m| pe::python_dll(&m.name).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +104,22 @@ mod tests {
         let mods = [m("python3.12"), m("libc.so.6")];
         assert_eq!(find_python_module(&mods).unwrap().name, "python3.12");
         assert!(find_python_module(&[m("bash"), m("libc.so.6")]).is_none());
+    }
+
+    #[test]
+    fn detects_windows_launcher() {
+        // The module list of a venv's Scripts\python.exe, as seen on Windows.
+        let launcher = [m("python.exe"), m("ntdll.dll"), m("KERNEL32.DLL")];
+        assert!(is_windows_launcher(&launcher));
+        assert!(is_windows_launcher(&[m("PythonW.EXE"), m("ntdll.dll")]));
+        // The python3.dll forwarder alone is not an interpreter either.
+        assert!(is_windows_launcher(&[m("python.exe"), m("python3.dll")]));
+        // The interpreter it starts.
+        let real = [m("python.exe"), m("ntdll.dll"), m("python314.dll")];
+        assert!(!is_windows_launcher(&real));
+        // Not Windows, or not python.
+        assert!(!is_windows_launcher(&[m("python3.12"), m("libc.so.6")]));
+        assert!(!is_windows_launcher(&[m("app.exe"), m("ntdll.dll")]));
+        assert!(!is_windows_launcher(&[]));
     }
 }

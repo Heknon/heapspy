@@ -139,6 +139,13 @@ pub fn locate_runtime(src: &dyn MemorySource) -> Result<RuntimeLocation> {
             Some(e) => format!("no _PyRuntime symbol found ({e})"),
             None => "no module exports _PyRuntime".to_string(),
         };
+        if symbols::is_windows_launcher(&modules) {
+            return Err(Error::NotPython(format!(
+                "{why}; {} loads no python3XY.dll, so it is probably a venv launcher: \
+                 read the python.exe it started (its child process) instead",
+                modules[0].name
+            )));
+        }
         return Err(Error::NotPython(why));
     };
 
