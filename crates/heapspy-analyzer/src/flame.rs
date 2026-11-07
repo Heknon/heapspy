@@ -203,6 +203,9 @@ pub(crate) type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 enum Key {
     /// A root object: its root label.
     Root(StrId),
+    /// An object only something outside the graph holds (see
+    /// `graph::EXTERNAL_ROOT_LABEL`). All of them share one frame.
+    External,
     /// An edge label with list and tuple indices zeroed, whether it was
     /// reached through other objects (`...`), and the object's type group.
     Edge {
@@ -264,6 +267,7 @@ fn label_tree(a: &Analysis, max_depth: u32) -> LabelTree {
         let f = if p == root {
             let key = match a.g.root_entry(e) {
                 Some(r) => Key::Root(r.label),
+                None if a.g.is_external_root(e) => Key::External,
                 // Dominated only by the super-root but reached through an
                 // ordinary edge: shared by several roots, owned by none.
                 None => Key::Edge {
@@ -326,6 +330,7 @@ pub(crate) fn sanitise(s: &mut String) {
 fn frame_text(a: &Analysis, key: Key) -> Result<String> {
     let mut s = match key {
         Key::Root(l) => a.snap.string(l)?.to_string(),
+        Key::External => crate::graph::EXTERNAL_ROOT_LABEL.to_string(),
         Key::Other => return Ok(OTHER_FRAME.to_string()),
         Key::Edge { label, dots, group } => {
             let mut s = String::new();

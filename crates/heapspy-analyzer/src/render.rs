@@ -287,14 +287,28 @@ pub fn analyze(r: &AnalyzeReport) -> Result<String> {
         t.roots,
         r.snapshot.python_version
     );
-    let _ = writeln!(
-        out,
-        "reachable: {} objects ({}); unreachable: {} objects ({})",
-        t.reachable_objects,
-        format_bytes(t.reachable_bytes),
-        t.unreachable_objects,
-        format_bytes(t.unreachable_bytes)
-    );
+    if t.refcounts_checked {
+        let _ = writeln!(
+            out,
+            "reachable: {} objects ({}); held outside the Python graph: {} objects ({}); \
+             garbage awaiting collection: {} objects ({})",
+            t.reachable_objects,
+            format_bytes(t.reachable_bytes),
+            t.external_objects,
+            format_bytes(t.external_bytes),
+            t.unreachable_objects,
+            format_bytes(t.unreachable_bytes)
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "reachable: {} objects ({}); unreachable: {} objects ({})",
+            t.reachable_objects,
+            format_bytes(t.reachable_bytes),
+            t.unreachable_objects,
+            format_bytes(t.unreachable_bytes)
+        );
+    }
 
     out.push_str("\nTop retainers by retained size\n\n");
     if r.top_retainers.is_empty() {
@@ -379,6 +393,27 @@ pub fn analyze(r: &AnalyzeReport) -> Result<String> {
                 format_bytes(m.graph_bytes)
             );
         }
+    }
+    if !m.breakdown.is_empty() {
+        let basis = m.breakdown_basis.as_deref().unwrap_or("committed");
+        let total: u64 = m.breakdown.iter().map(|p| p.bytes).sum();
+        let _ = writeln!(
+            out,
+            "\nWhat the process's memory is ({basis}, {})\n",
+            format_bytes(total)
+        );
+        let rows: Vec<Vec<String>> = m
+            .breakdown
+            .iter()
+            .map(|p| {
+                vec![
+                    format_bytes(p.bytes),
+                    format!("{:.1}%", pct_of(p.bytes, total)),
+                    memory_part_text(&p.part).to_string(),
+                ]
+            })
+            .collect();
+        table(&mut out, &["bytes", "%", "what"], &rows, &[0, 1]);
     }
     let rest: Vec<Note> = r
         .notes
@@ -627,6 +662,29 @@ pub fn diff(r: &DiffReport) -> Result<String> {
 }
 
 /// Binary-unit size with one decimal: `412.6 MiB`, `1.1 KiB`, `512 B`.
+fn pct_of(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
+}
+
+/// What a `memory.breakdown` part is, in a few words.
+fn memory_part_text(part: &str) -> &str {
+    match part {
+        "images" => "code and data of loaded modules (python, DLLs, extensions)",
+        "mapped_files" => "memory-mapped files",
+        "stacks" => "thread stacks",
+        "python_small_objects" => "Python objects in pymalloc (small objects)",
+        "pymalloc_free" => "pymalloc free space: held by Python's allocator, not in use",
+        "python_large_objects" => "Python objects from malloc (larger than 512 bytes)",
+        "native_heap" => "native heap: memory C code allocated",
+        "native_unknown" => "native heap and other private memory C code allocated",
+        other => other,
+    }
+}
+
 pub fn format_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     if n < 1024 {

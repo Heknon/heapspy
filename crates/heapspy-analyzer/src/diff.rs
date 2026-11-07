@@ -79,8 +79,10 @@ fn shortest_path_site(a: &Analysis, v: u32) -> Result<String> {
     let mut s = String::new();
     for (i, (_, e)) in a.bfs_chain(v).into_iter().enumerate() {
         if i == 0 {
-            let r = a.g.root_entry(e).expect("a BFS path starts at a root");
-            s.push_str(a.snap.string(r.label)?);
+            let (label, _) =
+                a.g.root_label(a.snap, e)?
+                    .expect("a BFS path starts at a root");
+            s.push_str(&label);
         } else {
             push_edge(
                 &mut s,
@@ -129,8 +131,8 @@ fn sites(a: &Analysis) -> Result<HashMap<String, SiteStat>> {
         }
         let e = a.via[vi];
         let (parent, label) = if p == root {
-            match a.g.root_entry(e) {
-                Some(r) => (NONE, a.snap.string(r.label)?.to_string()),
+            match a.g.root_label(a.snap, e)? {
+                Some((label, _)) => (NONE, label),
                 // Dominated only by the super-root but reached through an
                 // ordinary edge: the object hangs off several roots and none
                 // of them owns it. Name the site by its shortest path, which

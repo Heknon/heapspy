@@ -4,7 +4,8 @@
 //! table, so the same scenarios run against the 3.12, 3.13 and 3.14 layouts.
 
 use heapspy_snapshot::{
-    KeyLabel, ObjectFlags, PythonVersion, RootKind, Snapshot, SnapshotInfo, SnapshotWriter,
+    EdgeOrigin, KeyLabel, ObjectFlags, PythonVersion, RootKind, Snapshot, SnapshotInfo,
+    SnapshotWriter,
 };
 
 use super::offsets::*;
@@ -441,6 +442,24 @@ fn edges(s: &Snapshot, addr: u64) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// Like [`edges`], leaving out speculative (out-of-line) edges.
+fn known_edges(s: &Snapshot, addr: u64) -> Vec<(String, u64)> {
+    let i = s.find_object(addr).unwrap();
+    s.edges(i)
+        .filter(|e| e.origin != EdgeOrigin::Speculative)
+        .map(|e| (s.render_label(e.label).unwrap(), e.target))
+        .collect()
+}
+
+/// Speculative edges of the object at `addr`: `(label, target)`.
+fn speculative_edges(s: &Snapshot, addr: u64) -> Vec<(String, u64)> {
+    let i = s.find_object(addr).unwrap();
+    s.edges(i)
+        .filter(|e| e.origin == EdgeOrigin::Speculative)
+        .map(|e| (s.render_label(e.label).unwrap(), e.target))
+        .collect()
+}
+
 fn type_of(s: &Snapshot, addr: u64) -> String {
     let o = s.object(s.find_object(addr).unwrap());
     s.type_name(o.type_id).unwrap()
@@ -738,6 +757,173 @@ fn untracked_dict_reached_from_tracked_object_is_walked() {
     assert_eq!(edges(&s, d)[1], ("[<str len=1>]".to_string(), v));
     assert!(s.find_object(v).is_some());
     assert_eq!(edges(&s, l)[0].1, d);
+}
+
+/// An extension type the walker has no layout for: GC-tracked, 56 bytes,
+/// with `tp_members` naming the field at offset 16.
+fn holder_type(h: &mut Heap, name: &str) -> u64 {
+    let t = h.static_type(name, TPFLAGS_HAVE_GC, 56, 0);
+    let defs = h.alloc(2 * MEMBERDEF_SIZE);
+    let n = h.cstr("payload");
+    h.w64(defs, n);
+    h.w32(defs + MEMBERDEF_TYPE, T_OBJECT_EX);
+    h.w64(defs + MEMBERDEF_OFFSET, 16);
+    let tp_members = h.o.tp_base - 16;
+    h.w64(t + tp_members, defs);
+    t
+}
+
+#[test]
+fn unknown_c_type_fields_are_scanned_for_references() {
+    for minor in [12, 13, 14] {
+        let mut h = Heap::new(minor);
+        let t = holder_type(&mut h, "_ext.Holder");
+        let owned = h.list(&[]);
+        let leaf = h.str("leaf");
+        let x = h.object(t, 56, Some(0), false);
+        h.w64(x + 16, owned); // named by tp_members
+        h.w64(x + 24, 0x1234_5679); // not a pointer
+        h.w64(x + 32, leaf); // untracked object, unnamed field
+        h.w64(x + 40, owned + 8); // points inside an object
+        h.w64(x + 48, BASE + 0x40); // aligned, but no object there
+        let (s, _) = walk_heap(&h, &DumpOptions::default());
+        // The last two are heap pointers that are not objects, so they are
+        // searched out of line; whatever that finds is speculative and is
+        // the analyzer's to keep or drop.
+        assert_eq!(
+            known_edges(&s, x),
+            vec![(".payload".to_string(), owned), ("<+32>".to_string(), leaf)],
+            "3.{minor}"
+        );
+        let i = s.find_object(x).unwrap();
+        assert!(
+            s.edges(i)
+                .any(|e| e.target == leaf && e.origin == EdgeOrigin::Scanned),
+            "3.{minor}"
+        );
+        assert!(s.find_object(leaf).is_some(), "3.{minor}");
+    }
+}
+
+#[test]
+fn out_of_line_block_items_are_speculative_edges() {
+    // A deque-like container: its body points at a separately allocated
+    // block (not an object) holding a link and two items.
+    let mut h = Heap::new(12);
+    let t = holder_type(&mut h, "_ext.Chain");
+    let a = h.list(&[]);
+    let b = h.str("item");
+    let block = h.alloc(8 * 4);
+    h.w64(block, 0); // link to the next block: none
+    h.w64(block + 8, a);
+    h.w64(block + 16, b);
+    h.w64(block + 24, a); // the same item twice: one edge
+    let x = h.object(t, 56, Some(0), false);
+    h.w64(x + 24, block);
+    let (s, _) = walk_heap(&h, &DumpOptions::default());
+    let spec = speculative_edges(&s, x);
+    assert!(spec.contains(&("<+24[1]>".to_string(), a)), "{spec:?}");
+    assert!(spec.contains(&("<+24[2]>".to_string(), b)), "{spec:?}");
+    assert_eq!(spec.iter().filter(|e| e.1 == a).count(), 1, "{spec:?}");
+    // The untracked item was reached only out of line and is recorded.
+    assert!(s.find_object(b).is_some());
+}
+
+#[test]
+fn chained_blocks_are_followed_and_foreign_memory_is_not() {
+    // A deque-like chain: block1 <-> block2, both linked both ways, and a
+    // pointer from block2 into an unrelated block that does not link back.
+    let mut h = Heap::new(12);
+    let t = holder_type(&mut h, "_ext.Chain");
+    let near = h.str("near");
+    let far = h.str("far");
+    let foreign_item = h.str("not mine");
+    let foreign = h.alloc(8 * 4);
+    h.w64(foreign + 8, foreign_item);
+    let block1 = h.alloc(8 * 4);
+    let block2 = h.alloc(8 * 4);
+    h.w64(block1, block2); // link to the next block
+    h.w64(block1 + 8, near);
+    h.w64(block2, block1); // link back
+    h.w64(block2 + 8, far);
+    h.w64(block2 + 16, foreign); // a heap pointer, but not a chain link
+    let x = h.object(t, 56, Some(0), false);
+    h.w64(x + 24, block1);
+    let (s, _) = walk_heap(&h, &DumpOptions::default());
+    let spec: Vec<u64> = speculative_edges(&s, x).into_iter().map(|e| e.1).collect();
+    assert!(spec.contains(&near), "{spec:?}");
+    assert!(spec.contains(&far), "{spec:?}");
+    assert!(!spec.contains(&foreign_item), "{spec:?}");
+}
+
+#[test]
+fn a_block_first_reached_from_the_wrong_neighbour_is_still_followed() {
+    // block1 -> block2 -> block3. block1's window runs on past its end into
+    // block2's memory, so it sees block2's link to block3 before block2 is
+    // read. block3 rejects that (it links back to block2, not block1) and
+    // must still be accepted when block2 itself gets to it.
+    let mut h = Heap::new(12);
+    let t = holder_type(&mut h, "_ext.Chain");
+    let last = h.str("last");
+    let block1 = h.alloc(8 * 2);
+    let block2 = h.alloc(8 * 2);
+    let block3 = h.alloc(8 * 2);
+    h.w64(block1, 0);
+    h.w64(block1 + 8, block2);
+    h.w64(block2, block1);
+    h.w64(block2 + 8, block3);
+    h.w64(block3, block2);
+    h.w64(block3 + 8, last);
+    let x = h.object(t, 56, Some(0), false);
+    h.w64(x + 24, block1);
+    let (s, _) = walk_heap(&h, &DumpOptions::default());
+    let spec: Vec<u64> = speculative_edges(&s, x).into_iter().map(|e| e.1).collect();
+    assert!(spec.contains(&last), "{spec:?}");
+}
+
+#[test]
+fn freed_object_is_not_taken_for_a_live_one() {
+    // pymalloc reuses the refcount word of a freed block for its free list
+    // and leaves the type pointer alone. Such a block must not become an
+    // object, or a stale pointer to it an edge.
+    let mut h = Heap::new(12);
+    let t = holder_type(&mut h, "_ext.Holder");
+    let freed = h.str("gone");
+    h.w64(freed, 0); // end of the free list
+    let reused = h.str("gone too");
+    h.w64(reused, freed); // a free-list link
+    let x = h.object(t, 56, Some(0), false);
+    h.w64(x + 16, freed);
+    h.w64(x + 24, reused);
+    let (s, _) = walk_heap(&h, &DumpOptions::default());
+    assert!(known_edges(&s, x).is_empty(), "{:?}", known_edges(&s, x));
+    assert!(s.find_object(freed).is_none());
+    assert!(s.find_object(reused).is_none());
+}
+
+#[test]
+fn weak_references_are_not_scanned() {
+    let mut h = Heap::new(12);
+    let t = h.static_type("weakref.ReferenceType", TPFLAGS_HAVE_GC, 48, 0);
+    let target = h.list(&[]);
+    let wr = h.object(t, 48, Some(0), false);
+    h.w64(wr + 16, target); // wr_object: borrowed, must not retain
+    let (s, _) = walk_heap(&h, &DumpOptions::default());
+    assert!(edges(&s, wr).is_empty());
+}
+
+#[test]
+fn scanned_fields_do_not_repeat_known_edges() {
+    // Two fields pointing at the same object: one edge, under the name the
+    // first field has.
+    let mut h = Heap::new(12);
+    let t = holder_type(&mut h, "_ext.Holder");
+    let owned = h.list(&[]);
+    let x = h.object(t, 56, Some(0), false);
+    h.w64(x + 16, owned);
+    h.w64(x + 24, owned);
+    let (s, _) = walk_heap(&h, &DumpOptions::default());
+    assert_eq!(edges(&s, x), vec![(".payload".to_string(), owned)]);
 }
 
 #[test]

@@ -115,6 +115,10 @@ pub struct Analysis<'s> {
     /// BFS distance from the super-root in edges; [`NONE`] if unreachable.
     pub dist: Vec<u32>,
     pub shallow_total: u64,
+    /// Objects reached only through an external root (see
+    /// `ObjectGraph::external_roots`), and their shallow bytes.
+    pub external_objects: u64,
+    pub external_bytes: u64,
     /// Source locations, computed on demand for what a report shows.
     pub(crate) loc: Locator<'s>,
 }
@@ -148,8 +152,17 @@ impl<'s> Analysis<'s> {
         }
         drop(next);
 
-        let (via, dist) = bfs(&g);
+        let (via, dist, outside) = bfs(&g);
+        // Found by the external phase of the BFS: nothing but an external
+        // root holds them.
+        let (mut external_objects, mut external_bytes) = (0u64, 0u64);
+        for v in outside {
+            external_objects += 1;
+            external_bytes += snap.object(v).shallow_size;
+        }
         Ok(Analysis {
+            external_objects,
+            external_bytes,
             snap,
             g,
             types,
@@ -237,9 +250,9 @@ impl<'s> Analysis<'s> {
         match self.edge_label(e) {
             Some(l) => hop.edge = Some(self.snap.render_label(l)?),
             None => {
-                let r = self.g.root_entry(e).expect("super-root edge");
-                hop.root_label = Some(self.snap.string(r.label)?.to_string());
-                hop.root_kind = Some(r.kind.as_str().to_string());
+                let (label, kind) = self.g.root_label(self.snap, e)?.expect("super-root edge");
+                hop.root_label = Some(label);
+                hop.root_kind = Some(kind);
             }
         }
         Ok(hop)
@@ -487,27 +500,45 @@ impl<'s> Analysis<'s> {
 }
 
 /// Breadth-first search from the super-root over forward edges. Returns the
-/// entering edge and the distance of each node.
-fn bfs(g: &ObjectGraph) -> (Vec<u32>, Vec<u32>) {
+/// entering edge and the distance of each node, and the nodes the external
+/// phase found (held from outside the graph and by nothing else).
+fn bfs(g: &ObjectGraph) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let n = g.n as usize + 1;
     let mut via = vec![NONE; n];
     let mut dist = vec![NONE; n];
     let mut queue: Vec<u32> = Vec::new();
     dist[g.n as usize] = 0;
-    queue.push(g.n);
     let mut head = 0;
-    while head < queue.len() {
-        let v = queue[head];
-        head += 1;
-        let d = dist[v as usize] + 1;
-        for e in g.csr.range(v) {
-            let w = g.csr.targets[e];
+    let mut external_from = 0;
+    // One BFS per root phase, each over what the earlier ones left: an object
+    // a module holds gets a path from that module even when a running
+    // function's local is a hop closer. See `ObjectGraph::root_phases`.
+    for (i, phase) in g.root_phases.iter().enumerate() {
+        if i == 2 {
+            external_from = queue.len();
+        }
+        for e in phase.clone() {
+            let w = g.csr.targets[e as usize];
             if w != NONE && dist[w as usize] == NONE {
-                dist[w as usize] = d;
-                via[w as usize] = e as u32;
+                dist[w as usize] = 1;
+                via[w as usize] = e;
                 queue.push(w);
             }
         }
+        while head < queue.len() {
+            let v = queue[head];
+            head += 1;
+            let d = dist[v as usize] + 1;
+            for e in g.csr.range(v) {
+                let w = g.csr.targets[e];
+                if w != NONE && dist[w as usize] == NONE {
+                    dist[w as usize] = d;
+                    via[w as usize] = e as u32;
+                    queue.push(w);
+                }
+            }
+        }
     }
-    (via, dist)
+    let outside = queue.split_off(external_from);
+    (via, dist, outside)
 }

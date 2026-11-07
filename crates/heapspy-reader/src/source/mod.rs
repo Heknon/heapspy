@@ -132,9 +132,52 @@ pub struct MemorySummary {
     pub rss_bytes: Option<u64>,
 }
 
+/// What kind of native heap block a [`NativeBlock`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeBlockKind {
+    /// One allocation handed out by the C heap (`malloc`, `HeapAlloc`, the
+    /// backend of the Windows heap).
+    Allocation,
+    /// One allocation large enough that the allocator gave it its own
+    /// mapping (`mmap`ed chunk in glibc, a `VirtualAlloc`ed block of the
+    /// Windows heap). The range is the whole mapping; the pointer the
+    /// program holds may be anywhere inside it.
+    Large,
+    /// A container the allocator carves small allocations out of, when the
+    /// individual allocations inside are not listed (a Windows
+    /// low-fragmentation-heap subsegment). The range is the container.
+    SmallBlockContainer,
+}
+
+/// One busy (allocated, not free) block of a native heap.
+///
+/// `start..start + size` covers the allocation as the program sees it, plus
+/// whatever header the allocator keeps in front of it: a pointer the program
+/// holds to the block is somewhere in this range (usually just past the
+/// header). Free blocks and the allocator's own bookkeeping are not listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBlock {
+    pub start: u64,
+    pub size: u64,
+    pub kind: NativeBlockKind,
+    /// Which heap it came from, as an index into the source's heap list
+    /// (the process heaps on Windows, the arenas in glibc). 0 when there is
+    /// one.
+    pub heap: u32,
+}
+
 /// A read-only view of one process's memory. See the module docs for the
 /// rules every implementation must follow.
 pub trait MemorySource: Send + Sync {
+    /// Every busy block of the process's native heaps, sorted by start and
+    /// non-overlapping, or `None` if the source cannot walk its heaps (no
+    /// walker for this allocator, or the image does not hold the heap
+    /// metadata). Read from the image the same way objects are: nothing is
+    /// asked of the target.
+    fn native_blocks(&self) -> Result<Option<Vec<NativeBlock>>> {
+        Ok(None)
+    }
+
     /// OS, architecture, pointer size and byte order of the target.
     fn target(&self) -> TargetInfo;
 

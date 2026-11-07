@@ -320,9 +320,18 @@ window early: the profile is written and `truncated` is `true`.
 | `shallow_bytes` | integer | sum of shallow sizes of all objects |
 | `reachable_objects` | integer | objects reachable from at least one root |
 | `reachable_bytes` | integer | sum of shallow sizes of reachable objects |
-| `unreachable_objects` | integer | objects no root reaches (cyclic garbage not yet collected, or held only from outside the recorded graph) |
+| `external_objects` | integer | objects no root reaches that something outside the recorded graph owns, as their refcounts show (native code, C globals, memory heapspy could not lay out). Paths to them start at the root `held outside the Python graph`, kind `external`. 0 when `refcounts_checked` is false |
+| `external_bytes` | integer | their shallow sizes |
+| `unreachable_objects` | integer | objects neither reachable nor held from outside. When `refcounts_checked` is true, their owners are all each other: cyclic garbage the collector will free. When it is false, this also includes what `external_objects` would have counted |
 | `unreachable_bytes` | integer | their shallow sizes |
 | `dangling_edges` | integer | edges whose target is not in the snapshot |
+| `refcounts_checked` | boolean | whether the snapshot recorded refcounts and references were checked against them |
+| `borrowed_edges_dropped` | integer | scanned edges (fields of a layout heapspy does not know) dropped because their target had more of them than owners |
+| `stale_edges_dropped` | integer | out-of-line pointers dropped because nothing about their target needed them. Without refcounts, every out-of-line pointer |
+| `out_of_line_edges` | integer | out-of-line references kept: objects held through memory their owner points at but does not lay out, such as a `deque`'s blocks |
+
+Percentages in reports (`retained_pct`) are of everything held:
+`reachable_bytes + external_bytes`.
 
 `memory`:
 

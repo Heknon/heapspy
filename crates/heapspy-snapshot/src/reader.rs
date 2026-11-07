@@ -70,6 +70,7 @@ pub struct Snapshot {
     extras: Records,
     regions: Option<Records>,
     meta: Records,
+    refcounts: Option<Records>,
     unknown_sections: Vec<u32>,
 }
 
@@ -178,7 +179,7 @@ impl Snapshot {
                     section_name(kind)
                 )));
             }
-            if !(SK_STRINGS..=SK_META).contains(&kind) {
+            if !(SK_STRINGS..=SK_REFCOUNTS).contains(&kind) {
                 if sflags & SF_REQUIRED != 0 {
                     return Err(Error::UnknownRequiredSection(kind));
                 }
@@ -269,6 +270,15 @@ impl Snapshot {
             true => records(SK_META, META_RECORD_LEN)?,
             false => Records::default(),
         };
+        let refcounts = match found.contains_key(&SK_REFCOUNTS) {
+            true => Some(records(SK_REFCOUNTS, REFCOUNT_RECORD_LEN)?),
+            false => None,
+        };
+        if refcounts.is_some_and(|r| r.count != objects.count) {
+            return Err(corrupt(
+                "refcounts section does not have one record per object",
+            ));
+        }
 
         if objects.count > u32::MAX as usize {
             return Err(corrupt("more than 2^32-1 objects"));
@@ -332,6 +342,7 @@ impl Snapshot {
             extras,
             regions,
             meta,
+            refcounts,
             unknown_sections,
         };
         let source_ref = snap_string(&snap, b, StrId(rd_u32(b, H_SOURCE_REF)))?.to_string();
@@ -488,7 +499,16 @@ impl Snapshot {
         Edge {
             target: rd_u64(r, 0),
             label: crate::types::EdgeLabel::decode(r[12], r[13], rd_u32(r, 8)),
+            origin: crate::types::EdgeOrigin::from_code(u16::from_le_bytes([r[14], r[15]])),
         }
+    }
+
+    /// How the walker knew edge `global_index` is a reference, without
+    /// decoding its label.
+    #[inline]
+    pub fn edge_origin(&self, global_index: u64) -> crate::types::EdgeOrigin {
+        let r = self.edges.at(self.b(), global_index as usize);
+        crate::types::EdgeOrigin::from_code(u16::from_le_bytes([r[14], r[15]]))
     }
 
     /// Outgoing edges of an object, in recorded order.
@@ -561,6 +581,21 @@ impl Snapshot {
     }
 
     // ---- memory summary / meta ----
+
+    /// Whether the snapshot recorded reference counts.
+    pub fn has_refcounts(&self) -> bool {
+        self.refcounts.is_some()
+    }
+
+    /// `ob_refcnt` of object `i` as captured: how many references own it.
+    /// `None` if the snapshot has no refcounts or this one was not read.
+    /// Immortal objects (see `ObjectFlags::IMMORTAL`) carry a sentinel, not a
+    /// count, and should not be compared with anything.
+    pub fn refcount(&self, i: u32) -> Option<u64> {
+        let recs = self.refcounts?;
+        let v = rd_u64(recs.at(self.b(), i as usize), 0);
+        (v != UNKNOWN_REFCOUNT).then_some(v)
+    }
 
     /// Memory summary entries, or `None` if the source had no memory map data.
     pub fn memory_summary(&self) -> Option<Vec<MemoryRegion>> {

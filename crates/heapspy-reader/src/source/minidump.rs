@@ -245,6 +245,10 @@ pub struct Minidump {
     process_create_time: Option<u32>,
     timestamp: u32,
     flags: u64,
+    /// Working set of the process when it was dumped, if whoever captured it
+    /// also asked the OS (see [`Minidump::set_rss_bytes`]). A minidump file
+    /// does not record residency itself.
+    rss_bytes: Option<u64>,
 }
 
 impl fmt::Debug for Minidump {
@@ -262,6 +266,13 @@ impl fmt::Debug for Minidump {
 }
 
 impl Minidump {
+    /// Record the process's working set at capture time, which the dump file
+    /// itself does not carry. Live capture knows it; a dump opened from disk
+    /// does not.
+    pub fn set_rss_bytes(&mut self, rss: Option<u64>) {
+        self.rss_bytes = rss;
+    }
+
     /// Open a full-memory minidump. Fails with [`Error::Format`] if the dump
     /// has no `Memory64ListStream` (it was not written with full memory).
     pub fn open(path: &Path) -> Result<Minidump> {
@@ -385,6 +396,7 @@ impl Minidump {
         };
 
         Ok(Minidump {
+            rss_bytes: None,
             data,
             target,
             full_memory,
@@ -708,7 +720,7 @@ impl MemorySource for Minidump {
                     resident_bytes: None,
                 })
                 .collect(),
-            rss_bytes: None,
+            rss_bytes: self.rss_bytes,
         })
     }
 

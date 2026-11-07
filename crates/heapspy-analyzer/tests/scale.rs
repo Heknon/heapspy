@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use heapspy_analyzer::{analyze, AnalyzeOptions};
 use heapspy_snapshot::{
-    Edge, EdgeLabel, KeyLabel, ObjectInput, RootKind, Snapshot, SnapshotInfo, SnapshotWriter,
+    Edge, EdgeLabel, EdgeOrigin, KeyLabel, ObjectInput, RootKind, Snapshot, SnapshotInfo,
+    SnapshotWriter,
 };
 
 /// Peak and current resident set size in KiB, from /proc (Linux only).
@@ -62,6 +63,7 @@ fn write(n: u64, path: &std::path::Path, spill: &std::path::Path) -> u64 {
     let e = |t: u64, label| Edge {
         target: addr(t),
         label,
+        origin: EdgeOrigin::Exact,
     };
 
     // 0 module, 1 module dict, 2 CACHE; entries at 3.., payloads after them.
@@ -128,6 +130,7 @@ fn write(n: u64, path: &std::path::Path, spill: &std::path::Path) -> u64 {
             out.push(Edge {
                 target: 0xdead,
                 label: EdgeLabel::Other(None),
+                origin: EdgeOrigin::Exact,
             });
         }
         w.add_object(

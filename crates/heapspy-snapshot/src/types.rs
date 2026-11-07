@@ -350,6 +350,56 @@ pub struct Edge {
     /// [`crate::Snapshot::find_object`].
     pub target: u64,
     pub label: EdgeLabel,
+    pub origin: EdgeOrigin,
+}
+
+/// How the walker knows an edge is a reference.
+///
+/// Stored in the edge record's `edge_flags`. Readers that predate it see
+/// reserved bytes and treat every edge as [`EdgeOrigin::Exact`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EdgeOrigin {
+    /// Read from a layout the walker knows: a dict entry, a list item, a
+    /// frame local. The source owns the target.
+    #[default]
+    Exact,
+    /// A field of an object whose layout the walker does not know, that
+    /// points at an object. Usually an owned reference; a field that only
+    /// borrows would over-count, which the target's refcount can show.
+    Scanned,
+    /// A pointer found in memory an object points at but does not lay out
+    /// (an out-of-line array or block). It may be a stale slot, so it is
+    /// only a reference if the target has owners nothing else accounts for.
+    Speculative,
+}
+
+impl EdgeOrigin {
+    pub fn code(self) -> u16 {
+        match self {
+            EdgeOrigin::Exact => 0,
+            EdgeOrigin::Scanned => 1,
+            EdgeOrigin::Speculative => 2,
+        }
+    }
+
+    pub fn from_code(c: u16) -> EdgeOrigin {
+        match c & 3 {
+            1 => EdgeOrigin::Scanned,
+            2 => EdgeOrigin::Speculative,
+            _ => EdgeOrigin::Exact,
+        }
+    }
+}
+
+impl Edge {
+    /// An edge read from a known layout.
+    pub fn exact(target: u64, label: EdgeLabel) -> Edge {
+        Edge {
+            target,
+            label,
+            origin: EdgeOrigin::Exact,
+        }
+    }
 }
 
 /// One root, decoded.

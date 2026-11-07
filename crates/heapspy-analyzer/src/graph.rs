@@ -1,9 +1,30 @@
 //! Load a snapshot's objects and edges into a [`Csr`] indexed by object index.
 
-use heapspy_snapshot::{Root, RootKind, Snapshot};
+use heapspy_snapshot::{EdgeOrigin, ObjectFlags, Root, RootKind, Snapshot};
 
 use crate::dominators::{Csr, NONE};
 use crate::Result;
+
+/// Root label for an object nothing in the graph accounts for, whose
+/// refcount says something outside it holds a reference: native code, a C
+/// global, memory the walker could not lay out.
+pub const EXTERNAL_ROOT_LABEL: &str = "held outside the Python graph";
+/// `root_kind` of such a root in reports.
+pub const EXTERNAL_ROOT_KIND: &str = "external";
+
+/// What reconciling edges against refcounts did. All zero for a snapshot
+/// without refcounts, where every edge is taken as it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// Whether the snapshot had refcounts to reconcile against.
+    pub refcounts: bool,
+    /// Scanned edges dropped because their target had more of them than
+    /// owners: fields that borrow rather than own.
+    pub scanned_dropped: u64,
+    /// Speculative (out-of-line) edges kept, and dropped as stale.
+    pub speculative_kept: u64,
+    pub speculative_dropped: u64,
+}
 
 /// The object graph plus a synthetic super-root.
 ///
@@ -26,13 +47,43 @@ pub struct ObjectGraph {
     /// For each super-root edge `snapshot_edges + k`, the root entry chosen to
     /// describe that root object (see [`primary_root`]).
     pub root_entries: Vec<Root>,
+    pub reconciliation: Reconciliation,
+    /// Super-root edges by BFS phase: stable roots (modules, interpreter
+    /// state), then transient ones (frames, thread state), then external.
+    /// Each is a range of CSR edge indices.
+    pub root_phases: [std::ops::Range<u32>; 3],
 }
 
 impl ObjectGraph {
-    /// The root entry for a super-root edge.
+    /// The root entry for a super-root edge, or `None` for an ordinary edge
+    /// or an external root.
     pub fn root_entry(&self, e: u32) -> Option<&Root> {
         e.checked_sub(self.snapshot_edges)
             .and_then(|k| self.root_entries.get(k as usize))
+    }
+
+    /// Whether `e` is a super-root edge to an external root.
+    pub fn is_external_root(&self, e: u32) -> bool {
+        e.checked_sub(self.snapshot_edges)
+            .is_some_and(|k| k as usize >= self.root_entries.len())
+    }
+
+    /// Label and kind of the root a super-root edge leads to. `None` for an
+    /// ordinary edge.
+    pub fn root_label(&self, snap: &Snapshot, e: u32) -> Result<Option<(String, String)>> {
+        if self.is_external_root(e) {
+            return Ok(Some((
+                EXTERNAL_ROOT_LABEL.to_string(),
+                EXTERNAL_ROOT_KIND.to_string(),
+            )));
+        }
+        match self.root_entry(e) {
+            Some(r) => Ok(Some((
+                snap.string(r.label)?.to_string(),
+                r.kind.as_str().to_string(),
+            ))),
+            None => Ok(None),
+        }
     }
 }
 
@@ -124,17 +175,24 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     // local that happens to hold a function whose `__globals__` is the same
     // module dict. Ordering by object index would make that choice depend on
     // addresses, which change from one dump to the next.
-    keyed.sort_by(|a, b| (a.1, &a.2, a.0).cmp(&(b.1, &b.2, b.0)));
+    //
+    // Stable roots (modules, interpreter state) go before transient ones
+    // (frame locals, thread state), and the BFS finishes the stable ones
+    // before it starts the others (see `ObjectGraph::root_phases`). A path
+    // then starts at a frame only when nothing longer-lived holds the object.
+    keyed.sort_by(|a, b| {
+        (transient(a.3.kind), a.1, &a.2, a.0).cmp(&(transient(b.3.kind), b.1, &b.2, b.0))
+    });
+    let stable_roots = keyed.iter().filter(|k| !transient(k.3.kind)).count() as u32;
     let root_nodes: Vec<u32> = keyed.iter().map(|k| k.0).collect();
     let root_entries: Vec<Root> = keyed.into_iter().map(|k| k.3).collect();
 
-    let total = e
-        .checked_add(root_nodes.len())
+    e.checked_add(root_nodes.len())
         .filter(|&t| t < NONE as usize)
         .ok_or_else(|| limit("more than 2^32 - 2 edges"))?;
 
     let mut offsets = Vec::with_capacity(n + 2);
-    let mut targets = Vec::with_capacity(total);
+    let mut targets = Vec::with_capacity(e + root_nodes.len());
     let mut dangling = 0u64;
     for i in 0..n as u32 {
         offsets.push(targets.len() as u32);
@@ -150,9 +208,23 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
     }
     debug_assert_eq!(targets.len(), e);
     offsets.push(targets.len() as u32);
+    drop(index);
+
+    let (reconciliation, unexplained) = reconcile(snap, &mut targets);
+
+    // External roots: objects no root reaches that something outside the
+    // graph holds. Found before the super-root's edges are appended, so the
+    // reachability below is from the real roots only.
+    let external = external_roots(&offsets, &targets, &root_nodes, &unexplained);
+
     targets.extend_from_slice(&root_nodes);
+    targets.extend_from_slice(&external);
     offsets.push(targets.len() as u32);
 
+    let first = e as u32;
+    let transient_start = first + stable_roots;
+    let external_start = first + root_nodes.len() as u32;
+    let end = external_start + external.len() as u32;
     Ok(ObjectGraph {
         csr: Csr { offsets, targets },
         n: n as u32,
@@ -160,7 +232,173 @@ pub fn build(snap: &Snapshot) -> Result<ObjectGraph> {
         dangling_edges: dangling,
         missing_roots,
         root_entries,
+        reconciliation,
+        root_phases: [
+            first..transient_start,
+            transient_start..external_start,
+            external_start..end,
+        ],
     })
+}
+
+/// Roots that exist only while a thread is running a function.
+fn transient(kind: RootKind) -> bool {
+    matches!(kind, RootKind::FrameLocal | RootKind::ThreadLocals)
+}
+
+/// The refcount of object `i`, if it can be compared with edge counts:
+/// recorded, and not immortal (an immortal object's count is a sentinel).
+fn owners(snap: &Snapshot, i: u32) -> Option<u64> {
+    if snap.object(i).flags.contains(ObjectFlags::IMMORTAL) {
+        return None;
+    }
+    snap.refcount(i)
+}
+
+/// Check the edges the walker was unsure of against the targets' refcounts.
+///
+/// A refcount is the number of references that own an object. Edges read
+/// from a known layout ([`EdgeOrigin::Exact`]) are references. The others
+/// are kept only as far as the refcount leaves room for them:
+///
+/// - A target with more scanned edges than owners left over has scanned
+///   fields that borrow. Scanned edges past the count are dropped.
+/// - A speculative edge (a pointer found out of line) is kept only while the
+///   target still has owners nothing else explains. A stale slot's target
+///   is fully explained by its real owners, so its edge is dropped.
+///
+/// Dropped edges become [`NONE`] placeholders, like dangling ones, so CSR
+/// edge `e` stays snapshot edge `e`. Returns what was done and, per object,
+/// the owners still unexplained. Without refcounts nothing is checked:
+/// scanned edges are kept and speculative ones dropped, since there is
+/// nothing to tell a stale pointer from a real one.
+fn reconcile(snap: &Snapshot, targets: &mut [u32]) -> (Reconciliation, Vec<u32>) {
+    let n = snap.object_count();
+    let mut r = Reconciliation {
+        refcounts: snap.has_refcounts(),
+        ..Reconciliation::default()
+    };
+    let origin = |g: usize| snap.edge_origin(g as u64);
+    if !r.refcounts {
+        for (g, t) in targets.iter_mut().enumerate() {
+            if *t != NONE && origin(g) == EdgeOrigin::Speculative {
+                *t = NONE;
+                r.speculative_dropped += 1;
+            }
+        }
+        return (r, Vec::new());
+    }
+
+    // Owners left after the exact edges, then after the scanned ones.
+    let mut left: Vec<u64> = (0..n as u32)
+        .map(|i| owners(snap, i).unwrap_or(u64::MAX))
+        .collect();
+    for (g, &t) in targets.iter().enumerate() {
+        if t != NONE && origin(g) == EdgeOrigin::Exact {
+            left[t as usize] = left[t as usize].saturating_sub(1);
+        }
+    }
+    for (g, t) in targets.iter_mut().enumerate() {
+        if *t == NONE || origin(g) != EdgeOrigin::Scanned {
+            continue;
+        }
+        let l = &mut left[*t as usize];
+        if *l == 0 {
+            *t = NONE;
+            r.scanned_dropped += 1;
+        } else {
+            *l = l.saturating_sub(1);
+        }
+    }
+    for (g, t) in targets.iter_mut().enumerate() {
+        if *t == NONE || origin(g) != EdgeOrigin::Speculative {
+            continue;
+        }
+        let l = &mut left[*t as usize];
+        // u64::MAX: no usable refcount, so nothing to vouch for the pointer.
+        if *l == 0 || *l == u64::MAX {
+            *t = NONE;
+            r.speculative_dropped += 1;
+        } else {
+            *l -= 1;
+            r.speculative_kept += 1;
+        }
+    }
+    let unexplained = left
+        .into_iter()
+        .map(|l| {
+            if l == u64::MAX {
+                0
+            } else {
+                l.min(u32::MAX as u64) as u32
+            }
+        })
+        .collect();
+    (r, unexplained)
+}
+
+/// Objects to treat as roots because something outside the graph holds
+/// them: not reachable from `roots`, with owners `unexplained` by any edge.
+///
+/// Among such objects, those that others of them point at are left to be
+/// reached through those others where possible, so a native-held container
+/// is the root and its contents hang below it, not beside it.
+fn external_roots(
+    offsets: &[u32],
+    targets: &[u32],
+    roots: &[u32],
+    unexplained: &[u32],
+) -> Vec<u32> {
+    if unexplained.is_empty() {
+        return Vec::new();
+    }
+    let n = unexplained.len();
+    let mut seen = vec![false; n];
+    let mut stack: Vec<u32> = Vec::new();
+    let mark = |from: u32, seen: &mut Vec<bool>, stack: &mut Vec<u32>| {
+        if !seen[from as usize] {
+            seen[from as usize] = true;
+            stack.push(from);
+        }
+        while let Some(v) = stack.pop() {
+            let v = v as usize;
+            for &w in &targets[offsets[v] as usize..offsets[v + 1] as usize] {
+                if w != NONE && !seen[w as usize] {
+                    seen[w as usize] = true;
+                    stack.push(w);
+                }
+            }
+        }
+    };
+    for &r in roots {
+        mark(r, &mut seen, &mut stack);
+    }
+    // In-degree within the part no root reaches.
+    let mut indeg = vec![0u32; n];
+    for v in 0..n {
+        if seen[v] {
+            continue;
+        }
+        for &w in &targets[offsets[v] as usize..offsets[v + 1] as usize] {
+            if w != NONE && !seen[w as usize] {
+                indeg[w as usize] += 1;
+            }
+        }
+    }
+    let candidates: Vec<u32> = (0..n as u32)
+        .filter(|&v| !seen[v as usize] && unexplained[v as usize] > 0)
+        .collect();
+    let mut out = Vec::new();
+    for top_only in [true, false] {
+        for &v in &candidates {
+            if seen[v as usize] || (top_only && indeg[v as usize] > 0) {
+                continue;
+            }
+            out.push(v);
+            mark(v, &mut seen, &mut stack);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

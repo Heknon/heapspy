@@ -25,7 +25,7 @@ pub mod render;
 pub mod report;
 pub mod source;
 
-use heapspy_snapshot::Snapshot;
+use heapspy_snapshot::{RegionKind, Snapshot};
 
 use analysis::Analysis;
 pub use flame::{
@@ -33,8 +33,8 @@ pub use flame::{
     MinWidth,
 };
 use report::{
-    Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryTotals, Retainer, RetainingPathReport,
-    SchemaVersion, SnapshotSummary, SourceRef, Totals, TypeQueryReport,
+    Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryPart, MemoryTotals, Retainer,
+    RetainingPathReport, SchemaVersion, SnapshotSummary, SourceRef, Totals, TypeQueryReport,
 };
 
 /// Errors from analysis.
@@ -192,12 +192,87 @@ fn rss_bytes(snap: &Snapshot) -> Result<Option<u64>> {
 fn memory_totals(snap: &Snapshot, graph_bytes: u64) -> Result<MemoryTotals> {
     let rss = rss_bytes(snap)?;
     let outside = rss.map(|r| r.saturating_sub(graph_bytes));
+    let (breakdown, breakdown_basis) = memory_breakdown(snap, graph_bytes)?;
     Ok(MemoryTotals {
         rss_bytes: rss,
         graph_bytes,
         outside_graph_bytes: outside,
         outside_graph_pct: rss.zip(outside).map(|(r, o)| pct(o, r)),
+        breakdown,
+        breakdown_basis,
     })
+}
+
+fn meta_u64(snap: &Snapshot, key: &str) -> Result<Option<u64>> {
+    Ok(snap
+        .meta_value(key)?
+        .and_then(|v| v.trim().parse::<u64>().ok()))
+}
+
+/// What the process's memory is: the memory map's regions by kind, with
+/// private memory split by what the walk learned about it.
+///
+/// - Images, mapped files and thread stacks come from the map as they are.
+/// - Private memory (heaps and anonymous mappings) holds pymalloc's arenas,
+///   whose pool headers say how much is handed out (`python_small_objects`)
+///   and how much is held in reserve (`pymalloc_free`); Python objects too
+///   large for pymalloc, which come from `malloc` (`python_large_objects`:
+///   the object graph's bytes beyond what pymalloc holds); and the rest,
+///   which is memory C code allocated (`native_unknown`).
+///
+/// Counts resident bytes where every region knows them, committed bytes
+/// otherwise (a minidump does not record residency).
+fn memory_breakdown(
+    snap: &Snapshot,
+    graph_bytes: u64,
+) -> Result<(Vec<MemoryPart>, Option<String>)> {
+    let Some(regions) = snap.memory_summary() else {
+        return Ok((Vec::new(), None));
+    };
+    let resident = regions.iter().all(|r| r.resident_bytes.is_some());
+    let by = |kinds: &[RegionKind]| -> u64 {
+        regions
+            .iter()
+            .filter(|r| kinds.contains(&r.kind))
+            .map(|r| {
+                if resident {
+                    r.resident_bytes.unwrap_or(0)
+                } else {
+                    r.mapped_bytes
+                }
+            })
+            .sum()
+    };
+    let images = by(&[RegionKind::Image]);
+    let mapped = by(&[RegionKind::MappedFile]);
+    let stacks = by(&[RegionKind::Stack]);
+    let private = by(&[
+        RegionKind::Heap,
+        RegionKind::Anonymous,
+        RegionKind::PythonArena,
+        RegionKind::Other,
+    ]);
+    let used = meta_u64(snap, "pymalloc.used_bytes")?.unwrap_or(0);
+    let arenas = meta_u64(snap, "pymalloc.arena_bytes")?
+        .unwrap_or(0)
+        .max(used);
+    let large = graph_bytes.saturating_sub(used);
+    let native = private.saturating_sub(arenas).saturating_sub(large);
+    let part = |part: &str, bytes: u64| MemoryPart {
+        part: part.to_string(),
+        bytes,
+    };
+    let parts = vec![
+        part("images", images),
+        part("mapped_files", mapped),
+        part("stacks", stacks),
+        part("python_small_objects", used),
+        part("pymalloc_free", arenas - used),
+        part("python_large_objects", large),
+        part("native_unknown", native),
+    ];
+    let basis = if resident { "resident" } else { "committed" };
+    Ok((parts, Some(basis.to_string())))
 }
 
 /// Dominator tree, retained sizes, top retainers, type histogram.
@@ -214,19 +289,28 @@ pub(crate) fn analyze_with(
     opts: &AnalyzeOptions,
 ) -> Result<(AnalyzeReport, Vec<u32>)> {
     let snap = a.snap;
+    // Everything the super-root reaches, external roots included: the base
+    // for percentages, since that is all the memory something holds.
     let reachable_bytes = a.reachable_bytes();
-    let reachable_objects = a.reachable_objects();
+    let held_objects = a.reachable_objects();
+    let rec = a.g.reconciliation;
     let totals = Totals {
         objects: snap.object_count() as u64,
         edges: snap.edge_count() as u64,
         types: a.types.names.len() as u64 - 1,
         roots: snap.root_count() as u64,
         shallow_bytes: a.shallow_total,
-        reachable_objects,
-        reachable_bytes,
-        unreachable_objects: snap.object_count() as u64 - reachable_objects,
+        reachable_objects: held_objects - a.external_objects,
+        reachable_bytes: reachable_bytes - a.external_bytes,
+        external_objects: a.external_objects,
+        external_bytes: a.external_bytes,
+        unreachable_objects: snap.object_count() as u64 - held_objects,
         unreachable_bytes: a.shallow_total - reachable_bytes,
         dangling_edges: a.g.dangling_edges,
+        refcounts_checked: rec.refcounts,
+        borrowed_edges_dropped: rec.scanned_dropped,
+        stale_edges_dropped: rec.speculative_dropped,
+        out_of_line_edges: rec.speculative_kept,
     };
     let memory = memory_totals(snap, a.shallow_total)?;
 

@@ -40,6 +40,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     MiniDumpIgnoreInaccessibleMemory, MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo,
     MiniDumpWithHandleData, MiniDumpWithThreadInfo, MiniDumpWriteDump, MINIDUMP_TYPE,
 };
+use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE,
     PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
@@ -64,8 +65,10 @@ const DUMP_TYPE: MINIDUMP_TYPE = MiniDumpWithFullMemory
 /// choice.
 pub fn capture(pid: u32, scratch_dir: &Path) -> Result<Minidump> {
     let file = create_temp(pid, scratch_dir)?;
-    write_to(pid, &file)?;
-    Minidump::from_file(file, MinidumpOptions::default())
+    let rss = write_to(pid, &file)?;
+    let mut dump = Minidump::from_file(file, MinidumpOptions::default())?;
+    dump.set_rss_bytes(rss);
+    Ok(dump)
 }
 
 /// Write a full-memory minidump of `pid` to `path` and keep it. `path` must
@@ -76,7 +79,7 @@ pub fn write_dump(pid: u32, path: &Path) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    if let Err(e) = write_to(pid, &file) {
+    if let Err(e) = write_to(pid, &file).map(drop) {
         drop(file);
         let _ = std::fs::remove_file(path);
         return Err(e);
@@ -225,7 +228,21 @@ fn dump_error(pid: u32, code: u32) -> Error {
     ))
 }
 
-fn write_to(pid: u32, file: &File) -> Result<()> {
+/// The process's working set (its resident memory), read just after the dump
+/// so it describes the same moment. `None` if Windows will not say.
+fn working_set(process: HANDLE) -> Option<u64> {
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS is valid; the call writes
+    // at most `size` bytes into it, and `process` is open with
+    // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = size;
+    let ok = unsafe { K32GetProcessMemoryInfo(process, &mut counters, size) };
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+/// Write the dump and return the working set at that moment.
+fn write_to(pid: u32, file: &File) -> Result<Option<u64>> {
     let (process, dup) = open_process(pid)?;
     let ty = if dup {
         DUMP_TYPE
@@ -248,5 +265,5 @@ fn write_to(pid: u32, file: &File) -> Result<()> {
     if ok == 0 {
         return Err(dump_error(pid, last_error()));
     }
-    Ok(())
+    Ok(working_set(process.0))
 }

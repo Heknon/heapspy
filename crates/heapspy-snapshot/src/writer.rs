@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::format::*;
 use crate::types::*;
 
-const SPILL_OBJECT_LEN: usize = 64;
+const SPILL_OBJECT_LEN: usize = 72;
 
 /// Summary returned by [`SnapshotWriter::finish`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +40,9 @@ pub struct ObjectInput {
     pub shallow_size: u64,
     pub flags: ObjectFlags,
     pub extras: ObjectExtras,
+    /// `ob_refcnt` as read from the target: how many references own the
+    /// object. `None` if it was not read. See the refcounts section.
+    pub refcount: Option<u64>,
 }
 
 impl ObjectInput {
@@ -50,6 +53,7 @@ impl ObjectInput {
             shallow_size,
             flags: ObjectFlags::GC_TRACKED,
             extras: ObjectExtras::default(),
+            refcount: None,
         }
     }
 }
@@ -150,6 +154,9 @@ pub struct SnapshotWriter {
     keys: Vec<(u64, u32)>,
     edge_total: u64,
     extras_count: u64,
+    /// Whether any object came with a refcount. Without one the refcounts
+    /// section is not written at all.
+    has_refcounts: bool,
     roots: Vec<(u64, RootKind, StrId)>,
     regions: Vec<MemoryRegion>,
     meta: Vec<(StrId, StrId)>,
@@ -180,6 +187,7 @@ impl SnapshotWriter {
             keys: Vec::new(),
             edge_total: 0,
             extras_count: 0,
+            has_refcounts: false,
             roots: Vec::new(),
             regions: Vec::new(),
             meta: Vec::new(),
@@ -252,6 +260,7 @@ impl SnapshotWriter {
             wr_u32(&mut r, 8, operand);
             r[12] = kind;
             r[13] = flags;
+            r[14..16].copy_from_slice(&e.origin.code().to_le_bytes());
             self.edge_buf.extend_from_slice(&r);
             count += 1;
         }
@@ -288,6 +297,8 @@ impl SnapshotWriter {
         wr_u32(&mut r, 48, StrId::encode(x.qualname));
         wr_u32(&mut r, 52, StrId::encode(x.source_loc));
         wr_u32(&mut r, 56, StrId::encode(x.content));
+        wr_u64(&mut r, 64, obj.refcount.unwrap_or(UNKNOWN_REFCOUNT));
+        self.has_refcounts |= obj.refcount.is_some();
 
         self.edges.write(&self.edge_buf)?;
         self.objects.write(&r)?;
@@ -398,6 +409,13 @@ impl SnapshotWriter {
             ));
         }
         sections.push((SK_META, 0, rec(self.meta.len() as u64, META_RECORD_LEN)));
+        if self.has_refcounts {
+            sections.push((
+                SK_REFCOUNTS,
+                0,
+                rec(self.keys.len() as u64, REFCOUNT_RECORD_LEN),
+            ));
+        }
 
         let table_offset = HEADER_LEN as u64;
         let mut pos = align_up(table_offset + (sections.len() * SECTION_ENTRY_LEN) as u64);
@@ -548,6 +566,13 @@ impl SnapshotWriter {
                         wr_u32(&mut r, 0, k.0);
                         wr_u32(&mut r, 4, v.0);
                         out.write_all(&r)?;
+                    }
+                }
+                SK_REFCOUNTS => {
+                    out.record_header(self.keys.len() as u64, REFCOUNT_RECORD_LEN)?;
+                    for &(_, si) in &self.keys {
+                        let s = &obj_bytes[si as usize * SPILL_OBJECT_LEN..][..SPILL_OBJECT_LEN];
+                        out.write_all(&s[64..72])?;
                     }
                 }
                 _ => unreachable!("writer only emits known sections"),

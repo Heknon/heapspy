@@ -54,16 +54,35 @@ pub struct ObjectSpec {
     ty: TypeId,
     size: u64,
     flags: ObjectFlags,
-    edges: Vec<(u64, L)>,
+    edges: Vec<(u64, L, EdgeOrigin)>,
     length: Option<u64>,
     qualname: Option<String>,
     source_loc: Option<String>,
     content: Option<(String, bool)>,
+    refcount: Option<u64>,
 }
 
 impl ObjectSpec {
     fn push(&mut self, target: u64, l: L) -> &mut Self {
-        self.edges.push((target, l));
+        self.edges.push((target, l, EdgeOrigin::Exact));
+        self
+    }
+    /// A field of unknown layout found by scanning, labelled `<+off>`.
+    pub fn scanned(&mut self, target: u64, off: u64) -> &mut Self {
+        self.edges.push((
+            target,
+            L::Other(Some(format!("+{off}"))),
+            EdgeOrigin::Scanned,
+        ));
+        self
+    }
+    /// A pointer found out of line, labelled `<+off[slot]>`.
+    pub fn speculative(&mut self, target: u64, off: u64, slot: u32) -> &mut Self {
+        self.edges.push((
+            target,
+            L::Other(Some(format!("+{off}[{slot}]"))),
+            EdgeOrigin::Speculative,
+        ));
         self
     }
     /// `[key]` where `key_repr` is the key's repr text, e.g. `"'cache'"` or `"3"`.
@@ -128,6 +147,11 @@ impl ObjectSpec {
     }
     pub fn length(&mut self, len: u64) -> &mut Self {
         self.length = Some(len);
+        self
+    }
+    /// The object's `ob_refcnt`: how many references own it.
+    pub fn refcount(&mut self, n: u64) -> &mut Self {
+        self.refcount = Some(n);
         self
     }
     pub fn qualname(&mut self, q: &str) -> &mut Self {
@@ -247,6 +271,7 @@ impl SnapshotBuilder {
             qualname: None,
             source_loc: None,
             content: None,
+            refcount: None,
         });
         self.objects.last_mut().expect("just pushed")
     }
@@ -282,7 +307,7 @@ impl SnapshotBuilder {
         }
         for o in &self.objects {
             let mut edges = Vec::with_capacity(o.edges.len());
-            for (target, l) in &o.edges {
+            for (target, l, origin) in &o.edges {
                 let key =
                     |w: &mut SnapshotWriter, t: &Option<String>, red: bool| -> Result<KeyLabel> {
                         Ok(match t {
@@ -307,6 +332,7 @@ impl SnapshotBuilder {
                 edges.push(Edge {
                     target: *target,
                     label,
+                    origin: *origin,
                 });
             }
             let extras = ObjectExtras {
@@ -322,6 +348,7 @@ impl SnapshotBuilder {
                 shallow_size: o.size,
                 flags: o.flags,
                 extras,
+                refcount: o.refcount,
             };
             w.add_object(&input, edges)?;
         }

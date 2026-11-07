@@ -224,7 +224,8 @@ Out of scope for v1: allocation call chains, per-object native or C-extension me
 ## Known blind spots
 
 - **Untracked objects.** Bare ints, short strings, and raw buffers are not on the GC lists. heapspy sees them only when a tracked container references them. A leak made entirely of floating untracked objects will not show up in v1, and the output will say so.
-- **Native memory.** Memory allocated by C extensions is invisible to the object graph. heapspy reports how much of RSS falls outside the graph rather than guessing.
+- **Native memory.** Memory allocated by C extensions is invisible to the object graph. heapspy reports how much of RSS falls outside the graph rather than guessing. Python objects that native code holds are not lost: their refcounts show owners heapspy found no reference from, and they are reported under the root `held outside the Python graph`.
+- **C types heapspy has no layout for.** Their references are found by scanning their fields for pointers to objects, and the memory they point at but do not lay out (a `deque`'s blocks, an extension's item array) is searched the same way. Both kinds of edge are checked against the targets' refcounts, so a field that only borrows, or a stale slot, does not count as ownership.
 - **Struct layouts.** CPython's internal layouts change between versions and builds. heapspy uses DWARF or PDB symbols when available, 3.14's debug offsets section where present, and shipped per-version offset tables otherwise.
 
 ## Agent integration: heapspy-mcp
