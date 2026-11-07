@@ -23,6 +23,11 @@ on:
         default: both
   push:
     tags: ["v*"]
+    # TEMPORARY, remove before merging: workflow_dispatch only works once
+    # this file is on the default branch, so pushes to this branch run it.
+    # "[record: linux]" or "[record: windows]" in the commit message picks
+    # one side.
+    branches: [feature/ci-record-checks]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     paths-ignore:
@@ -46,7 +51,8 @@ jobs:
     # about, so adding unrelated labels does not start a run.
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.side != 'windows') ||
-      github.event_name == 'push' ||
+      (github.event_name == 'push' &&
+       !contains(github.event.head_commit.message, '[record: windows]')) ||
       (contains(github.event.pull_request.labels.*.name, 'ci:record') &&
        (github.event.action != 'labeled' || github.event.label.name == 'ci:record'))
     runs-on: ubuntu-latest
@@ -153,7 +159,8 @@ jobs:
     name: record (windows)
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.side != 'linux') ||
-      github.event_name == 'push' ||
+      (github.event_name == 'push' &&
+       !contains(github.event.head_commit.message, '[record: linux]')) ||
       (contains(github.event.pull_request.labels.*.name, 'ci:record') &&
        (github.event.action != 'labeled' || github.event.label.name == 'ci:record'))
     runs-on: windows-latest
