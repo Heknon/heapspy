@@ -337,10 +337,26 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     if modules.iter().any(|m| other_allocator(&m.name)) {
         return Ok(None);
     }
-    let Some(libc) = modules.iter().find(|m| is_glibc(&m.name)) else {
+    let ranges = src.mapped_ranges()?;
+    // libc: its module, or a mapped file named like it. A core whose
+    // module list misses libc (its ELF header not dumped and not on disk
+    // where the core says) still names it in `NT_FILE`.
+    let files = || ranges.iter().filter_map(|r| r.file.as_deref());
+    if files().any(|f| other_allocator(module_name(f))) {
+        return Ok(None);
+    }
+    let libc_path = modules
+        .iter()
+        .find(|m| is_glibc(&m.name))
+        .map(|m| m.path.clone())
+        .or_else(|| {
+            files()
+                .find(|f| is_glibc(module_name(f)))
+                .map(str::to_string)
+        });
+    let Some(libc_path) = libc_path else {
         return Ok(None);
     };
-    let ranges = src.mapped_ranges()?;
     let stacks: Vec<u64> = src
         .threads()
         .unwrap_or_default()
@@ -357,7 +373,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     // libc's writable data, where `main_arena` is.
     let libc_data: Vec<Span> = ranges
         .iter()
-        .filter(|r| r.perms.write && r.file.as_deref() == Some(libc.path.as_str()))
+        .filter(|r| r.perms.write && r.file.as_deref() == Some(libc_path.as_str()))
         .filter_map(|r| Span::new(r.start, r.start.checked_add(r.size)?))
         .collect();
 
@@ -608,13 +624,19 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     Ok(Some(out))
 }
 
+/// The file name of a path.
+fn module_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn is_glibc(name: &str) -> bool {
     name == "libc.so.6" || (name.starts_with("libc-2.") && name.ends_with(".so"))
 }
 
 fn other_allocator(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["jemalloc", "tcmalloc", "mimalloc"]
+    // musl's libc is its loader: a musl process has no glibc heap.
+    ["jemalloc", "tcmalloc", "mimalloc", "ld-musl"]
         .iter()
         .any(|a| n.contains(a))
 }
@@ -2062,6 +2084,21 @@ mod tests {
         assert!(got.iter().any(|b| b.start == t));
         // Fastbins: neither list mode validates, so they count busy.
         assert!(got.iter().any(|b| b.start == f1) && got.iter().any(|b| b.start == f2));
+    }
+
+    #[test]
+    fn libc_is_found_by_its_mapping_when_no_module_names_it() {
+        // An old gdb's core: NT_FILE names libc's data, but its ELF header
+        // was not dumped, so it is no module.
+        let (mut w, want, _) = main_heap_world(V2_23, TargetInfo::LINUX_X86_64, true);
+        w.modules.retain(|m| *m != "libc.so.6");
+        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+        // An allocator named only by a mapping still opts out.
+        let mut je = w.clone();
+        je.bytes.region(0x7f40_0000_0000, 0x1000);
+        je.files
+            .push((0x7f40_0000_0000, "/usr/lib/libjemalloc.so.2".into()));
+        assert_eq!(blocks(&je.img(), &HeapHints::default()), None);
     }
 
     #[test]
