@@ -9,11 +9,15 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo check --workspace --target x86_64-pc-windows-gnu
+cargo check --workspace --target x86_64-unknown-linux-musl
 ```
 
-The last command type-checks the Windows `cfg` code from a Linux or macOS
-machine. Add the target once with `rustup target add x86_64-pc-windows-gnu`.
-It does not link or run anything, so no MinGW toolchain is needed.
+The last two commands type-check the code for the other release targets.
+The Windows one checks the Windows `cfg` code from a Linux or macOS machine;
+the musl one catches libc signatures that differ from glibc's. Add the
+targets once with `rustup target add x86_64-pc-windows-gnu
+x86_64-unknown-linux-musl`. Neither links anything, so no MinGW or musl
+toolchain is needed.
 
 ## Running CI on GitHub
 
@@ -21,7 +25,7 @@ The workflow in `.github/workflows/ci.yml` runs only when asked:
 
 | Trigger | What runs |
 |---|---|
-| PR label `ci` | fmt, clippy and `cargo test --workspace` on ubuntu-latest |
+| PR label `ci` | fmt, clippy (glibc and musl) and `cargo test --workspace` on ubuntu-latest |
 | PR label `ci:windows` | `cargo test --workspace` on windows-latest |
 | every release (called by `release.yml`) | both jobs |
 | manual dispatch (Actions tab) | both jobs |
