@@ -372,7 +372,7 @@ impl<'a> Walker<'a> {
             // (a Windows large block's header sits at a random offset, and
             // its list links point into other blocks' headers); otherwise
             // at the block start itself.
-            addr >= blk.start + blk.data_offset.max(1)
+            addr >= blk.start.saturating_add(blk.data_offset.max(1))
         })
     }
 
@@ -435,8 +435,12 @@ impl<'a> Walker<'a> {
 
     /// Flags of the type at `ob_type` of `addr`, without building a TypeInfo.
     fn raw_type_flags(&self, addr: u64) -> Option<u64> {
-        let t = self.ptr(addr + 8).ok()?;
-        self.src.read_u32(t + self.o.tp_flags).ok().map(u64::from)
+        // Any word can land here, so the sums must not overflow.
+        let t = self.ptr(addr.checked_add(8)?).ok()?;
+        self.src
+            .read_u32(t.checked_add(self.o.tp_flags)?)
+            .ok()
+            .map(u64::from)
     }
 
     /// Whether `addr` looks like the start of a live object: GC-tracked, or
@@ -462,7 +466,7 @@ impl<'a> Walker<'a> {
         if !immortal && (refcnt == 0 || refcnt >> 32 != 0 || link) {
             return false;
         }
-        let Ok(t) = self.ptr(addr + 8) else {
+        let Some(Ok(t)) = addr.checked_add(8).map(|a| self.ptr(a)) else {
             return false;
         };
         if t == 0 || t & 7 != 0 {
