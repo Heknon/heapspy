@@ -94,7 +94,8 @@ const PAYLOAD_LINE: u32 = 6;
 /// `keep.append(build_payload(i))`.
 const HANDLER_LINE: u32 = 8;
 
-/// The ETW session the recorder starts.
+/// The ETW sessions the recorder may start: its own `heapspy-<pid>`
+/// (system logger mode), or this one where that mode is not supported.
 const KERNEL_LOGGER: &str = "NT Kernel Logger";
 
 // ---- Win32, for the checks only ---------------------------------------
@@ -228,20 +229,44 @@ fn etw_sessions() -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-fn kernel_logger_running() -> bool {
-    etw_sessions().contains(KERNEL_LOGGER)
+/// Names of the running ETW sessions, from `logman query -ets`.
+fn session_names() -> Vec<String> {
+    etw_sessions()
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_end();
+            // Rows are "<name>   <type>   <status>"; names may have spaces.
+            let cut = l.find("  ")?;
+            Some(l[..cut].trim().to_string())
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
 }
 
-/// Stops a kernel logger left behind by a failed test, so the next test
-/// does not fail for that reason too. Created only after checking that no
-/// other tool had it.
+/// heapspy's own session name: `heapspy-<digits>`.
+fn is_heapspy_session(n: &str) -> bool {
+    n.strip_prefix("heapspy-")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A recorder's ETW session is running (heapspy's own, or the kernel
+/// logger it falls back to).
+fn kernel_logger_running() -> bool {
+    session_names()
+        .iter()
+        .any(|n| n == KERNEL_LOGGER || is_heapspy_session(n))
+}
+
+/// Stops a recorder session left behind by a failed test, so the next
+/// test does not fail for that reason too. Created only after checking that
+/// no other tool had one.
 struct LoggerGuard;
 
 impl LoggerGuard {
     fn new() -> LoggerGuard {
         assert!(
             !kernel_logger_running(),
-            "the {KERNEL_LOGGER} session is already running before the test:\n{}",
+            "a recorder ETW session is already running before the test:\n{}",
             etw_sessions()
         );
         LoggerGuard
@@ -250,16 +275,40 @@ impl LoggerGuard {
 
 impl Drop for LoggerGuard {
     fn drop(&mut self) {
-        if kernel_logger_running() {
-            eprintln!("cleanup: stopping a leftover {KERNEL_LOGGER} session");
-            let _ = Command::new("logman")
-                .args(["stop", KERNEL_LOGGER, "-ets"])
-                .output();
+        for n in session_names() {
+            if n == KERNEL_LOGGER || is_heapspy_session(&n) {
+                eprintln!("cleanup: stopping a leftover {n} session");
+                let _ = Command::new("logman").args(["stop", &n, "-ets"]).output();
+            }
         }
     }
 }
 
-// ---- the victim ----------------------------------------------------------
+/// Start a real-time ETW session of any provider under `name` with
+/// logman, as another tool (or a killed heapspy) would leave one.
+fn start_foreign_session(name: &str) {
+    let o = Command::new("logman")
+        .args([
+            "start",
+            name,
+            "-p",
+            "Microsoft-Windows-Kernel-Process",
+            "-rt",
+            "-ets",
+        ])
+        .output()
+        .expect("run logman");
+    assert!(
+        o.status.success(),
+        "logman start {name}: {}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+fn stop_named_session(name: &str) {
+    let _ = Command::new("logman").args(["stop", name, "-ets"]).output();
+}
 
 fn python(minor: u8) -> PathBuf {
     if let Ok(p) = std::env::var(format!("HEAPSPY_PY3{minor}")) {
@@ -439,14 +488,15 @@ fn run(minor: u8, mechanism: &str) {
     let rec = ok_json(&o, "record");
     eprintln!("{}", String::from_utf8_lossy(&o.stderr).trim_end());
     let want: Vec<&str> = match mechanism {
-        "auto" => vec!["etw", "debugger"],
+        // auto is ETW alone on Windows.
+        "auto" => vec!["etw"],
         m => vec![m],
     };
     assert_eq!(rec["kind"], "record", "{rec}");
     assert_eq!(rec["mechanisms"], serde_json::json!(want), "{rec}");
     let samples = rec["samples"].as_u64().unwrap();
     assert!(samples > 0, "no samples: {rec}");
-    if mechanism != "etw" {
+    if mechanism == "debugger" {
         assert!(
             rec["overhead"]["total_pause_ns"].as_u64().unwrap() > 0,
             "the debugger stopped no thread: {rec}"
@@ -510,7 +560,7 @@ fn run(minor: u8, mechanism: &str) {
     }
 
     match mechanism {
-        "etw" => {
+        "etw" | "auto" => {
             assert!(a.approximate, "ETW frames not flagged approximate");
             // ETW alone has no exact sample: every framed one is approximate.
             assert_eq!(approx, all.len(), "samples not flagged approximate");
@@ -703,6 +753,12 @@ fn killed(mechanism: &str) {
     rec.kill().unwrap();
     rec.wait().unwrap();
     std::thread::sleep(Duration::from_millis(500));
+    // What the guardian found and did, for the CI log.
+    let log = dir.path().join("k.hpya.guardian.log");
+    match std::fs::read_to_string(&log) {
+        Ok(t) => eprintln!("GUARDIAN {mechanism}:\n{}", t.trim_end()),
+        Err(e) => eprintln!("GUARDIAN {mechanism}: no log ({e})"),
+    }
     let mut bad = target_left_clean(&mut v, mechanism);
     if out.exists() {
         bad.push("a killed recording left a profile".into());
@@ -861,4 +917,160 @@ fn stop_flag_etw() {
 #[ignore = "needs an elevated prompt and specific interpreters"]
 fn stop_flag_debugger() {
     stop_flag(Mechanism::Debugger);
+}
+
+// ---- guardian and ETW sessions -----------------------------------------------
+
+/// A pid no process has: a process that ran and exited.
+fn dead_pid() -> u32 {
+    let mut c = Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+/// A `heapspy-<pid>` session of a recorder that is gone (killed, so its
+/// guardian could not act either) is stopped by the next recording.
+#[test]
+#[ignore = "needs an elevated prompt and specific interpreters"]
+fn stale_session_is_cleaned_up() {
+    assert_elevated();
+    let _logger = LoggerGuard::new();
+    let stale = format!("heapspy-{}", dead_pid());
+    start_foreign_session(&stale);
+    assert!(session_names().contains(&stale), "{}", etw_sessions());
+    let dir = tempfile::tempdir().unwrap();
+    let mut v = start(&python(13), dir.path());
+    let prof = dir.path().join("s.hpya");
+    let o = heapspy(&[
+        "record",
+        "--pid",
+        &v.pid.to_string(),
+        "--duration",
+        "1s",
+        "--mechanism",
+        "etw",
+        "-o",
+        s(&prof),
+    ]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    let left = session_names().contains(&stale);
+    if left {
+        stop_named_session(&stale);
+    }
+    eprintln!(
+        "RESULT stale session {stale}: {}",
+        if left { "left running" } else { "stopped" }
+    );
+    assert!(o.status.success(), "record failed: {err}");
+    assert!(!left, "the stale {stale} session was not stopped: {err}");
+    assert!(err.contains(&stale), "the stop is not reported: {err}");
+    let bad = target_left_clean(&mut v, "etw");
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Sessions whose names are not exactly `heapspy-<pid of a dead
+/// recorder>` are never touched: other names, names that only look like
+/// heapspy's, and a heapspy name whose pid is a running process.
+#[test]
+#[ignore = "needs an elevated prompt and specific interpreters"]
+fn foreign_sessions_are_untouched() {
+    assert_elevated();
+    let _logger = LoggerGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut v = start(&python(13), dir.path());
+    let foreign = [
+        "heapspy-foreign".to_string(),
+        format!("heapspyx-{}", dead_pid()),
+        format!("other-{}", dead_pid()),
+    ];
+    for n in &foreign {
+        start_foreign_session(n);
+    }
+    let prof = dir.path().join("f.hpya");
+    let o = heapspy(&[
+        "record",
+        "--pid",
+        &v.pid.to_string(),
+        "--duration",
+        "1s",
+        "--mechanism",
+        "etw",
+        "-o",
+        s(&prof),
+    ]);
+    let names = session_names();
+    let missing: Vec<&String> = foreign.iter().filter(|n| !names.contains(n)).collect();
+    for n in &foreign {
+        stop_named_session(n);
+    }
+    eprintln!(
+        "RESULT foreign sessions: {}",
+        if missing.is_empty() {
+            "untouched".to_string()
+        } else {
+            format!("stopped {missing:?}")
+        }
+    );
+    assert!(
+        o.status.success(),
+        "record failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(missing.is_empty(), "heapspy stopped {missing:?}");
+    let bad = target_left_clean(&mut v, "etw");
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// After a clean finish the guardian is told there is nothing to do: it
+/// exits without a word and without writing its log (the recorder's
+/// stderr pipe closing, which `output()` waits for, shows it has exited).
+fn guardian_idle(mechanism: &str) {
+    assert_elevated();
+    let _logger = (mechanism != "debugger").then(LoggerGuard::new);
+    let dir = tempfile::tempdir().unwrap();
+    let mut v = start(&python(13), dir.path());
+    let prof = dir.path().join("g.hpya");
+    let t0 = Instant::now();
+    let o = heapspy(&[
+        "record",
+        "--pid",
+        &v.pid.to_string(),
+        "--duration",
+        "2s",
+        "--mechanism",
+        mechanism,
+        "-o",
+        s(&prof),
+    ]);
+    let took = t0.elapsed();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "record failed: {err}");
+    assert!(!err.contains("guardian:"), "the guardian acted: {err}");
+    assert!(!err.contains("no guardian"), "no guardian ran: {err}");
+    let log = dir.path().join("g.hpya.guardian.log");
+    assert!(!log.exists(), "the guardian wrote {}", log.display());
+    assert!(took < Duration::from_secs(20), "took {took:?}");
+    let bad = target_left_clean(&mut v, mechanism);
+    eprintln!(
+        "RESULT guardian after a clean finish, {mechanism}: {}",
+        if bad.is_empty() {
+            "did nothing".to_string()
+        } else {
+            bad.join("; ")
+        }
+    );
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+#[test]
+#[ignore = "needs an elevated prompt and specific interpreters"]
+fn guardian_idle_after_clean_finish_etw() {
+    guardian_idle("etw");
+}
+
+#[test]
+#[ignore = "needs an elevated prompt and specific interpreters"]
+fn guardian_idle_after_clean_finish_debugger() {
+    guardian_idle("debugger");
 }

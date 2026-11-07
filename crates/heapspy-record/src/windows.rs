@@ -105,6 +105,9 @@
 
 pub mod clock;
 pub mod debug;
+pub mod guardian;
+#[cfg(windows)]
+mod guardian_sys;
 #[cfg(windows)]
 pub mod live;
 pub mod matcher;
@@ -118,6 +121,25 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::options::RecordOptions;
 use crate::recorder::{RecordContext, Recorder, RunOutcome};
+
+/// If this process was started as the recorder's guardian
+/// (`heapspy __guardian <recorder pid>`), run it and return its exit code;
+/// otherwise `None`. heapspy's `main` calls this first. See [`guardian`].
+pub fn guardian_main_if_requested() -> Option<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) != Some(guardian::GUARDIAN_ARG) {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        Some(guardian_sys::main(&args[1..]))
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("heapspy: the recorder's guardian runs on Windows only");
+        Some(2)
+    }
+}
 
 /// pymalloc arena size on Windows (3.10+).
 pub const ARENA_SIZE: u64 = 1 << 20;
@@ -204,6 +226,8 @@ mod imp {
     use heapspy_reader::cpython::frames::{self, RawStack};
 
     use super::debug::Machine;
+    use super::guardian::{self, Msg};
+    use super::guardian_sys::Link;
     use super::matcher::{StackHistory, StackSample};
     use super::sys::{Debugger, EtwAlloc, EtwSession};
     use super::ARENA_SIZE;
@@ -254,10 +278,25 @@ mod imp {
         let mut ran = Mechanisms::NONE;
         let mut first_err = None;
 
+        // The guardian first, so it is watching before anything is changed;
+        // declared first, it is dropped (told `done`) last.
+        let link = match Link::start(pid, &guardian::log_path(&ctx.opts.output)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "heapspy: warning: no guardian ({e}); if heapspy is killed while recording, \
+                     the target and the ETW session are not cleaned up"
+                );
+                None
+            }
+        };
         let (tx, rx) = mpsc::channel::<EtwAlloc>();
         let session = if etw {
             match EtwSession::start(pid, ARENA_SIZE, tx) {
                 Ok(s) => {
+                    if let Some(l) = &link {
+                        l.send(&Msg::Etw(s.name.clone()));
+                    }
                     ran.insert(Mechanism::Etw);
                     Some(s)
                 }
@@ -322,7 +361,7 @@ mod imp {
                             }
                         }
                     });
-                    match Debugger::attach(pid, machine, on_entry, on_exit) {
+                    match Debugger::attach(pid, machine, link.as_ref(), on_entry, on_exit) {
                         Ok(d) => {
                             ran.insert(Mechanism::Debugger);
                             dbg = Some(d);

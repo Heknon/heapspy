@@ -54,8 +54,9 @@ pub fn host_os() -> Option<Os> {
 }
 
 /// The recorders to try for `choice` on `os`, in order. `auto` on Linux is
-/// eBPF then ptrace; on Windows it is one recorder using ETW and debugger
-/// breakpoints together.
+/// eBPF then ptrace; on Windows it is ETW alone. The debugger stops every
+/// thread of the target at each breakpoint (most of the window, measured),
+/// so it runs only when asked for with `--mechanism debugger`.
 pub fn select(choice: MechanismChoice, os: Option<Os>) -> Result<Vec<Box<dyn Recorder>>> {
     let unsupported = |what: String| Err(Error::Unsupported(what));
     match (os, choice) {
@@ -70,7 +71,7 @@ pub fn select(choice: MechanismChoice, os: Option<Os>) -> Result<Vec<Box<dyn Rec
             Ok(vec![Box::new(linux_ptrace::PtraceRecorder::new())])
         }
         (Some(Os::Windows), MechanismChoice::Auto) => {
-            Ok(vec![Box::new(windows::WindowsRecorder::new(true, true))])
+            Ok(vec![Box::new(windows::WindowsRecorder::new(true, false))])
         }
         (Some(Os::Windows), MechanismChoice::Only(Mechanism::Etw)) => {
             Ok(vec![Box::new(windows::WindowsRecorder::new(true, false))])
