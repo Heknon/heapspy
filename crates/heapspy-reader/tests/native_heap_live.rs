@@ -122,9 +122,16 @@ fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
             .iter()
             .find(|b| b.start <= *p && *p < b.start + b.size)
             .unwrap_or_else(|| panic!("{what}: {kind} malloc({size}) at {p:#x} is in no block"));
-        // The user pointer is the chunk plus 16, and the chunk holds it.
+        // The user pointer is the chunk plus 16, and the chunk holds it. A
+        // busy chunk's data also runs into the next chunk's `prev_size`
+        // word (8 bytes), so malloc(24) fits a 32-byte chunk.
+        let spill = if b.kind == NativeBlockKind::Allocation {
+            8
+        } else {
+            0
+        };
         assert!(
-            b.start + b.size >= p + size,
+            b.start + b.size + spill >= p + size,
             "{what}: {b:?} too small for {size}"
         );
         match kind.as_str() {

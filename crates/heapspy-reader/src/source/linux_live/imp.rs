@@ -606,7 +606,7 @@ impl Inner {
         let mut cur = addr;
         while cur < end {
             let bstart = cur & !(BLOCK - 1);
-            let bend = (bstart + BLOCK).min(end);
+            let bend = bstart.saturating_add(BLOCK).min(end);
             let dst = &mut buf[(cur - addr) as usize..(bend - addr) as usize];
             match self.block(bstart) {
                 Some(b) => {
