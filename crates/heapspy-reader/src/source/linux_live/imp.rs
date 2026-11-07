@@ -518,6 +518,18 @@ impl Inner {
         self.modules.clone()
     }
 
+    /// The brk heap: the `[heap]` lines of `maps`, first start to last end
+    /// (the kernel may list it in pieces).
+    pub(super) fn brk_range(&self) -> Option<(u64, u64)> {
+        let mut heap = self
+            .maps
+            .iter()
+            .filter(|m| m.path.as_deref() == Some("[heap]"));
+        let first = heap.next()?;
+        let end = heap.fold(first.end, |e, m| e.max(m.end));
+        Some((first.start, end))
+    }
+
     pub(super) fn threads(&self) -> Vec<ThreadInfo> {
         self.threads.clone()
     }

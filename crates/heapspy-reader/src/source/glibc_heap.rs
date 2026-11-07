@@ -1,0 +1,1646 @@
+//! glibc malloc heap walker: every busy chunk of a Linux process's C heap,
+//! read from the image through [`MemorySource::read`]. Nothing is asked of
+//! the target and no glibc debug symbols are needed (`main_arena` and `mp_`
+//! are not exported). [`super::elf_core`] and [`super::linux_live`] use it
+//! for [`MemorySource::native_blocks`].
+//!
+//! Modelled on glibc 2.31 to 2.39 for 64-bit little-endian targets (x86_64
+//! and aarch64, where `SIZE_SZ` is 8 and `MALLOC_ALIGNMENT` is 16). The
+//! layouts below are cited from `malloc/malloc.c` and `malloc/arena.c` of
+//! those releases. **It has been tested on synthetic images laid out like
+//! those versions, not yet on a real Linux process**; the ignored test
+//! `tests/native_heap_live.rs` (run by the e2e workflow) checks it there.
+//!
+//! # What is walked
+//!
+//! - **Chunks** (`struct malloc_chunk`): a `prev_size` word, then a `size`
+//!   word whose low bits are `PREV_INUSE` (1), `IS_MMAPPED` (2) and
+//!   `NON_MAIN_ARENA` (4). The program's pointer is the chunk plus 16
+//!   (`chunk2mem`). Chunks of a heap are contiguous, so the walk steps from
+//!   one header to the next by `size`. A chunk is busy when the *next*
+//!   chunk's `PREV_INUSE` bit is set; a free chunk also writes its size into
+//!   the next chunk's `prev_size` (`set_foot`), which the walk checks.
+//! - **The main arena** lives in `[heap]`, the brk area. glibc grows it in
+//!   whole pages (`sysmalloc`: `ALIGN_UP (size, pagesize)`), so the top
+//!   chunk ends where the mapping ends. A live source names the mapping;
+//!   a core does not, so every anonymous mapping is tried, and one counts as
+//!   the brk heap only if its chunks tile it exactly from start to end *and*
+//!   either its first chunk is a valid tcache (below; glibc's first `malloc`
+//!   in a process allocates it, `tcache_init`) or `main_arena` is found with
+//!   its `top` pointing at the last chunk.
+//! - **Thread arenas** (`arena.c`, `new_heap`): mappings aligned to
+//!   `HEAP_MAX_SIZE` (`2 * DEFAULT_MMAP_THRESHOLD_MAX` = 64 MiB on 64-bit)
+//!   that start with a `heap_info`: `ar_ptr`, `prev`, `size`,
+//!   `mprotect_size`, and since 2.35 `pagesize`, padded to 32 bytes (2.31 to
+//!   2.34) or 48 (2.35+). The first heap of an arena holds the arena's
+//!   `malloc_state` right after `heap_info` (`_int_new_arena`: `a = h->ar_ptr
+//!   = (mstate) (h + 1)`), and its chunks start after it, 16-aligned. Later
+//!   heaps of the arena start their chunks right after `heap_info`
+//!   (`sysmalloc`: `top (av) = chunk_at_offset (heap, sizeof (*heap))`).
+//!   A heap that is no longer the arena's newest ends in fenceposts
+//!   (`sysmalloc`: a 16-byte chunk, then a header of size 0) instead of a top
+//!   chunk. Arenas are numbered 1, 2, ... in order of their `malloc_state`
+//!   address; the main arena is 0.
+//! - **mmapped chunks** (`sysmalloc_mmap`): an allocation at or above the
+//!   mmap threshold (128 KiB by default, rising up to 32 MiB as such chunks
+//!   are freed) gets its own mapping. Its header has `IS_MMAPPED` alone, and
+//!   `prev_size` is the distance from the mapping start (0, or the lead
+//!   `_int_memalign` skipped for alignment). As `munmap_chunk` checks, the
+//!   mapping start and `prev_size + size` are page-aligned and the user
+//!   pointer's offset in its page is 0 or a power of two. The kernel merges
+//!   neighbouring anonymous mappings, so every 4 KiB page of anonymous
+//!   memory outside the arenas is checked at the offsets such a header can
+//!   have (0 and `2^k - 16`). Reported as [`NativeBlockKind::Large`] covering
+//!   `prev_size` + `size` from the mapping start, with heap 0.
+//!
+//! # Free chunks that look busy
+//!
+//! tcache and fastbin chunks keep `PREV_INUSE` set in their successor, so
+//! the header walk alone counts them busy. They are taken out where the
+//! lists can be read reliably:
+//!
+//! - **tcache** (2.26+; layout of 2.30+): each thread's
+//!   `tcache_perthread_struct` (`uint16_t counts[64]; tcache_entry
+//!   *entries[64]`, a 0x290-byte chunk) is a busy chunk somewhere in the
+//!   arenas. A 0x290 chunk is taken for one when every list it describes
+//!   checks out: `entries[i]` is null exactly when `counts[i]` is 0, each
+//!   entry is the user pointer of a busy-looking chunk of size class `i`
+//!   (`csize2tidx`), the list ends after `counts[i]` entries, and no entry
+//!   repeats. `next` links are tried raw (before 2.32) and with safe-linking
+//!   (`PROTECT_PTR (pos, ptr)` = `(pos >> 12) ^ ptr`, 2.32+). The `key`
+//!   field (the tcache's address until 2.33, the random `tcache_key` since
+//!   2.34) is not needed. The tcache struct is allocator bookkeeping and is
+//!   not listed when it holds entries or is the first chunk of a heap; an
+//!   empty one elsewhere (a thread that reused an arena) is listed busy,
+//!   since it cannot be told from an all-zero 640-byte allocation.
+//! - **fastbins**: `malloc_state.fastbinsY[10]` holds chunk pointers whose
+//!   `fd` links are raw or safe-linked like tcache. Thread arenas' states
+//!   are at `ar_ptr`; `main_arena` is found by scanning libc's writable
+//!   data for the brk heap's top chunk address and checking the state
+//!   around it: lock and flag words in range, and every one of the 127
+//!   `bins` either empty (both links point at the bin itself, `bin_at`) or
+//!   pointing at chunks of the heap. Layout since 2.27 (`have_fastchunks`):
+//!   `fastbinsY` at 0x10, `top` at 0x60, `bins` at 0x70, size 0x898. When
+//!   the state is not found or does not check out, fastbin chunks are
+//!   listed as busy.
+//!
+//! # Robustness
+//!
+//! Every header is checked: size a multiple of 16 and at least 32 (16 only
+//! for fenceposts at a heap's end), inside the heap, `IS_MMAPPED` clear,
+//! `NON_MAIN_ARENA` clear in the main arena, the first chunk's `PREV_INUSE`
+//! set, and the footer of each free chunk. The first bad header stops that
+//! heap. A heap found by its own header (a named `[heap]`, a `heap_info`)
+//! keeps the chunks before the bad one, minus the last (its size led to
+//! the bad header); a guessed heap must tile exactly or it is dropped.
+//! Walks are bounded ([`MAX_CHUNKS`] chunks, [`MAX_SCAN_PAGES`] pages for
+//! the mmapped-chunk scan), and lists are bounded by the chunks they can
+//! point at, so nothing loops.
+//!
+//! # Not handled
+//!
+//! - Other allocators: a loaded jemalloc, tcmalloc or mimalloc library, or
+//!   no glibc `libc.so.6`, gives `Ok(None)`. So does an image where no arena
+//!   heap is found.
+//! - The main arena's non-contiguous fallback (brk failed and `sysmalloc`
+//!   continued in mmapped memory without a `heap_info`), hugepage arenas
+//!   (`glibc.malloc.hugetlb`, which change `HEAP_MAX_SIZE`), 32-bit and
+//!   big-endian targets, and glibc before 2.30 (one-byte tcache counts).
+//! - A brk heap merged by the kernel with the anonymous mapping before it
+//!   (no ASLR) is found only by a live source, which knows `[heap]`.
+//! - Anonymous mappings holding a thread's stack pointer are skipped.
+
+use std::collections::HashSet;
+
+use heapspy_snapshot::{Arch, Os};
+
+use super::{MemorySource, NativeBlock, NativeBlockKind};
+use crate::error::Result;
+
+const CHUNK_HDR: u64 = 16;
+const MINSIZE: u64 = 32;
+const ALIGN: u64 = 16;
+const PREV_INUSE: u64 = 1;
+const IS_MMAPPED: u64 = 2;
+const NON_MAIN_ARENA: u64 = 4;
+const FLAGS: u64 = 7;
+/// `HEAP_MAX_SIZE` on 64-bit: `2 * DEFAULT_MMAP_THRESHOLD_MAX`, where the
+/// latter is `4 * 1024 * 1024 * sizeof (long)`.
+const HEAP_MAX_SIZE: u64 = 64 << 20;
+/// Granularity of page checks. Linux pages are 4 KiB, or 16/64 KiB on some
+/// aarch64 kernels; anything aligned to those is aligned to 4 KiB.
+const PAGE: u64 = 4096;
+/// `sizeof (struct malloc_state)` and field offsets, 2.27+ on 64-bit.
+const MSTATE_SIZE: u64 = 0x898;
+const MSTATE_FASTBINS: u64 = 0x10;
+const MSTATE_TOP: u64 = 0x60;
+const MSTATE_BINS: u64 = 0x70;
+/// `NFASTBINS`: `fastbin_index (request2size (MAX_FAST_SIZE)) + 1`.
+const NFASTBINS: u64 = 10;
+/// `NBINS * 2 - 2` pointers, as 127 (fd, bk) pairs.
+const NBIN_PAIRS: u64 = 127;
+/// `TCACHE_MAX_BINS`, and the chunk holding a `tcache_perthread_struct`
+/// with `uint16_t` counts (2.30+): `request2size (64 * 2 + 64 * 8)`.
+const TCACHE_BINS: usize = 64;
+const TCACHE_CHUNK: u64 = 0x290;
+const TCACHE_STRUCT: usize = 0x280;
+/// Offsets in a page where an mmapped chunk header can be: the user
+/// pointer is page-aligned or at a power of two in its page.
+const MMAP_OFFSETS: [u64; 8] = [0, 48, 112, 240, 496, 1008, 2032, 4080];
+/// Most chunks walked over all heaps. At 24 bytes each, 768 MiB of
+/// bookkeeping for a heap of tens of GiB.
+pub const MAX_CHUNKS: usize = 32 << 20;
+/// Most pages checked for mmapped chunks (64 GiB of anonymous memory).
+pub const MAX_SCAN_PAGES: u64 = 16 << 20;
+/// How close to a heap's end a fencepost may sit (`sysmalloc` leaves the
+/// size-0 header 16 to 31 bytes before the end, after a 16-byte chunk).
+const FENCE_SLACK: u64 = 80;
+
+/// What the source knows about the heap besides its bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeapHints {
+    /// The `[heap]` (brk) mapping, `start..end`, when the source names it
+    /// (`/proc/<pid>/maps`). A core does not; the walker then looks for it.
+    pub brk: Option<(u64, u64)>,
+}
+
+/// List the busy chunks of a glibc malloc heap. See the module docs.
+pub fn native_blocks<S: MemorySource + ?Sized>(
+    src: &S,
+    hints: &HeapHints,
+) -> Result<Option<Vec<NativeBlock>>> {
+    let t = src.target();
+    if t.os != Os::Linux
+        || t.pointer_size != 8
+        || !t.little_endian
+        || !matches!(t.arch, Arch::X86_64 | Arch::Aarch64)
+    {
+        return Ok(None);
+    }
+    let modules = src.modules()?;
+    if modules.iter().any(|m| other_allocator(&m.name)) {
+        return Ok(None);
+    }
+    let Some(libc) = modules.iter().find(|m| is_glibc(&m.name)) else {
+        return Ok(None);
+    };
+    let ranges = src.mapped_ranges()?;
+    let stacks: Vec<u64> = src
+        .threads()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.stack_pointer)
+        .collect();
+    // Anonymous read-write mappings: where malloc's memory comes from.
+    let anon: Vec<Span> = ranges
+        .iter()
+        .filter(|r| r.file.is_none() && r.perms.read && r.perms.write && r.size > 0)
+        .filter_map(|r| Span::new(r.start, r.start.checked_add(r.size)?))
+        .filter(|s| !stacks.iter().any(|&sp| s.contains(sp)))
+        .collect();
+    let merged = coalesce(&anon);
+    // libc's writable data, where `main_arena` is.
+    let libc_data: Vec<Span> = ranges
+        .iter()
+        .filter(|r| r.perms.write && r.file.as_deref() == Some(libc.path.as_str()))
+        .filter_map(|r| Span::new(r.start, r.start.checked_add(r.size)?))
+        .collect();
+
+    let mut w = Walker {
+        src,
+        budget: MAX_CHUNKS,
+    };
+    let mut heaps: Vec<Heap> = Vec::new();
+
+    // Thread arenas, by their heap_info headers.
+    let infos = w.find_thread_heaps(&merged);
+    let mut keys: Vec<u64> = infos.iter().map(|h| h.ar_ptr).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let firsts: HashSet<u64> = infos.iter().filter(|h| h.first).map(|h| h.base).collect();
+    for h in &infos {
+        let arena_base = h.ar_ptr & !(HEAP_MAX_SIZE - 1);
+        let hi = h.ar_ptr - arena_base;
+        if hi != 32 && hi != 48 {
+            continue;
+        }
+        let start = if h.first {
+            align_up(h.ar_ptr + MSTATE_SIZE, ALIGN)
+        } else {
+            h.base + hi
+        };
+        // A later heap whose arena's first heap is not in the image has
+        // only its own header to vouch for it: it must tile exactly.
+        let strict = !h.first && !firsts.contains(&arena_base);
+        let walk = w.walk(start, h.base + h.size, false);
+        if strict && !walk.complete() {
+            w.refund(&walk);
+            continue;
+        }
+        let arena = 1 + keys.binary_search(&h.ar_ptr).unwrap_or(0) as u32;
+        heaps.push(Heap {
+            arena,
+            first_chunk: h.first.then_some(start),
+            walk,
+        });
+    }
+
+    // The main arena's brk heap.
+    let mut main_state = None;
+    let thread_spans: Vec<Span> = infos
+        .iter()
+        .map(|h| Span {
+            start: h.base,
+            end: h.base.saturating_add(HEAP_MAX_SIZE),
+        })
+        .collect();
+    let mut main_spans: Vec<Span> = Vec::new();
+    if let Some((s, e)) = hints.brk {
+        if let Some(span) = Span::new(s, e) {
+            let walk = w.walk(align_up(s, ALIGN), e, true);
+            if !walk.chunks.is_empty() || walk.complete() {
+                if let End::Top(top) = walk.end {
+                    main_state = w.find_main_arena(&libc_data, top, &walk.chunks);
+                }
+                main_spans.push(span);
+                heaps.push(Heap {
+                    arena: 0,
+                    first_chunk: Some(align_up(s, ALIGN)),
+                    walk,
+                });
+            }
+        }
+    } else {
+        for r in &anon {
+            if thread_spans.iter().any(|t| t.overlaps(r)) {
+                continue;
+            }
+            let start = align_up(r.start, ALIGN);
+            // Cheap first look: the first chunk of a fresh brk heap.
+            match w.header(start) {
+                Some((0, word))
+                    if word & FLAGS == PREV_INUSE
+                        && (word & !FLAGS) >= MINSIZE
+                        && (word & !FLAGS) <= r.end - start => {}
+                _ => continue,
+            }
+            let walk = w.walk(start, r.end, true);
+            let End::Top(top) = walk.end else {
+                w.refund(&walk);
+                continue;
+            };
+            let state = w.find_main_arena(&libc_data, top, &walk.chunks);
+            let tcache_first = walk.chunks.first().is_some_and(|c| {
+                c.addr == start
+                    && c.size == TCACHE_CHUNK
+                    && w.tcache_entries(c.addr + CHUNK_HDR, &walk.chunks).is_some()
+            });
+            if walk.chunks.is_empty() || (state.is_none() && !tcache_first) {
+                w.refund(&walk);
+                continue;
+            }
+            main_state = main_state.or(state);
+            main_spans.push(*r);
+            heaps.push(Heap {
+                arena: 0,
+                first_chunk: Some(start),
+                walk,
+            });
+        }
+    }
+
+    if heaps.is_empty() {
+        return Ok(None);
+    }
+
+    // Every chunk the walks could classify, sorted (heaps do not overlap).
+    let mut all: Vec<Chunk> = Vec::new();
+    let mut arena_of: Vec<(u64, u32)> = Vec::new();
+    let mut firsts: HashSet<u64> = HashSet::new();
+    let mut tops: Vec<(u32, u64)> = Vec::new();
+    for h in &heaps {
+        all.extend_from_slice(&h.walk.chunks);
+        arena_of.extend(h.walk.chunks.iter().map(|c| (c.addr, h.arena)));
+        firsts.extend(h.first_chunk);
+        if let End::Top(t) = h.walk.end {
+            tops.push((h.arena, t));
+        }
+    }
+    all.sort_unstable_by_key(|c| c.addr);
+    arena_of.sort_unstable_by_key(|a| a.0);
+
+    let mut free: HashSet<u64> = HashSet::new();
+    let mut bookkeeping: HashSet<u64> = HashSet::new();
+    // tcache: every busy 0x290 chunk that checks out as a tcache struct.
+    for c in all.iter().filter(|c| c.busy && c.size == TCACHE_CHUNK) {
+        if let Some(entries) = w.tcache_entries(c.addr + CHUNK_HDR, &all) {
+            if !entries.is_empty() || firsts.contains(&c.addr) {
+                bookkeeping.insert(c.addr);
+            }
+            free.extend(entries);
+        }
+    }
+    // fastbins, for each arena whose malloc_state checks out.
+    let mut states: Vec<(u32, u64)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| (1 + i as u32, k))
+        .collect();
+    if let Some(m) = main_state {
+        states.push((0, m));
+    }
+    for (arena, ms) in states {
+        let chunks: Vec<Chunk> = all
+            .iter()
+            .zip(&arena_of)
+            .filter(|(_, a)| a.1 == arena)
+            .map(|(c, _)| *c)
+            .collect();
+        let arena_tops: Vec<u64> = tops.iter().filter(|t| t.0 == arena).map(|t| t.1).collect();
+        if w.check_mstate(ms, &arena_tops, &chunks) {
+            free.extend(w.fastbin_chunks(ms, &chunks));
+        }
+    }
+
+    let mut out: Vec<NativeBlock> = all
+        .iter()
+        .zip(&arena_of)
+        .filter(|(c, _)| c.busy && !free.contains(&c.addr) && !bookkeeping.contains(&c.addr))
+        .map(|(c, a)| NativeBlock {
+            start: c.addr,
+            size: c.size,
+            kind: NativeBlockKind::Allocation,
+            heap: a.1,
+        })
+        .collect();
+
+    // mmapped chunks, in the anonymous memory outside the arenas.
+    let mut excluded: Vec<Span> = thread_spans;
+    excluded.extend(main_spans);
+    let mut pages = MAX_SCAN_PAGES;
+    for seg in subtract(&merged, &excluded) {
+        w.scan_mmapped(seg, &mut pages, &mut out);
+    }
+
+    out.sort_unstable_by_key(|b| b.start);
+    let mut end = 0u64;
+    out.retain(|b| {
+        let keep = b.start >= end && b.size > 0;
+        if keep {
+            end = b.start.saturating_add(b.size);
+        }
+        keep
+    });
+    Ok(Some(out))
+}
+
+fn is_glibc(name: &str) -> bool {
+    name == "libc.so.6" || (name.starts_with("libc-2.") && name.ends_with(".so"))
+}
+
+fn other_allocator(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["jemalloc", "tcmalloc", "mimalloc"]
+        .iter()
+        .any(|a| n.contains(a))
+}
+
+fn align_up(x: u64, a: u64) -> u64 {
+    x.checked_add(a - 1).map_or(!(a - 1), |v| v & !(a - 1))
+}
+
+/// A half-open address range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    start: u64,
+    end: u64,
+}
+
+impl Span {
+    fn new(start: u64, end: u64) -> Option<Span> {
+        (start < end).then_some(Span { start, end })
+    }
+    fn contains(&self, a: u64) -> bool {
+        a >= self.start && a < self.end
+    }
+    fn overlaps(&self, o: &Span) -> bool {
+        self.start < o.end && o.start < self.end
+    }
+}
+
+/// Join touching spans (the kernel splits and merges anonymous mappings at
+/// will; a heap or an mmapped chunk may straddle what a core lists as two).
+fn coalesce(spans: &[Span]) -> Vec<Span> {
+    let mut v = spans.to_vec();
+    v.sort_unstable_by_key(|s| s.start);
+    let mut out: Vec<Span> = Vec::with_capacity(v.len());
+    for s in v {
+        match out.last_mut() {
+            Some(l) if s.start <= l.end => l.end = l.end.max(s.end),
+            _ => out.push(s),
+        }
+    }
+    out
+}
+
+/// `spans` minus everything in `cut`.
+fn subtract(spans: &[Span], cut: &[Span]) -> Vec<Span> {
+    let mut out = Vec::new();
+    for s in spans {
+        let mut pieces = vec![*s];
+        for c in cut {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|p| {
+                    if !p.overlaps(c) {
+                        return vec![p];
+                    }
+                    [Span::new(p.start, c.start), Span::new(c.end, p.end)]
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                })
+                .collect();
+        }
+        out.extend(pieces);
+    }
+    out
+}
+
+/// One chunk whose status is known: its successor's header was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Chunk {
+    addr: u64,
+    size: u64,
+    /// The next chunk's `PREV_INUSE` is set. True for tcache and fastbin
+    /// chunks too.
+    busy: bool,
+}
+
+fn find(chunks: &[Chunk], addr: u64) -> Option<&Chunk> {
+    chunks
+        .binary_search_by_key(&addr, |c| c.addr)
+        .ok()
+        .map(|i| &chunks[i])
+}
+
+/// How a heap walk ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// At the top chunk, which reaches the end of the heap.
+    Top(u64),
+    /// At `sysmalloc`'s fenceposts: a heap that is no longer the newest.
+    Fence,
+    /// At a header that does not check out, or out of budget.
+    Broken,
+}
+
+#[derive(Debug)]
+struct HeapWalk {
+    /// Every chunk but the last one walked (the top chunk, the fencepost,
+    /// or the chunk whose size led to a bad header), and none under 32
+    /// bytes. Sorted.
+    chunks: Vec<Chunk>,
+    end: End,
+    /// Headers read, for [`Walker::refund`].
+    walked: usize,
+}
+
+impl HeapWalk {
+    fn complete(&self) -> bool {
+        self.end != End::Broken && self.walked >= 2
+    }
+}
+
+struct Heap {
+    arena: u32,
+    first_chunk: Option<u64>,
+    walk: HeapWalk,
+}
+
+/// A `heap_info` that checks out.
+#[derive(Clone, Copy, Debug)]
+struct HeapInfo {
+    base: u64,
+    ar_ptr: u64,
+    size: u64,
+    /// The arena's `malloc_state` follows this header.
+    first: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Link {
+    Raw,
+    /// Safe-linking, 2.32+: stored as `(pos >> 12) ^ ptr`.
+    Protected,
+}
+
+impl Link {
+    fn decode(self, pos: u64, stored: u64) -> u64 {
+        match self {
+            Link::Raw => stored,
+            Link::Protected => (pos >> 12) ^ stored,
+        }
+    }
+}
+
+struct Walker<'a, S: ?Sized> {
+    src: &'a S,
+    /// Chunks the walks may still record.
+    budget: usize,
+}
+
+impl<S: MemorySource + ?Sized> Walker<'_, S> {
+    fn word(&self, addr: u64) -> Option<u64> {
+        let mut b = [0u8; 8];
+        self.src.read(addr, &mut b).ok()?;
+        Some(u64::from_le_bytes(b))
+    }
+
+    /// `(prev_size, size word)` of the chunk at `c`.
+    fn header(&self, c: u64) -> Option<(u64, u64)> {
+        let mut b = [0u8; 16];
+        self.src.read(c, &mut b).ok()?;
+        Some((
+            u64::from_le_bytes(b[..8].try_into().unwrap()),
+            u64::from_le_bytes(b[8..].try_into().unwrap()),
+        ))
+    }
+
+    fn refund(&mut self, w: &HeapWalk) {
+        self.budget += w.walked;
+    }
+
+    /// Walk the chunks of one heap, `start..end`. See the module docs for
+    /// the checks.
+    fn walk(&mut self, start: u64, end: u64, main: bool) -> HeapWalk {
+        // (addr, size, PREV_INUSE of its own header)
+        let mut seen: Vec<(u64, u64, bool)> = Vec::new();
+        let mut c = start;
+        let end_kind = loop {
+            if seen.len() >= self.budget || c.checked_add(CHUNK_HDR).is_none_or(|e| e > end) {
+                break End::Broken;
+            }
+            let Some((prev_size, word)) = self.header(c) else {
+                break End::Broken;
+            };
+            let size = word & !FLAGS;
+            let pinuse = word & PREV_INUSE != 0;
+            match seen.last() {
+                // A free predecessor leaves its size in our prev_size.
+                Some(&(_, psize, _)) if !pinuse && prev_size != psize => break End::Broken,
+                None if !pinuse => break End::Broken,
+                _ => {}
+            }
+            if size == 0 {
+                if pinuse && !seen.is_empty() && end - c <= FENCE_SLACK {
+                    break End::Fence;
+                }
+                break End::Broken;
+            }
+            if word & IS_MMAPPED != 0
+                || (main && word & NON_MAIN_ARENA != 0)
+                || size % ALIGN != 0
+                || (size < MINSIZE && end - c > FENCE_SLACK)
+            {
+                break End::Broken;
+            }
+            let Some(next) = c.checked_add(size).filter(|&n| n <= end) else {
+                break End::Broken;
+            };
+            seen.push((c, size, pinuse));
+            if next == end {
+                break End::Top(c);
+            }
+            c = next;
+        };
+        self.budget -= seen.len();
+        let chunks = seen
+            .windows(2)
+            .filter(|w| w[0].1 >= MINSIZE)
+            .map(|w| Chunk {
+                addr: w[0].0,
+                size: w[0].1,
+                busy: w[1].2,
+            })
+            .collect();
+        HeapWalk {
+            chunks,
+            end: end_kind,
+            walked: seen.len(),
+        }
+    }
+
+    /// Every `HEAP_MAX_SIZE`-aligned address in `spans` with a plausible
+    /// `heap_info`.
+    fn find_thread_heaps(&self, spans: &[Span]) -> Vec<HeapInfo> {
+        let mut out = Vec::new();
+        for s in spans {
+            let mut a = align_up(s.start, HEAP_MAX_SIZE);
+            while a >= s.start && a.checked_add(48).is_some_and(|e| e <= s.end) {
+                if let Some(h) = self.heap_info(a, s) {
+                    out.push(h);
+                }
+                match a.checked_add(HEAP_MAX_SIZE) {
+                    Some(n) => a = n,
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
+    fn heap_info(&self, a: u64, s: &Span) -> Option<HeapInfo> {
+        let mut b = [0u8; 40];
+        self.src.read(a, &mut b).ok()?;
+        let f = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        let (ar_ptr, prev, size, mprotect, pagesize) = (f(0), f(1), f(2), f(3), f(4));
+        let sizes_ok = size >= PAGE
+            && size % PAGE == 0
+            && size <= HEAP_MAX_SIZE
+            && mprotect % PAGE == 0
+            && (size..=HEAP_MAX_SIZE).contains(&mprotect)
+            && a.checked_add(size).is_some_and(|e| e <= s.end);
+        if !sizes_ok || ar_ptr == 0 || ar_ptr % 8 != 0 {
+            return None;
+        }
+        let pagesize_ok = pagesize >= PAGE && pagesize.is_power_of_two();
+        let first = prev == 0 && (ar_ptr == a + 32 || (ar_ptr == a + 48 && pagesize_ok));
+        let later = prev != 0 && prev % HEAP_MAX_SIZE == 0 && prev != a && ar_ptr != a + 32;
+        (first || later).then_some(HeapInfo {
+            base: a,
+            ar_ptr,
+            size,
+            first,
+        })
+    }
+
+    /// The tcache entries (as chunk addresses) of the `tcache_perthread_struct`
+    /// at user pointer `mem`, if it checks out. `chunks` is what the entries
+    /// may point at.
+    fn tcache_entries(&self, mem: u64, chunks: &[Chunk]) -> Option<Vec<u64>> {
+        let mut b = vec![0u8; TCACHE_STRUCT];
+        self.src.read(mem, &mut b).ok()?;
+        let count = |i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as usize;
+        let entry = |i: usize| {
+            let o = 2 * TCACHE_BINS + 8 * i;
+            u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+        };
+        for i in 0..TCACHE_BINS {
+            if (count(i) == 0) != (entry(i) == 0) {
+                return None;
+            }
+        }
+        'mode: for link in [Link::Raw, Link::Protected] {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for i in 0..TCACHE_BINS {
+                let mut x = entry(i);
+                for k in 0..count(i) {
+                    let ok = x % ALIGN == 0
+                        && x >= CHUNK_HDR
+                        && find(chunks, x - CHUNK_HDR)
+                            .is_some_and(|c| c.busy && (c.size - MINSIZE) / ALIGN == i as u64)
+                        && seen.insert(x);
+                    if !ok {
+                        continue 'mode;
+                    }
+                    out.push(x - CHUNK_HDR);
+                    let Some(stored) = self.word(x) else {
+                        continue 'mode;
+                    };
+                    let next = link.decode(x, stored);
+                    if (k + 1 == count(i)) != (next == 0) {
+                        continue 'mode;
+                    }
+                    x = next;
+                }
+            }
+            return Some(out);
+        }
+        None
+    }
+
+    /// Check the `malloc_state` at `ms`: its `top` is one of `tops`, the lock
+    /// and flags are in range, and every bin is empty or points at `chunks`.
+    fn check_mstate(&self, ms: u64, tops: &[u64], chunks: &[Chunk]) -> bool {
+        let mut b = vec![0u8; MSTATE_SIZE as usize];
+        if self.src.read(ms, &mut b).is_err() {
+            return false;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |o: u64| {
+            let o = o as usize;
+            u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+        };
+        if u32_at(0) > 2 || u32_at(4) & !7 != 0 || u32_at(8) > 1 {
+            return false;
+        }
+        if !tops.contains(&u64_at(MSTATE_TOP)) {
+            return false;
+        }
+        (0..NBIN_PAIRS).all(|j| {
+            let head = ms + MSTATE_BINS + 16 * j - CHUNK_HDR;
+            let (fd, bk) = (
+                u64_at(MSTATE_BINS + 16 * j),
+                u64_at(MSTATE_BINS + 16 * j + 8),
+            );
+            (fd == head && bk == head)
+                || (fd != head
+                    && bk != head
+                    && find(chunks, fd).is_some()
+                    && find(chunks, bk).is_some())
+        })
+    }
+
+    /// `main_arena`: a `malloc_state` in libc's writable data whose `top`
+    /// is the brk heap's top chunk.
+    fn find_main_arena(&self, data: &[Span], top: u64, chunks: &[Chunk]) -> Option<u64> {
+        const MAX_DATA: u64 = 8 << 20;
+        for s in data {
+            let len = (s.end - s.start).min(MAX_DATA) as usize;
+            let mut b = vec![0u8; len];
+            if self.src.read(s.start, &mut b).is_err() {
+                continue;
+            }
+            for (i, w) in b.chunks_exact(8).enumerate() {
+                let off = i as u64 * 8;
+                if off >= MSTATE_TOP && u64::from_le_bytes(w.try_into().unwrap()) == top {
+                    let ms = s.start + off - MSTATE_TOP;
+                    if self.check_mstate(ms, &[top], chunks) {
+                        return Some(ms);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The chunks in the fastbins of the `malloc_state` at `ms`, if every
+    /// list checks out; otherwise none.
+    fn fastbin_chunks(&self, ms: u64, chunks: &[Chunk]) -> Vec<u64> {
+        let Some(heads): Option<Vec<u64>> = (0..NFASTBINS)
+            .map(|i| self.word(ms + MSTATE_FASTBINS + 8 * i))
+            .collect()
+        else {
+            return Vec::new();
+        };
+        'mode: for link in [Link::Raw, Link::Protected] {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for (i, &head) in heads.iter().enumerate() {
+                let mut p = head;
+                while p != 0 {
+                    // fastbin_index (sz) = (sz >> 4) - 2 on 64-bit.
+                    let ok = find(chunks, p)
+                        .is_some_and(|c| c.busy && (c.size >> 4) - 2 == i as u64)
+                        && seen.insert(p)
+                        && seen.len() <= chunks.len();
+                    if !ok {
+                        continue 'mode;
+                    }
+                    out.push(p);
+                    let Some(stored) = self.word(p + CHUNK_HDR) else {
+                        continue 'mode;
+                    };
+                    p = link.decode(p + CHUNK_HDR, stored);
+                }
+            }
+            return out;
+        }
+        Vec::new()
+    }
+
+    /// Find mmapped chunks in `seg`, page by page.
+    fn scan_mmapped(&self, seg: Span, pages: &mut u64, out: &mut Vec<NativeBlock>) {
+        let mut p = align_up(seg.start, PAGE);
+        let mut min_block = seg.start;
+        'pages: while p < seg.end && *pages > 0 {
+            *pages -= 1;
+            for o in MMAP_OFFSETS {
+                let c = p + o;
+                if c.checked_add(CHUNK_HDR).is_none_or(|e| e > seg.end) {
+                    break;
+                }
+                let Some((ps, word)) = self.header(c) else {
+                    continue;
+                };
+                if let Some((block, total)) = mmapped_at(c, ps, word, seg, min_block) {
+                    out.push(NativeBlock {
+                        start: block,
+                        size: total,
+                        kind: NativeBlockKind::Large,
+                        heap: 0,
+                    });
+                    p = block + total;
+                    min_block = p;
+                    continue 'pages;
+                }
+            }
+            p = p.saturating_add(PAGE);
+        }
+    }
+}
+
+/// The mapping (`start`, `length`) of an mmapped chunk whose header at `c`
+/// is (`ps`, `word`), if it is one and fits in `seg` at or after `min_block`.
+fn mmapped_at(c: u64, ps: u64, word: u64, seg: Span, min_block: u64) -> Option<(u64, u64)> {
+    if word & FLAGS != IS_MMAPPED {
+        return None;
+    }
+    let size = word & !FLAGS;
+    if size < MINSIZE || size % ALIGN != 0 {
+        return None;
+    }
+    let block = c.checked_sub(ps)?;
+    let total = ps.checked_add(size)?;
+    if block % PAGE != 0 || total % PAGE != 0 || block < min_block.max(seg.start) {
+        return None;
+    }
+    if block.checked_add(total)? > seg.end {
+        return None;
+    }
+    // munmap_chunk: the user pointer's offset in its page is 0 or a power of two.
+    let in_page = (c + CHUNK_HDR) % PAGE;
+    (in_page & in_page.wrapping_sub(1) == 0).then_some((block, total))
+}
+
+/// Builders for synthetic glibc heaps, shared with the backends' tests.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::*;
+
+    /// What a chunk in a synthetic heap is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum St {
+        Busy,
+        /// In a doubly linked bin: the next chunk's `PREV_INUSE` is clear.
+        Free,
+        /// In a tcache or fastbin: looks busy to the header walk.
+        Cached,
+    }
+
+    /// How a synthetic heap ends.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Tail {
+        Top,
+        /// The old top freed (`St::Free`), then `sysmalloc`'s fenceposts.
+        Fence,
+    }
+
+    /// One glibc version's layout choices.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Glibc {
+        pub safe_linking: bool,
+        pub heap_info_size: u64,
+    }
+    pub const V2_31: Glibc = Glibc {
+        safe_linking: false,
+        heap_info_size: 32,
+    };
+    pub const V2_33: Glibc = Glibc {
+        safe_linking: true,
+        heap_info_size: 32,
+    };
+    pub const V2_35: Glibc = Glibc {
+        safe_linking: true,
+        heap_info_size: 48,
+    };
+
+    impl Glibc {
+        pub fn protect(&self, pos: u64, ptr: u64) -> u64 {
+            if self.safe_linking {
+                (pos >> 12) ^ ptr
+            } else {
+                ptr
+            }
+        }
+    }
+
+    /// Little-endian byte regions at fixed addresses, written to by address.
+    #[derive(Clone, Debug, Default)]
+    pub struct Bytes {
+        pub regions: Vec<(u64, Vec<u8>)>,
+    }
+
+    impl Bytes {
+        pub fn region(&mut self, base: u64, len: u64) {
+            self.regions.push((base, vec![0; len as usize]));
+        }
+        pub fn poke(&mut self, addr: u64, v: u64) {
+            let (b, r) = self
+                .regions
+                .iter_mut()
+                .find(|(b, r)| addr >= *b && addr + 8 <= *b + r.len() as u64)
+                .unwrap_or_else(|| panic!("poke {addr:#x} outside the regions"));
+            let o = (addr - *b) as usize;
+            r[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        pub fn poke_u16(&mut self, addr: u64, v: u16) {
+            let (b, r) = self
+                .regions
+                .iter_mut()
+                .find(|(b, r)| addr >= *b && addr + 2 <= *b + r.len() as u64)
+                .unwrap();
+            let o = (addr - *b) as usize;
+            r[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        }
+
+        /// Lay out chunks `start..end` (the region must exist). Returns
+        /// `(addr, size, state)` of each chunk, then the top chunk or the
+        /// fencepost pair. `non_main` sets `NON_MAIN_ARENA` on busy-looking
+        /// chunks, as `_int_malloc` does in thread arenas.
+        pub fn heap(
+            &mut self,
+            start: u64,
+            end: u64,
+            specs: &[(u64, St)],
+            tail: Tail,
+            non_main: bool,
+        ) -> Vec<(u64, u64, St)> {
+            let mut out = Vec::new();
+            let mut c = start;
+            let mut prev: Option<(u64, St)> = None;
+            let put = |me: &mut Self, c: u64, size: u64, st: St, prev: Option<(u64, St)>| {
+                let pin = prev.is_none_or(|p| p.1 != St::Free);
+                let nm = non_main && st != St::Free;
+                me.poke(c, prev.filter(|p| p.1 == St::Free).map_or(0, |p| p.0));
+                me.poke(
+                    c + 8,
+                    size | if pin { PREV_INUSE } else { 0 } | if nm { NON_MAIN_ARENA } else { 0 },
+                );
+            };
+            for &(size, st) in specs {
+                put(self, c, size, st, prev);
+                out.push((c, size, st));
+                prev = Some((size, st));
+                c += size;
+            }
+            match tail {
+                Tail::Top => {
+                    let size = end - c;
+                    put(self, c, size, St::Busy, prev);
+                    // The top chunk is never NON_MAIN_ARENA-marked busy;
+                    // glibc's set_head (top, size | PREV_INUSE) leaves it bare.
+                    let w = size
+                        | if prev.is_none_or(|p| p.1 != St::Free) {
+                            1
+                        } else {
+                            0
+                        };
+                    self.poke(c + 8, w);
+                    out.push((c, size, St::Busy));
+                }
+                Tail::Fence => {
+                    let orig = end - c;
+                    let old = (orig - MINSIZE) & !(ALIGN - 1);
+                    put(self, c, old, St::Free, prev);
+                    out.push((c, old, St::Free));
+                    let f = c + old;
+                    self.poke(f, old);
+                    self.poke(f + 8, CHUNK_HDR);
+                    self.poke(f + 16, 0);
+                    self.poke(f + 24, PREV_INUSE);
+                    out.push((f, CHUNK_HDR, St::Busy));
+                }
+            }
+            out
+        }
+
+        /// Write a `tcache_perthread_struct` at user pointer `mem` holding
+        /// `lists` (size-class index, chunk addresses, head first).
+        pub fn tcache(&mut self, g: Glibc, mem: u64, lists: &[(usize, Vec<u64>)], key: u64) {
+            for (idx, list) in lists {
+                self.poke_u16(mem + 2 * *idx as u64, list.len() as u16);
+                self.poke(mem + 128 + 8 * *idx as u64, list[0] + CHUNK_HDR);
+                for (k, &c) in list.iter().enumerate() {
+                    let e = c + CHUNK_HDR;
+                    let next = list.get(k + 1).map_or(0, |n| n + CHUNK_HDR);
+                    self.poke(e, g.protect(e, next));
+                    self.poke(e + 8, key);
+                }
+            }
+        }
+
+        /// Write a `malloc_state` at `ms`: `top`, fastbin lists (index,
+        /// chunks head first), and `unsorted` chunks linked in bin 1; every
+        /// other bin empty. `next` is the arena list link.
+        pub fn mstate(
+            &mut self,
+            g: Glibc,
+            ms: u64,
+            top: u64,
+            fast: &[(usize, Vec<u64>)],
+            unsorted: &[u64],
+            next: u64,
+        ) {
+            for (idx, list) in fast {
+                self.poke(ms + MSTATE_FASTBINS + 8 * *idx as u64, list[0]);
+                for (k, &c) in list.iter().enumerate() {
+                    let next = list.get(k + 1).copied().unwrap_or(0);
+                    self.poke(c + 16, g.protect(c + 16, next));
+                }
+            }
+            self.poke(ms + MSTATE_TOP, top);
+            for j in 0..NBIN_PAIRS {
+                let head = ms + MSTATE_BINS + 16 * j - CHUNK_HDR;
+                self.poke(head + 16, head);
+                self.poke(head + 24, head);
+            }
+            if !unsorted.is_empty() {
+                let head = ms + MSTATE_BINS - CHUNK_HDR;
+                let ring: Vec<u64> = std::iter::once(head)
+                    .chain(unsorted.iter().copied())
+                    .collect();
+                for (k, &n) in ring.iter().enumerate() {
+                    let fd = ring[(k + 1) % ring.len()];
+                    let bk = ring[(k + ring.len() - 1) % ring.len()];
+                    self.poke(n + 16, fd);
+                    self.poke(n + 24, bk);
+                }
+            }
+            self.poke(ms + 0x870, next);
+            self.poke(ms + 0x880, 1);
+        }
+    }
+
+    /// A small brk heap at `base` (`len` bytes): a tcache struct with two
+    /// entries, busy chunks and a top chunk. Returns its bytes and the
+    /// blocks it should give.
+    pub fn simple_brk_heap(g: Glibc, base: u64, len: u64) -> (Vec<u8>, Vec<NativeBlock>) {
+        let mut b = Bytes::default();
+        b.region(base, len);
+        let ch = b.heap(
+            base,
+            base + len,
+            &[
+                (TCACHE_CHUNK, St::Busy),
+                (0x30, St::Busy),
+                (0x30, St::Cached),
+                (0x110, St::Busy),
+                (0x30, St::Cached),
+                (0x1010, St::Busy),
+            ],
+            Tail::Top,
+            false,
+        );
+        b.tcache(
+            g,
+            base + CHUNK_HDR,
+            &[(1, vec![ch[4].0, ch[2].0])],
+            base + 16,
+        );
+        let want = [1, 3, 5]
+            .iter()
+            .map(|&i| NativeBlock {
+                start: ch[i].0,
+                size: ch[i].1,
+                kind: NativeBlockKind::Allocation,
+                heap: 0,
+            })
+            .collect();
+        (b.regions.remove(0).1, want)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testkit::*;
+    use super::*;
+    use crate::source::mem::MemImage;
+    use crate::source::{MappedRange, MemorySummary, Module, TargetInfo, ThreadInfo};
+
+    const LIBC_PATH: &str = "/usr/lib/x86_64-linux-gnu/libc.so.6";
+    const LIBC_DATA: u64 = 0x7f12_3456_0000;
+    const MAIN_ARENA: u64 = LIBC_DATA + 0xa80;
+    const BRK: u64 = 0x5555_5555_9000;
+    const BRK_LEN: u64 = 0x21000;
+
+    const AARCH64: TargetInfo = TargetInfo {
+        os: Os::Linux,
+        arch: Arch::Aarch64,
+        pointer_size: 8,
+        little_endian: true,
+    };
+
+    /// A [`MemImage`] whose ranges can be file-backed, with modules.
+    struct Img {
+        mem: MemImage,
+        files: Vec<(u64, String)>,
+    }
+
+    impl MemorySource for Img {
+        fn target(&self) -> TargetInfo {
+            self.mem.target()
+        }
+        fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+            self.mem.read(addr, buf)
+        }
+        fn mapped_ranges(&self) -> Result<Vec<MappedRange>> {
+            let mut r = self.mem.mapped_ranges()?;
+            for m in &mut r {
+                m.file = self
+                    .files
+                    .iter()
+                    .find(|f| f.0 == m.start)
+                    .map(|f| f.1.clone());
+            }
+            Ok(r)
+        }
+        fn modules(&self) -> Result<Vec<Module>> {
+            self.mem.modules()
+        }
+        fn threads(&self) -> Result<Vec<ThreadInfo>> {
+            self.mem.threads()
+        }
+        fn memory_summary(&self) -> Option<MemorySummary> {
+            None
+        }
+    }
+
+    /// The regions of a world, then which of them are libc's data.
+    #[derive(Clone)]
+    struct World {
+        target: TargetInfo,
+        bytes: Bytes,
+        files: Vec<(u64, String)>,
+        modules: Vec<&'static str>,
+        threads: Vec<ThreadInfo>,
+    }
+
+    impl World {
+        fn new(target: TargetInfo) -> World {
+            World {
+                target,
+                bytes: Bytes::default(),
+                files: Vec::new(),
+                modules: vec!["python3.12", "libc.so.6"],
+                threads: Vec::new(),
+            }
+        }
+
+        fn libc_data(&mut self) {
+            self.bytes.region(LIBC_DATA, 0x4000);
+            self.files.push((LIBC_DATA, LIBC_PATH.into()));
+        }
+
+        fn img(&self) -> Img {
+            let mut mem = MemImage::new(self.target);
+            for (b, r) in &self.bytes.regions {
+                mem.map(*b, r.clone());
+            }
+            for (i, name) in self.modules.iter().enumerate() {
+                mem.add_module(Module {
+                    name: name.to_string(),
+                    path: if *name == "libc.so.6" {
+                        LIBC_PATH.into()
+                    } else {
+                        format!("/usr/lib/{name}")
+                    },
+                    base: 0x7f00_1000_0000 + i as u64 * 0x100_0000,
+                    size: 0x10_0000,
+                    build_id: None,
+                });
+            }
+            for t in &self.threads {
+                mem.add_thread(t.clone());
+            }
+            Img {
+                mem,
+                files: self.files.clone(),
+            }
+        }
+    }
+
+    fn blocks(src: &dyn MemorySource, hints: &HeapHints) -> Option<Vec<NativeBlock>> {
+        native_blocks(src, hints).unwrap()
+    }
+
+    fn alloc(c: (u64, u64, St), heap: u32) -> NativeBlock {
+        NativeBlock {
+            start: c.0,
+            size: c.1,
+            kind: NativeBlockKind::Allocation,
+            heap,
+        }
+    }
+
+    fn large(start: u64, size: u64) -> NativeBlock {
+        NativeBlock {
+            start,
+            size,
+            kind: NativeBlockKind::Large,
+            heap: 0,
+        }
+    }
+
+    /// A brk heap with every kind of chunk, and `main_arena` describing it:
+    /// returns the world and what it should give.
+    fn main_heap_world(
+        g: Glibc,
+        target: TargetInfo,
+        with_arena: bool,
+    ) -> (World, Vec<NativeBlock>, Vec<NativeBlock>) {
+        let mut w = World::new(target);
+        w.bytes.region(BRK, BRK_LEN);
+        if with_arena {
+            w.libc_data();
+        }
+        let ch = w.bytes.heap(
+            BRK,
+            BRK + BRK_LEN,
+            &[
+                (TCACHE_CHUNK, St::Busy), // 0: the main thread's tcache
+                (0x30, St::Busy),         // 1
+                (0x30, St::Cached),       // 2: tcache
+                (0x30, St::Cached),       // 3: tcache
+                (0x110, St::Busy),        // 4
+                (0x20, St::Cached),       // 5: fastbin 0
+                (0x420, St::Free),        // 6: unsorted
+                (0x50, St::Busy),         // 7
+                (0x20, St::Cached),       // 8: fastbin 0
+                (0x70, St::Cached),       // 9: fastbin 5
+                (0x1010, St::Busy),       // 10
+                (TCACHE_CHUNK, St::Busy), // 11: a user's zeroed 640 bytes
+                (0x40, St::Busy),         // 12
+            ],
+            Tail::Top,
+            false,
+        );
+        let tcache_mem = BRK + CHUNK_HDR;
+        // 2.34+ keys are random; 2.29-2.33 use the tcache's address. Not read.
+        w.bytes.tcache(
+            g,
+            tcache_mem,
+            &[(1, vec![ch[3].0, ch[2].0])],
+            0x1234_5678_9abc_def0,
+        );
+        if with_arena {
+            w.bytes.mstate(
+                g,
+                MAIN_ARENA,
+                ch[13].0,
+                &[(0, vec![ch[8].0, ch[5].0]), (5, vec![ch[9].0])],
+                &[ch[6].0],
+                MAIN_ARENA,
+            );
+        }
+        let with = [1, 4, 7, 10, 11, 12].map(|i| alloc(ch[i], 0)).to_vec();
+        let without = [1, 4, 5, 7, 8, 9, 10, 11, 12]
+            .map(|i| alloc(ch[i], 0))
+            .to_vec();
+        (w, with, without)
+    }
+
+    #[test]
+    fn brk_heap_with_main_arena_drops_tcache_fastbin_and_free_chunks() {
+        for (g, t) in [
+            (V2_31, TargetInfo::LINUX_X86_64),
+            (V2_33, TargetInfo::LINUX_X86_64),
+            (V2_35, AARCH64),
+        ] {
+            let (w, want, _) = main_heap_world(g, t, true);
+            let img = w.img();
+            // A core: no hint, the heap is found by its chunks.
+            assert_eq!(
+                blocks(&img, &HeapHints::default()),
+                Some(want.clone()),
+                "{g:?}"
+            );
+            // A live process: [heap] named.
+            let hints = HeapHints {
+                brk: Some((BRK, BRK + BRK_LEN)),
+            };
+            assert_eq!(blocks(&img, &hints), Some(want), "{g:?}");
+        }
+    }
+
+    #[test]
+    fn without_main_arena_fastbin_chunks_count_as_busy() {
+        for g in [V2_31, V2_35] {
+            let (w, _, want) = main_heap_world(g, TargetInfo::LINUX_X86_64, false);
+            assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+        }
+    }
+
+    #[test]
+    fn a_corrupt_main_arena_is_ignored() {
+        let (mut w, _, want) = main_heap_world(V2_35, TargetInfo::LINUX_X86_64, true);
+        // A bin pointing nowhere: the state does not check out.
+        w.bytes
+            .poke(MAIN_ARENA + MSTATE_BINS + 16 * 40, 0xdead_0000);
+        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+    }
+
+    /// Two thread arenas: A with two heaps (the older ends in fenceposts),
+    /// and C with one. Plus a main heap so arena 0 exists.
+    fn thread_world(g: Glibc) -> (World, Vec<NativeBlock>) {
+        const A: u64 = 0x7f00_0000_0000;
+        const B: u64 = 0x7f00_0400_0000;
+        const C: u64 = 0x7f00_0800_0000;
+        let hi = g.heap_info_size;
+        let mut w = World::new(TargetInfo::LINUX_X86_64);
+        let (brk, mut want) = simple_brk_heap(g, BRK, 0x4000);
+        w.bytes.regions.push((BRK, brk));
+        let info = |w: &mut World, base: u64, ar: u64, prev: u64, size: u64, mprot: u64| {
+            w.bytes.poke(base, ar);
+            w.bytes.poke(base + 8, prev);
+            w.bytes.poke(base + 16, size);
+            w.bytes.poke(base + 24, mprot);
+            if hi == 48 {
+                w.bytes.poke(base + 32, 4096);
+            }
+        };
+        // Arena A, first heap: heap_info, malloc_state, chunks, fenceposts.
+        let a_ms = A + hi;
+        w.bytes.region(A, 0x8000);
+        info(&mut w, A, a_ms, 0, 0x8000, 0x8000);
+        let a_start = align_up(a_ms + MSTATE_SIZE, 16);
+        let a = w.bytes.heap(
+            a_start,
+            A + 0x8000,
+            &[
+                (TCACHE_CHUNK, St::Busy),
+                (0x40, St::Busy),
+                (0x40, St::Cached),
+                (0x100, St::Busy),
+            ],
+            Tail::Fence,
+            true,
+        );
+        w.bytes.tcache(g, a_start + 16, &[(2, vec![a[2].0])], 0);
+        // Arena A, second heap: the current one, holding top. Only part of
+        // its reserved size is in use; the rest is readable.
+        w.bytes.region(B, 0x8000);
+        info(&mut w, B, a_ms, A, 0x4000, 0x8000);
+        let b = w.bytes.heap(
+            B + hi,
+            B + 0x4000,
+            &[(0x60, St::Busy), (0x80, St::Cached), (0x60, St::Busy)],
+            Tail::Top,
+            true,
+        );
+        w.bytes
+            .mstate(g, a_ms, b[3].0, &[(6, vec![b[1].0])], &[a[4].0], C + hi);
+        // Arena C: one heap, an unused tcache first.
+        let c_ms = C + hi;
+        w.bytes.region(C, 0x4000);
+        info(&mut w, C, c_ms, 0, 0x4000, 0x4000);
+        let c = w.bytes.heap(
+            align_up(c_ms + MSTATE_SIZE, 16),
+            C + 0x4000,
+            &[(TCACHE_CHUNK, St::Busy), (0x30, St::Busy)],
+            Tail::Top,
+            true,
+        );
+        w.bytes.mstate(g, c_ms, c[2].0, &[], &[], a_ms);
+        want.extend([alloc(a[1], 1), alloc(a[3], 1)]);
+        want.extend([alloc(b[0], 1), alloc(b[2], 1)]);
+        want.push(alloc(c[1], 2));
+        want.sort_by_key(|b| b.start);
+        (w, want)
+    }
+
+    #[test]
+    fn thread_arenas_are_found_by_heap_info() {
+        for g in [V2_31, V2_33, V2_35] {
+            let (w, want) = thread_world(g);
+            assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want), "{g:?}");
+        }
+    }
+
+    #[test]
+    fn the_first_thread_heap_chunk_follows_malloc_state() {
+        // 2.31: 0x20 + 0x898, rounded up: the familiar ...8c0.
+        assert_eq!(
+            align_up(0x7f00_0000_0020 + MSTATE_SIZE, 16),
+            0x7f00_0000_08c0
+        );
+        assert_eq!(
+            align_up(0x7f00_0000_0030 + MSTATE_SIZE, 16),
+            0x7f00_0000_08d0
+        );
+    }
+
+    #[test]
+    fn a_later_heap_without_its_first_must_tile() {
+        let (mut w, _) = thread_world(V2_35);
+        // Drop arena A's first heap from the image.
+        w.bytes.regions.retain(|r| r.0 != 0x7f00_0000_0000);
+        let got = blocks(&w.img(), &HeapHints::default()).unwrap();
+        assert!(
+            got.iter().any(|b| b.start == 0x7f00_0400_0000 + 48),
+            "{got:?}"
+        );
+        // Now corrupt its middle: it is dropped, not half-read.
+        w.bytes.poke(0x7f00_0400_0000 + 48 + 0x60 + 8, 0x7777);
+        let got = blocks(&w.img(), &HeapHints::default()).unwrap();
+        assert!(!got.iter().any(|b| b.heap == 1), "{got:?}");
+    }
+
+    #[test]
+    fn mmapped_chunks_are_large_blocks() {
+        const M: u64 = 0x7f20_0000_0000;
+        let mut w = World::new(TargetInfo::LINUX_X86_64);
+        let (brk, mut want) = simple_brk_heap(V2_35, BRK, 0x4000);
+        w.bytes.regions.push((BRK, brk));
+        // One merged anonymous mapping: two plain mmapped chunks, a
+        // memalign(4096) one (user pointer page-aligned, 4080 bytes of lead)
+        // and a memalign(64) one (48 bytes of lead), then unused pages.
+        w.bytes.region(M, 0x130000);
+        w.bytes.poke(M + 8, 0x21000 | IS_MMAPPED);
+        w.bytes.poke(M + 0x21000 + 8, 0x10_0000 | IS_MMAPPED);
+        let c3 = M + 0x121000 + 4080;
+        w.bytes.poke(c3, 4080);
+        w.bytes.poke(c3 + 8, (0x3000 - 4080) | IS_MMAPPED);
+        let c4 = M + 0x124000 + 48;
+        w.bytes.poke(c4, 48);
+        w.bytes.poke(c4 + 8, (0x2000 - 48) | IS_MMAPPED);
+        // Noise that is not a chunk: wrong flags, misaligned size, lead
+        // that does not reach a page start, a chunk past the mapping.
+        w.bytes
+            .poke(M + 0x126000 + 8, 0x2000 | IS_MMAPPED | PREV_INUSE);
+        w.bytes.poke(M + 0x127000, 0);
+        w.bytes.poke(M + 0x127000 + 8, 0x1008 | IS_MMAPPED);
+        w.bytes.poke(M + 0x128000 + 48, 40);
+        w.bytes.poke(M + 0x128000 + 56, 0x2000 | IS_MMAPPED);
+        w.bytes.poke(M + 0x12f000 + 8, 0x2000 | IS_MMAPPED);
+        want.extend([
+            large(M, 0x21000),
+            large(M + 0x21000, 0x10_0000),
+            large(M + 0x121000, 0x3000),
+            large(M + 0x124000, 0x2000),
+        ]);
+        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+        assert_eq!(
+            mmapped_at(
+                M + 4080,
+                4080,
+                0x1010 | 2,
+                Span::new(M, M + 0x10000).unwrap(),
+                M
+            ),
+            Some((M, 0x2000))
+        );
+        assert_eq!(
+            mmapped_at(
+                M + 4080,
+                4080,
+                0x1010 | 2,
+                Span::new(M, M + 0x10000).unwrap(),
+                M + 1
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stacks_are_not_scanned() {
+        const S: u64 = 0x7ffd_0000_0000;
+        let mut w = World::new(TargetInfo::LINUX_X86_64);
+        let (brk, want) = simple_brk_heap(V2_31, BRK, 0x4000);
+        w.bytes.regions.push((BRK, brk));
+        w.bytes.region(S, 0x4000);
+        w.bytes.poke(S + 8, 0x4000 | IS_MMAPPED);
+        w.threads.push(ThreadInfo {
+            tid: 1,
+            name: None,
+            tls_base: None,
+            stack_pointer: Some(S + 0x3000),
+        });
+        assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want));
+    }
+
+    #[test]
+    fn a_corrupt_header_stops_a_named_heap_and_drops_a_guessed_one() {
+        let (w, _, want) = main_heap_world(V2_31, TargetInfo::LINUX_X86_64, false);
+        let hints = HeapHints {
+            brk: Some((BRK, BRK + BRK_LEN)),
+        };
+        // The 0x50 chunk (want[3], after the free 0x420 one) gets a bad
+        // header: too big, misaligned, zero, or with the wrong flags.
+        let bad = want[3].start;
+        for word in [
+            BRK_LEN | PREV_INUSE,
+            0x58 | PREV_INUSE,
+            PREV_INUSE,
+            0x50 | PREV_INUSE | IS_MMAPPED,
+            0x50 | PREV_INUSE | NON_MAIN_ARENA,
+        ] {
+            let mut w = w.clone();
+            w.bytes.poke(bad + 8, word);
+            let img = w.img();
+            // Named: the chunks before it, minus the one whose size led there
+            // (the free 0x420 chunk, which is not listed anyway).
+            let got = blocks(&img, &hints).unwrap();
+            assert_eq!(got, want[..3].to_vec(), "{word:#x}");
+            // Guessed: nothing tiles, so no heap at all.
+            assert_eq!(blocks(&img, &HeapHints::default()), None, "{word:#x}");
+        }
+        // A free chunk's footer that disagrees.
+        let mut w2 = w.clone();
+        w2.bytes.poke(bad, 0x410);
+        assert_eq!(blocks(&w2.img(), &hints).unwrap(), want[..3].to_vec());
+    }
+
+    #[test]
+    fn looping_lists_are_rejected_without_hanging() {
+        let (w, _, without) = main_heap_world(V2_35, TargetInfo::LINUX_X86_64, true);
+        let mut w = w;
+        // The second fastbin-0 chunk links back to the first: a loop.
+        let f1 = without[4].start; // ch[8], fastbin head
+        let f2 = without[2].start; // ch[5]
+        w.bytes.poke(f2 + 16, V2_35.protect(f2 + 16, f1));
+        // And a tcache entry links to itself.
+        let t = BRK + TCACHE_CHUNK + 0x30 + 0x30; // ch[3]
+        w.bytes.poke(t + 16, V2_35.protect(t + 16, t + 16));
+        let got = blocks(&w.img(), &HeapHints::default()).unwrap();
+        // The tcache no longer checks out: its entries and itself count busy.
+        assert!(got.iter().any(|b| b.start == BRK && b.size == TCACHE_CHUNK));
+        assert!(got.iter().any(|b| b.start == t));
+        // Fastbins: neither list mode validates, so they count busy.
+        assert!(got.iter().any(|b| b.start == f1) && got.iter().any(|b| b.start == f2));
+    }
+
+    #[test]
+    fn other_allocators_and_targets_give_none() {
+        let (w, _, _) = main_heap_world(V2_35, TargetInfo::LINUX_X86_64, true);
+        let mut je = w.clone();
+        je.modules.push("libjemalloc.so.2");
+        assert_eq!(blocks(&je.img(), &HeapHints::default()), None);
+        let mut musl = w.clone();
+        musl.modules = vec!["ld-musl-x86_64.so.1"];
+        assert_eq!(blocks(&musl.img(), &HeapHints::default()), None);
+        let mut win = w.clone();
+        win.target = TargetInfo::WINDOWS_X86_64;
+        assert_eq!(blocks(&win.img(), &HeapHints::default()), None);
+        // glibc, but nothing that looks like a heap.
+        let mut empty = World::new(TargetInfo::LINUX_X86_64);
+        empty.bytes.region(0x1000_0000, 0x10000);
+        for i in 0..0x2000u64 {
+            empty
+                .bytes
+                .poke(0x1000_0000 + i * 8, i.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        }
+        assert_eq!(blocks(&empty.img(), &HeapHints::default()), None);
+        assert!(is_glibc("libc-2.31.so") && !is_glibc("libcrypto.so.3"));
+    }
+
+    #[test]
+    fn garbage_never_panics_and_blocks_stay_well_formed() {
+        let (mut w, _) = thread_world(V2_35);
+        let (m, _, _) = main_heap_world(V2_35, TargetInfo::LINUX_X86_64, true);
+        w.bytes.regions.retain(|r| r.0 != BRK);
+        w.bytes.regions.extend(m.bytes.regions);
+        w.files = m.files;
+        w.bytes.region(0x7f20_0000_0000, 0x3000);
+        w.bytes.poke(0x7f20_0000_0008, 0x2000 | IS_MMAPPED);
+        let clean = w.img();
+        let ranges = clean.mapped_ranges().unwrap();
+        let total: usize = w.bytes.regions.iter().map(|r| r.1.len()).sum();
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        for round in 0..3000 {
+            let mut bad = w.clone();
+            // Flip a few bytes, mostly in headers (every 16th byte region).
+            for _ in 0..1 + round % 4 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let mut at = (x as usize) % total;
+                for (_, r) in &mut bad.bytes.regions {
+                    if at < r.len() {
+                        if round % 2 == 0 {
+                            at = (at & !15) + 8 + (at % 8);
+                            at = at.min(r.len() - 1);
+                        }
+                        r[at] ^= (x >> 32) as u8 | 1;
+                        break;
+                    }
+                    at -= r.len();
+                }
+            }
+            let hints = if round % 3 == 0 {
+                HeapHints {
+                    brk: Some((BRK, BRK + BRK_LEN)),
+                }
+            } else {
+                HeapHints::default()
+            };
+            let Some(got) = native_blocks(&bad.img(), &hints).unwrap() else {
+                continue;
+            };
+            for pair in got.windows(2) {
+                assert!(pair[0].start + pair[0].size <= pair[1].start, "{pair:?}");
+            }
+            for b in &got {
+                assert!(b.size >= MINSIZE);
+                assert!(
+                    ranges
+                        .iter()
+                        .any(|r| b.start >= r.start && b.start + b.size <= r.start + r.size),
+                    "{b:?}"
+                );
+            }
+        }
+    }
+}
