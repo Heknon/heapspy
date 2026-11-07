@@ -63,7 +63,8 @@ versions are not supported yet: Cargo writes `0.2.0-rc.1` where Python writes
    is nothing to tag by hand.
 6. Watch the **Release** workflow in the Actions tab. It runs, in order:
    - `gate`: sees that `v0.2.0` has no tag yet,
-   - CI (`ci.yml`) and E2E (`e2e.yml`) on the merge commit, Linux and Windows,
+   - CI (`ci.yml`), E2E (`e2e.yml`) and the live record tests (`record.yml`)
+     on the merge commit, Linux and Windows,
    - the version check and all builds,
    - the PyPI upload, as a deployment to the `pypi` environment,
    - the `v0.2.0` tag on the merge commit and the GitHub release, with the
@@ -73,8 +74,8 @@ versions are not supported yet: Cargo writes `0.2.0-rc.1` where Python writes
 Merges that do not change the version do not release. Only bump the version
 in a PR you intend to ship as soon as it merges.
 
-Nothing is published until CI, E2E, the version check and every build have
-passed. If one fails, fix it in a new PR and merge that: the version is still
+Nothing is published until CI, E2E, the record tests, the version check and
+every build have passed. If one fails, fix it in a new PR and merge that: the version is still
 untagged, so the next push to `master` releases it. If PyPI already accepted
 some files, do not reuse the version: PyPI never accepts the same file name
 twice. Bump to the next patch version instead.
@@ -91,7 +92,7 @@ version in that commit.
 | Job | Output |
 |---|---|
 | `gate` | decides whether this run releases: a `master` push whose version is untagged, a tag push, or a dispatch |
-| `ci`, `e2e` | `ci.yml` and `e2e.yml` on the release commit |
+| `ci`, `e2e`, `record` | `ci.yml`, `e2e.yml` and `record.yml` on the release commit |
 | `check-version` | runs `scripts/check-version.py`; checks that an existing tag for the version is on this commit; detects `python/heapspy-mcp` |
 | `wheels` | `heapspy` wheels for `x86_64-unknown-linux-gnu` (manylinux2014), `aarch64-unknown-linux-gnu` (manylinux2014, cross-compiled), `x86_64-unknown-linux-musl` (musllinux_1_2), `x86_64-pc-windows-msvc`; a `.tar.gz` or `.zip` of each binary |
 | `sdist` | `heapspy` sdist |
@@ -134,7 +135,7 @@ TestPyPI also refuses a file it already has. The TestPyPI upload uses
 `skip-existing`, so a second run with the same version succeeds but uploads
 nothing new.
 
-Manual dispatch with **publish** set to `none` runs CI and E2E and builds,
+Manual dispatch with **publish** set to `none` runs the tests and builds,
 without uploading anything. Use it to check
 that all targets still compile and download the artifacts from the run page.
 

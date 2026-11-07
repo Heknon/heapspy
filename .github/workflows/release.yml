@@ -6,8 +6,8 @@
 #
 #   1. gate: a push to master whose version has no vX.Y.Z tag yet is a
 #      release. Any other push to master stops here.
-#   2. ci.yml and e2e.yml run on the release commit (workflow_call), so
-#      nothing is published that they would refuse.
+#   2. ci.yml, e2e.yml and record.yml run on the release commit
+#      (workflow_call), so nothing is published that they would refuse.
 #   3. heapspy wheels, sdist, binaries and heapspy-mcp are built.
 #   4. both packages are published to PyPI with trusted publishing. The job
 #      runs in the `pypi` environment, which records a GitHub deployment.
@@ -19,7 +19,7 @@
 # to TestPyPI. It never publishes to PyPI or creates a release.
 #
 # The tag is pushed with this workflow's own token, which does not start other
-# workflows, so tagging does not run CI or E2E a second time.
+# workflows, so tagging does not run the tests a second time.
 name: Release
 
 on:
@@ -102,9 +102,17 @@ jobs:
     with:
       mcp_ref: ${{ github.sha }}
 
+  record:
+    name: Record
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/record.yml
+
   check-version:
     name: check versions
-    needs: [gate, ci, e2e]
+    needs: [gate, ci, e2e, record]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5

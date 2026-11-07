@@ -58,7 +58,7 @@ CPython 3.12, 3.13 and 3.14 processes through every mechanism:
 | Trigger | What runs |
 |---|---|
 | PR label `ci:record` | Linux (eBPF, ptrace, as root) and Windows (ETW, debugger) |
-| tag push matching `v*` | both |
+| every release (called by `release.yml`) | both |
 | manual dispatch (Actions tab) | both, or one with `side: linux` or `side: windows` |
 
 On Linux the job prints what the runner's kernel supports
@@ -102,9 +102,9 @@ publishes them. Releasing is a version bump merged to `master`:
 | Trigger | What runs |
 |---|---|
 | push to `master`, version already tagged | only the `gate` job, which stops |
-| push to `master`, version not tagged yet | CI, E2E, version check, all builds, publish to PyPI, tag `vX.Y.Z`, GitHub release |
+| push to `master`, version not tagged yet | CI, E2E, Record, version check, all builds, publish to PyPI, tag `vX.Y.Z`, GitHub release |
 | tag push matching `v*` | the same, for the tagged commit |
-| manual dispatch, `publish: none` | CI, E2E, version check and all builds; artifacts on the run page |
+| manual dispatch, `publish: none` | CI, E2E, Record, version check and all builds; artifacts on the run page |
 | manual dispatch, `publish: testpypi` | the same, then upload to TestPyPI |
 
 It has no PR triggers. See [docs/releasing.md](docs/releasing.md) for the
