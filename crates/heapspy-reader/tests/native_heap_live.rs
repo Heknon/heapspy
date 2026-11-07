@@ -121,7 +121,30 @@ fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
         let b = blocks
             .iter()
             .find(|b| b.start <= *p && *p < b.start + b.size)
-            .unwrap_or_else(|| panic!("{what}: {kind} malloc({size}) at {p:#x} is in no block"));
+            .unwrap_or_else(|| {
+                // What is around it, to tell a missed header from a
+                // neighbour that swallowed it.
+                let near = |a: u64, b: u64| a.abs_diff(b) < 64 << 20;
+                let blocks: Vec<_> = blocks.iter().filter(|b| near(b.start, *p)).collect();
+                let maps: Vec<String> = src
+                    .mapped_ranges()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| near(r.start, *p))
+                    .map(|r| format!("{:#x}+{:#x} {:?} {:?}", r.start, r.size, r.perms, r.file))
+                    .collect();
+                let sps: Vec<String> = src
+                    .threads()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t.stack_pointer)
+                    .map(|sp| format!("{sp:#x}"))
+                    .collect();
+                panic!(
+                    "{what}: {kind} malloc({size}) at {p:#x} is in no block\n\
+                     blocks near: {blocks:#x?}\nmaps near: {maps:#?}\nstack pointers: {sps:?}"
+                )
+            });
         // The user pointer is the chunk plus 16, and the chunk holds it. A
         // busy chunk's data also runs into the next chunk's `prev_size`
         // word (8 bytes), so malloc(24) fits a 32-byte chunk.
