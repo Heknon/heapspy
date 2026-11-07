@@ -197,7 +197,13 @@ jobs:
             exit 1
           }
           "elevated: yes"
+          # The session list is for the log only. logman can fail when a
+          # session on the runner ends while it is listing them ("The GUID
+          # passed was not recognized as valid by a WMI data provider"); that
+          # says nothing about heapspy, so it does not fail the job.
           logman query -ets
+          if ($LASTEXITCODE -ne 0) { "logman query -ets failed ($LASTEXITCODE); continuing" }
+          exit 0
       - name: Install Python 3.12, 3.13, 3.14 (python-build-standalone)
         run: |
           uv python install 3.12 3.13 3.14
@@ -230,4 +236,7 @@ jobs:
       - name: ETW sessions after the tests
         if: always()
         shell: pwsh
-        run: logman query -ets
+        run: |
+          logman query -ets
+          if ($LASTEXITCODE -ne 0) { "logman query -ets failed ($LASTEXITCODE); continuing" }
+          exit 0

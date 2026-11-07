@@ -79,7 +79,7 @@ Flags take precedence over environment variables.
 |---|---|---|---|
 | `--heapspy-bin PATH` | `HEAPSPY_BIN` | `heapspy` on `PATH` | heapspy executable. A configured path that is not executable stops the server at startup. If nothing is configured and `heapspy` is not on `PATH`, the server starts and the analysis tools return `binary_not_found`. |
 | `--allow PATTERN` | `HEAPSPY_MCP_ALLOW` | empty | Processes that `capture_snapshot` may dump. Repeatable; comma-separated lists are accepted; flag and variable entries are merged. Empty means live capture is disabled. |
-| `--allow-contents` | `HEAPSPY_MCP_ALLOW_CONTENTS=1` | off | Permit `capture_contents=true`. |
+| `--max-str N` | `HEAPSPY_MCP_MAX_STR` | 1024 | Per-string cap, in characters, used when a `capture_contents=true` call gives no `max_str` (1 to 1048576). |
 | `--max-rss SIZE` | `HEAPSPY_MCP_MAX_RSS` | `8G` | Refuse live capture of processes with a larger RSS. Binary suffixes: `512M`, `8G`, `8GiB`, or plain bytes. |
 | `--snapshot-dir DIR` | `HEAPSPY_MCP_SNAPSHOT_DIR` | `~/.cache/heapspy-mcp/snapshots` on Linux, `~/Library/Caches/heapspy-mcp/snapshots` on macOS, `%LOCALAPPDATA%\heapspy-mcp\Cache\snapshots` on Windows | Where captured snapshots are written. Created with mode 0700. |
 | `--timeout SECONDS` | `HEAPSPY_MCP_TIMEOUT` | 120 | Timeout for `analyze`, `query` and `diff`. |
@@ -113,9 +113,10 @@ debug privileges. It is gated as follows, in this order:
 1. `confirm` must be `true`. The tool description tells the agent to ask the
    user before setting it.
 2. Exactly one of `pid`, `core_path` or `minidump_path`.
-3. `capture_contents=true` is refused unless the server was started with
-   `--allow-contents`. By default snapshots hold types, sizes and references,
-   but no string or bytes contents, which often hold credentials and user data.
+3. Contents are the agent's call. Without `capture_contents`, snapshots hold
+   types, sizes and references only. With it, they also hold the text of
+   `str` and `bytes` objects (cut at `max_str`) and real dict keys, which can
+   include credentials and user data. Every such capture is logged.
 4. For a `pid`: the allowlist must be non-empty and the process must match an
    entry, and its RSS must be at or below `--max-rss`. The server's own PID is
    refused.
@@ -244,7 +245,10 @@ cores and minidumps), the dump's `notes`, and `report` (`json`, or
 `stderr_line` for an older heapspy, see
 [Compatibility with older heapspy binaries](#compatibility-with-older-heapspy-binaries)).
 A truncated snapshot also gets a `warning`: its numbers are lower bounds.
-`max_str` (1 to 4096) only applies with `capture_contents`.
+`max_str` (1 to 1048576) only applies with `capture_contents`; without it the
+server default (`--max-str`, 1024) is used. The result's `max_str` is the cap
+that was applied. An agent that finds the prefixes too short to tell what the
+data is can capture again with a larger `max_str`.
 
 heapspy writes into a private staging directory
 (`<snapshot dir>/.<handle>.partial/`) that is removed on every path, so a dump

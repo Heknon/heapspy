@@ -68,7 +68,6 @@ def make_config(fake_bin: Path, snapshot_dir: Path):
             "heapspy_bin": fake_bin,
             "snapshot_dir": snapshot_dir,
             "allow": [],
-            "allow_contents": False,
             "timeout": 20.0,
             "capture_timeout": 20.0,
         }

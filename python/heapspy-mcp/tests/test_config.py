@@ -68,13 +68,13 @@ def test_flags_merge_over_env(fake_bin: Path, tmp_path: Path) -> None:
         "HEAPSPY_MCP_ALLOW": "gunicorn*, pid:7",
         "HEAPSPY_MCP_MAX_RSS": "1G",
         "HEAPSPY_MCP_SNAPSHOT_DIR": str(tmp_path / "env-dir"),
-        "HEAPSPY_MCP_ALLOW_CONTENTS": "yes",
+        "HEAPSPY_MCP_MAX_STR": "4096",
     }
     cfg = Config.from_sources(heapspy_bin=str(fake_bin), allow=["worker,celery*"], env=env)
     assert cfg.allow == ["gunicorn*", "pid:7", "worker", "celery*"]
     assert cfg.max_rss_bytes == 1024**3
     assert cfg.snapshot_dir == tmp_path / "env-dir"
-    assert cfg.allow_contents is True
+    assert cfg.max_str == 4096
     cfg = Config.from_sources(
         heapspy_bin=str(fake_bin), max_rss="2G", snapshot_dir=str(tmp_path / "f"), env=env
     )
@@ -85,7 +85,7 @@ def test_flags_merge_over_env(fake_bin: Path, tmp_path: Path) -> None:
 def test_defaults(fake_bin: Path) -> None:
     cfg = Config.from_sources(heapspy_bin=str(fake_bin), env={})
     assert cfg.allow == []
-    assert cfg.allow_contents is False
+    assert cfg.max_str == 1024
     assert cfg.max_rss_bytes == DEFAULT_MAX_RSS
     assert "heapspy-mcp" in str(cfg.snapshot_dir)
 
@@ -139,3 +139,12 @@ def test_stall_rate_cap_bounds() -> None:
     assert DiagnosticsConfig.from_sources(env=env).max_stall_rate_hz == 25.0
     with pytest.raises(ConfigError, match="max-stall-rate"):
         DiagnosticsConfig.from_sources(max_stall_rate=5000, env={})
+
+
+def test_max_str_flag_wins_and_is_bounded(fake_bin: Path) -> None:
+    env = {"HEAPSPY_MCP_MAX_STR": "4096"}
+    assert Config.from_sources(heapspy_bin=str(fake_bin), max_str=64, env=env).max_str == 64
+    with pytest.raises(ConfigError):
+        Config.from_sources(heapspy_bin=str(fake_bin), env={"HEAPSPY_MCP_MAX_STR": "lots"})
+    with pytest.raises(ConfigError):
+        Config.from_sources(heapspy_bin=str(fake_bin), max_str=0, env={})

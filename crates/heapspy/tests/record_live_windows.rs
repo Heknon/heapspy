@@ -35,13 +35,15 @@
 //!   handler:8` in seven runs out of nine, and `handler:8` or `main:20`
 //!   in the other two; line 5, where arenas are carved, is rarely matched
 //!   because the
-//!   thread spends little time there. So the ETW checks are statistical
-//!   and hold whatever the order of the top stacks: one of the five top
-//!   stacks is `build_payload` (line 5 or 6) under `handler:8`, more
-//!   samples fall in the leak's chain (`handler`) than in the noise's
-//!   (`noise`), nearly every sample matched a stack, and every frame is
-//!   flagged approximate. Requiring the top stack to be `build_payload:5`
-//!   would fail most runs for reasons that are not bugs.
+//!   thread spends little time there. Twice, in about twenty runs, no top-5
+//!   stack had `build_payload` under `handler:8` at all: the samples split
+//!   across `handler:7`, `handler:8` and `handler:10`. So the ETW checks
+//!   are statistical and hold whatever the order of the top stacks: one of
+//!   the five top stacks runs through `handler`, more samples fall in the
+//!   leak's chain (`handler`) than in the noise's (`noise`), nearly every
+//!   sample matched a stack, and every frame is flagged approximate.
+//!   Requiring an exact line would fail some runs for reasons that are not
+//!   bugs. The debugger tests check the exact stack.
 //!
 //! Every test prints a `RESULT` line (sample counts, top stack) for the
 //! CI log, and `SKIPPED` when a check could not run on this machine.
@@ -89,8 +91,6 @@ main(sys.argv[1], sys.argv[2])
 "#;
 /// `leaked.append(...)`: arenas are carved here.
 const ARENA_LINE: u32 = 5;
-/// `bytes(64 * 1024)`: where the thread spends most of its time.
-const PAYLOAD_LINE: u32 = 6;
 /// `keep.append(build_payload(i))`.
 const HANDLER_LINE: u32 = 8;
 
@@ -576,13 +576,16 @@ fn run(minor: u8, mechanism: &str) {
                 "only {framed} of {} ETW samples matched a stack",
                 all.len()
             );
-            // Statistical, see the module docs.
+            // Statistical, see the module docs: the frames are where the
+            // thread was within a few ms of the event, so which line of
+            // `handler` (and whether `build_payload` is below it) varies
+            // from run to run. That the leak's chain dominates does not.
             assert!(
-                a.top_stacks.iter().take(5).any(|t| {
-                    has(&t.frames, "build_payload", &[ARENA_LINE, PAYLOAD_LINE])
-                        && has(&t.frames, "handler", &[HANDLER_LINE])
-                }),
-                "no top-5 stack is build_payload:{ARENA_LINE}|{PAYLOAD_LINE} <- handler:{HANDLER_LINE}"
+                a.top_stacks.iter().take(5).any(|t| t
+                    .frames
+                    .iter()
+                    .any(|f| f.function == "handler" && in_victim(f))),
+                "no top-5 stack runs through handler"
             );
             assert!(
                 leak_chain > noise_chain,

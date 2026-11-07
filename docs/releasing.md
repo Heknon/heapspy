@@ -76,9 +76,16 @@ in a PR you intend to ship as soon as it merges.
 
 Nothing is published until CI, E2E, the record tests, the version check and
 every build have passed. If one fails, fix it in a new PR and merge that: the version is still
-untagged, so the next push to `master` releases it. If PyPI already accepted
-some files, do not reuse the version: PyPI never accepts the same file name
-twice. Bump to the next patch version instead.
+untagged, so the next push to `master` releases it.
+
+If the PyPI upload stopped partway (for example `heapspy` was uploaded and
+`heapspy-mcp` was refused), fix the cause and merge any PR to `master`: the
+version is still untagged, so the release runs again. The upload skips files
+PyPI already has and uploads the rest, then tags and creates the GitHub
+release. PyPI never replaces a file, so the skipped files stay as first
+built. The GitHub release binaries come from the new run. If a file that is
+already on PyPI is wrong, do not reuse the version: bump to the next patch
+version instead.
 
 The tag and the GitHub release are created only after the PyPI upload
 succeeds. If the release job itself fails, re-run it from the run page.
