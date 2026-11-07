@@ -7,7 +7,8 @@
 # The ignored test crates/heapspy-reader/tests/native_heap_live.rs is built
 # once, statically for musl, so it runs in any image. Each image builds the
 # C victim (tests/victims/glibc_heap.c) with its own gcc and glibc, installs
-# gdb for gcore, and runs the test live and against a core.
+# gdb for gcore, and runs the test live and against a core (live only where
+# the image's gdb writes cores without file names).
 name: glibc
 
 on:
@@ -71,8 +72,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # malloc_state without have_fastchunks, no tcache.
-          - { image: "ubuntu:12.04", glibc: "2.15", apt: old-releases }
+          # malloc_state without have_fastchunks, no tcache. Live only:
+          # gdb 7.4's gcore writes no NT_FILE note, so nothing in its cores
+          # can be told to be libc (or any module).
+          - { image: "ubuntu:12.04", glibc: "2.15", apt: old-releases, core: "no" }
           - { image: "ubuntu:14.04", glibc: "2.19" }
           # attached_threads added.
           - { image: "ubuntu:16.04", glibc: "2.23" }
@@ -99,10 +102,11 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
           APT: ${{ matrix.apt }}
+          CORE: ${{ matrix.core }}
         run: |
           chmod +x bin/native_heap_live
           docker run --rm --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
-            -e APT -e DEBIAN_FRONTEND=noninteractive \
+            -e APT -e CORE -e DEBIAN_FRONTEND=noninteractive \
             -v "$PWD/crates/heapspy-reader/tests/victims:/victims:ro" \
             -v "$PWD/bin:/heapspy:ro" \
             "$IMAGE" bash -euc '
@@ -115,6 +119,7 @@ jobs:
               ldd --version | head -n 1
               gcc -O0 -o /tmp/victim /victims/glibc_heap.c -lpthread
               cd /tmp
+              if [ "$CORE" = no ]; then export HEAPSPY_SKIP_CORE=1; fi
               HEAPSPY_VICTIM=/tmp/victim /heapspy/native_heap_live \
                 --ignored --test-threads 1 --nocapture
             '

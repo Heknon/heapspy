@@ -71,7 +71,8 @@ The same test runs against older and other glibc releases in
 Ubuntu 12.04 (glibc 2.15) to Ubuntu 24.04 (2.39). CPython does not run on
 the oldest, so each image builds the C victim
 (`crates/heapspy-reader/tests/victims/glibc_heap.c`) with its own gcc and
-runs the test, built statically for musl, live and through `gcore`:
+runs the test, built statically for musl, live and through `gcore` (live
+only on 12.04, whose gdb 7.4 writes cores without file names):
 
 | Trigger | What runs |
 |---|---|
