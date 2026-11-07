@@ -2,7 +2,7 @@
 # Report what this Linux kernel offers `heapspy record`, and decide whether
 # the eBPF live tests can run here. Used by .github/workflows/record.yml.
 #
-#   sudo -E scripts/record-kernel-check.sh HEAPSPY_BIN PYTHON
+#   sudo env GITHUB_OUTPUT="$GITHUB_OUTPUT" scripts/record-kernel-check.sh HEAPSPY_BIN PYTHON
 #
 # HEAPSPY_BIN is a built heapspy, PYTHON any supported CPython. The last
 # check is a real one-second `heapspy record --mechanism ebpf` against a
@@ -17,7 +17,7 @@ set -u
 bin="${1:?usage: record-kernel-check.sh HEAPSPY_BIN PYTHON}"
 py="${2:?usage: record-kernel-check.sh HEAPSPY_BIN PYTHON}"
 if [ "$(id -u)" != 0 ]; then
-    echo "run as root (sudo -E)" >&2
+    echo "run as root" >&2
     exit 2
 fi
 

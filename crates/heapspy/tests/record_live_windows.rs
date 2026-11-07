@@ -127,6 +127,7 @@ extern "system" {
 }
 
 const PROCESS_VM_READ: u32 = 0x0010;
+const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_ELEVATION: u32 = 20;
@@ -178,7 +179,8 @@ fn assert_elevated() {
 
 /// A debugger is attached to `pid`.
 fn debugger_attached(pid: u32) -> bool {
-    let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION);
+    // CheckRemoteDebuggerPresent needs the full query right.
+    let h = open(pid, PROCESS_QUERY_INFORMATION);
     let mut present = 0i32;
     // SAFETY: valid handle and out pointer.
     assert!(unsafe { CheckRemoteDebuggerPresent(h.0, &mut present) } != 0);
@@ -419,6 +421,15 @@ fn run(minor: u8, mechanism: &str) {
         "--then-dump",
         s(&snap),
     ]);
+    if !o.status.success() {
+        let state = v.exited().unwrap_or_else(|| "still running".into());
+        panic!(
+            "record failed ({}); the target: {state}\nstdout: {}\nstderr: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
     let rec = ok_json(&o, "record");
     eprintln!("{}", String::from_utf8_lossy(&o.stderr).trim_end());
     let want: Vec<&str> = match mechanism {
