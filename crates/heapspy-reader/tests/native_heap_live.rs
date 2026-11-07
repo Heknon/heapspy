@@ -139,9 +139,25 @@ fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
             .filter(|r| r.perms.write)
             .map(|r| format!("{:#x}+{:#x} {:?}", r.start, r.size, r.file))
             .collect();
+        // libc's mappings, and whether the ELF header at each reads.
+        let libc: Vec<String> = src
+            .mapped_ranges()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.file.as_deref().is_some_and(|f| f.contains("libc")))
+            .map(|r| {
+                let mut b = [0u8; 4];
+                let head = src.read(r.start, &mut b).map(|()| b);
+                format!(
+                    "{:#x}+{:#x} {:?} {:?}: {head:x?}",
+                    r.start, r.size, r.perms, r.file
+                )
+            })
+            .collect();
         panic!(
             "{what}: no native blocks (allocator not recognised?)\n\
-                 libc modules: {modules:?}\nwritable mappings: {maps:#?}"
+             libc modules: {modules:?}\nlibc mappings: {libc:#?}\n\
+             writable mappings: {maps:#?}"
         )
     });
     eprintln!("{what}: {} native blocks", blocks.len());
