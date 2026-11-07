@@ -2,7 +2,7 @@
 # Runs on request only. See CONTRIBUTING.md and tests/e2e/README.md.
 #
 #   - Label a PR `ci:e2e` to run the Linux and Windows matrices.
-#   - Tag pushes (v*) and manual dispatch run both.
+#   - Every release (release.yml) and manual dispatch run both.
 #   - Manual dispatch can also smoke-test heapspy-mcp from another ref.
 name: E2E
 
@@ -13,8 +13,14 @@ on:
         description: "Branch, tag or SHA containing python/heapspy-mcp to smoke-test (empty: skip)"
         required: false
         default: ""
-  push:
-    tags: ["v*"]
+  # release.yml runs this on every release commit, before publishing.
+  workflow_call:
+    inputs:
+      mcp_ref:
+        description: "Branch, tag or SHA containing python/heapspy-mcp to smoke-test (empty: skip)"
+        type: string
+        required: false
+        default: ""
   pull_request:
     types: [labeled, synchronize, opened, reopened]
     paths-ignore:
@@ -22,8 +28,9 @@ on:
       - "docs/**"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A literal prefix, not github.workflow (see ci.yml).
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -71,7 +78,7 @@ jobs:
       - name: Build heapspy
         run: cargo build --release --locked -p heapspy
       - name: Check out heapspy-mcp
-        if: github.event_name == 'workflow_dispatch' && inputs.mcp_ref != ''
+        if: inputs.mcp_ref != ''
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.mcp_ref }}

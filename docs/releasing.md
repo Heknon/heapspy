@@ -7,8 +7,11 @@ heapspy ships as two PyPI projects:
 | `heapspy` | root `pyproject.toml` (maturin, `bindings = "bin"`) | the `heapspy` binary, one wheel per platform, plus an sdist |
 | `heapspy-mcp` | `python/heapspy-mcp` (hatchling) | pure-Python MCP server, one `py3-none-any` wheel plus an sdist |
 
-`.github/workflows/release.yml` builds and publishes both. It runs only on a
-pushed `v*` tag and on manual dispatch.
+`.github/workflows/release.yml` builds and publishes both. Releasing is a
+version bump: when a commit on `master` carries a version that has no `vX.Y.Z`
+tag yet, the workflow tests it, publishes it, tags it and creates the GitHub
+release. Every other push to `master` stops after a few seconds without doing
+anything.
 
 ## Versions
 
@@ -42,8 +45,8 @@ versions are not supported yet: Cargo writes `0.2.0-rc.1` where Python writes
 1. Bump the version in the root `Cargo.toml` (`[workspace.package] version`).
    Also bump the matching `version` entries for the internal crates in
    `[workspace.dependencies]`.
-2. If `python/heapspy-mcp` exists, set the same version in its
-   `pyproject.toml` and in `heapspy_mcp/__init__.py`.
+2. Set the same version in `python/heapspy-mcp/pyproject.toml` and in
+   `heapspy_mcp/__init__.py`.
 3. Update `Cargo.lock`:
 
    ```sh
@@ -56,42 +59,46 @@ versions are not supported yet: Cargo writes `0.2.0-rc.1` where Python writes
    python3 scripts/check-version.py v0.2.0
    ```
 
-5. Commit, open a PR, and merge it to `master`.
-6. Tag the merge commit on `master` and push the tag:
+5. Commit, open a PR, and merge it to `master`. Merging is the release: there
+   is nothing to tag by hand.
+6. Watch the **Release** workflow in the Actions tab. It runs, in order:
+   - `gate`: sees that `v0.2.0` has no tag yet,
+   - CI (`ci.yml`) and E2E (`e2e.yml`) on the merge commit, Linux and Windows,
+   - the version check and all builds,
+   - the PyPI upload, as a deployment to the `pypi` environment,
+   - the `v0.2.0` tag on the merge commit and the GitHub release, with the
+     binaries (`heapspy-v0.2.0-<target>.tar.gz` / `.zip`) and `SHA256SUMS`
+     attached and notes generated from merged PRs.
 
-   ```sh
-   git checkout master
-   git pull
-   git tag -a v0.2.0 -m "heapspy 0.2.0"
-   git push origin v0.2.0
-   ```
+Merges that do not change the version do not release. Only bump the version
+in a PR you intend to ship as soon as it merges.
 
-7. Watch the **Release** workflow in the Actions tab. On success:
-   - both projects are on PyPI,
-   - a GitHub release named after the tag has the binaries
-     (`heapspy-v0.2.0-<target>.tar.gz` / `.zip`) and `SHA256SUMS` attached,
-     with notes generated from merged PRs.
+Nothing is published until CI, E2E, the version check and every build have
+passed. If one fails, fix it in a new PR and merge that: the version is still
+untagged, so the next push to `master` releases it. If PyPI already accepted
+some files, do not reuse the version: PyPI never accepts the same file name
+twice. Bump to the next patch version instead.
 
-If the version check fails, the workflow stops before building. Delete the
-tag (`git push --delete origin v0.2.0`, `git tag -d v0.2.0`), fix the
-versions, and tag again.
+The tag and the GitHub release are created only after the PyPI upload
+succeeds. If the release job itself fails, re-run it from the run page.
 
-If a build fails, nothing has been published. Fix it on `master`, move the tag
-to the fixed commit, and push it again. If PyPI already accepted some files,
-do not reuse the version: PyPI never accepts the same file name twice. Bump to
-the next patch version instead.
+Pushing a `vX.Y.Z` tag by hand still works and runs the same jobs. Use it to
+release a commit that is not the tip of `master`. The tag must match the
+version in that commit.
 
 ## What the workflow builds
 
 | Job | Output |
 |---|---|
-| `check-version` | runs `scripts/check-version.py`; detects `python/heapspy-mcp` |
+| `gate` | decides whether this run releases: a `master` push whose version is untagged, a tag push, or a dispatch |
+| `ci`, `e2e` | `ci.yml` and `e2e.yml` on the release commit |
+| `check-version` | runs `scripts/check-version.py`; checks that an existing tag for the version is on this commit; detects `python/heapspy-mcp` |
 | `wheels` | `heapspy` wheels for `x86_64-unknown-linux-gnu` (manylinux2014), `aarch64-unknown-linux-gnu` (manylinux2014, cross-compiled), `x86_64-unknown-linux-musl` (musllinux_1_2), `x86_64-pc-windows-msvc`; a `.tar.gz` or `.zip` of each binary |
 | `sdist` | `heapspy` sdist |
 | `mcp` | `heapspy-mcp` sdist and wheel, built with `uv build`. Skipped when `python/heapspy-mcp` is not in the commit |
-| `publish-pypi` | tag pushes only: uploads both projects to PyPI |
+| `publish-pypi` | releases only: uploads both projects to PyPI in the `pypi` environment |
 | `publish-testpypi` | manual dispatch with `publish: testpypi` only: uploads both projects to TestPyPI |
-| `github-release` | tag pushes only, after `publish-pypi` succeeds: creates the GitHub release |
+| `github-release` | releases only, after `publish-pypi` succeeds: tags the commit `vX.Y.Z` if it is not tagged yet and creates the GitHub release |
 
 The `heapspy` wheels contain only the binary, so they are tagged
 `py3-none-<platform>` and install on any Python 3.8 or later. The x86_64 Linux
@@ -102,7 +109,7 @@ build.
 
 1. In the Actions tab, open **Release**, click **Run workflow**, pick the
    branch, and set **publish** to `testpypi`.
-2. The run builds everything and uploads to TestPyPI. It does not publish to
+2. The run tests and builds everything and uploads to TestPyPI. It does not publish to
    PyPI and does not create a GitHub release, even when run on a tag.
 3. Install from TestPyPI in a fresh virtual environment:
 
@@ -127,7 +134,8 @@ TestPyPI also refuses a file it already has. The TestPyPI upload uses
 `skip-existing`, so a second run with the same version succeeds but uploads
 nothing new.
 
-Manual dispatch with **publish** set to `none` only builds. Use it to check
+Manual dispatch with **publish** set to `none` runs CI and E2E and builds,
+without uploading anything. Use it to check
 that all targets still compile and download the artifacts from the run page.
 
 ## Build locally
@@ -154,9 +162,11 @@ These steps are done once by a repository owner, before the first release.
 
 In the repository, open **Settings > Environments** and create:
 
-- `pypi`. Recommended: under **Deployment branches and tags**, choose
-  **Selected branches and tags** and add the tag rule `v*`. Optionally add
-  required reviewers, so each PyPI upload waits for approval.
+- `pypi`. Under **Deployment branches and tags**, either leave it
+  unrestricted or choose **Selected branches and tags** and add both the
+  branch `master` and the tag rule `v*`. A rule with only `v*` blocks the
+  release from a merge to `master`. Optionally add required reviewers, so
+  each PyPI upload waits for approval.
 - `testpypi`. Leave branches unrestricted, so the workflow can be dispatched
   from any branch.
 
