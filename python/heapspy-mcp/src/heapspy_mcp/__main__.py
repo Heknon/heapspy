@@ -12,10 +12,10 @@ from .config import (
     DEFAULT_CAPTURE_TIMEOUT,
     DEFAULT_TIMEOUT,
     ENV_ALLOW,
-    ENV_ALLOW_CONTENTS,
     ENV_BIN,
     ENV_CAPTURE_TIMEOUT,
     ENV_MAX_RSS,
+    ENV_MAX_STR,
     ENV_SNAPSHOT_DIR,
     ENV_TIMEOUT,
     Config,
@@ -56,9 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--allow-contents",
-        action="store_true",
-        help=f"permit capture_contents=true (also ${ENV_ALLOW_CONTENTS}=1)",
+        "--max-str",
+        type=int,
+        metavar="N",
+        help=(
+            "default per-string cap, in characters, for capture_contents=true when the "
+            f"tool call gives no max_str (also ${ENV_MAX_STR}; default 1024)"
+        ),
     )
     p.add_argument(
         "--max-rss",
@@ -117,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             heapspy_bin=args.heapspy_bin,
             snapshot_dir=args.snapshot_dir,
             allow=args.allow,
-            allow_contents=args.allow_contents,
+            max_str=args.max_str,
             max_rss=args.max_rss,
             timeout=args.timeout,
             capture_timeout=args.capture_timeout,
@@ -137,11 +141,11 @@ def main(argv: list[str] | None = None) -> int:
             ENV_BIN,
         )
     log.info(
-        "heapspy=%s snapshot_dir=%s allow=%s allow_contents=%s max_rss=%d",
+        "heapspy=%s snapshot_dir=%s allow=%s default_max_str=%s max_rss=%d",
         config.heapspy_bin,
         config.snapshot_dir,
         config.allow or "(none: live capture disabled)",
-        config.allow_contents,
+        config.max_str,
         config.max_rss_bytes,
     )
 
