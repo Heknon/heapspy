@@ -11,7 +11,17 @@ use crate::cli::RecordArgs;
 use crate::output::{print_json, DumpSource};
 
 pub fn run(args: RecordArgs) -> anyhow::Result<()> {
-    let mut opts = RecordOptions::new(args.pid, args.duration, &args.output);
+    if let Some(image) = &args.prepare {
+        return prepare(image);
+    }
+    if let Some(image) = &args.unprepare {
+        return unprepare(image);
+    }
+    // clap guarantees these are present when neither prepare nor unprepare.
+    let pid = args.pid.expect("pid required");
+    let duration = args.duration.expect("duration required");
+    let output = args.output.clone().expect("output required");
+    let mut opts = RecordOptions::new(pid, duration, &output);
     opts.sampling = SamplingParams {
         events: args.events,
         byte_interval: args.interval,
@@ -30,14 +40,14 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
     let stats = heapspy_record::record(&opts, stop).map_err(|e| {
         anyhow::Error::from(e).context(DumpSource {
             kind: SourceKind::Pid,
-            text: format!("cannot record pid {}", args.pid),
+            text: format!("cannot record pid {pid}"),
         })
     })?;
 
     let mechanisms: Vec<&str> = stats.mechanisms.iter().map(|m| m.as_str()).collect();
     eprintln!(
         "wrote {}: {} samples, {} frames, {} code objects, {} bytes in {:.1}s via {}{}",
-        args.output.display(),
+        output.display(),
         stats.samples,
         stats.frames,
         stats.codes,
@@ -65,6 +75,52 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
     }
     if args.json {
         print_json(&report(&opts, &stats))?;
+    }
+    Ok(())
+}
+
+/// `--prepare <image>`: turn on heap tracing for an executable.
+fn prepare(image: &str) -> anyhow::Result<()> {
+    let p = heapspy_record::windows::prepare::prepare(image)?;
+    if p.already_enabled {
+        eprintln!(
+            "heap tracing was already on for {} ({})",
+            p.image, p.key_path
+        );
+    } else {
+        eprintln!("heap tracing enabled for {} ({})", p.image, p.key_path);
+    }
+    eprintln!(
+        "this is a global, persistent setting: start the target now, record with \
+         `--events native`, then undo it with `heapspy record --unprepare {}`.",
+        p.image
+    );
+    Ok(())
+}
+
+/// `--unprepare <image>`: remove the heap-tracing setting.
+fn unprepare(image: &str) -> anyhow::Result<()> {
+    let u = heapspy_record::windows::prepare::unprepare(image)?;
+    if u.key_absent {
+        eprintln!(
+            "nothing to undo for {}: no IFEO key ({})",
+            u.image, u.key_path
+        );
+    } else if u.value_removed {
+        eprintln!(
+            "heap tracing disabled for {}{}",
+            u.image,
+            if u.key_removed {
+                " (removed the key heapspy created)"
+            } else {
+                " (left other settings in the key in place)"
+            }
+        );
+    } else {
+        eprintln!(
+            "heap tracing was not on for {} (no TracingFlags value); nothing changed",
+            u.image
+        );
     }
     Ok(())
 }

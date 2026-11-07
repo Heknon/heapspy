@@ -4,7 +4,7 @@
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
-use heapspy_alloc::{EventKind, EventKinds};
+use heapspy_alloc::{sampled_weight, EventKind, EventKinds};
 #[cfg(target_os = "linux")]
 use heapspy_reader::cpython::frames::{self, RawFrame, MAX_INSTR_OFFSET};
 #[cfg(target_os = "linux")]
@@ -34,6 +34,71 @@ pub fn note_events(
         w.add_meta("heapspy.skipped_events", &v)?;
     }
     Ok(())
+}
+
+/// Decides which native heap allocations to keep. Pure, so it is tested on
+/// every platform; the Windows recorder feeds it the size of each
+/// `RtlAllocateHeap` / `RtlReAllocateHeap` event of the target.
+///
+/// Two stages, as the design asks (`docs/allocation-sampling.md`, "Native
+/// heap"):
+///
+/// 1. **Size floor.** A call for fewer than `min_size` bytes is dropped. The
+///    smallest allocations are the most frequent, and keeping their stacks
+///    would swamp the profile; the floor bounds how many samples the trap
+///    rate turns into. `min_size` 0 keeps every size.
+/// 2. **Byte-interval sampler.** Of the calls at or above the floor, one of
+///    `s` bytes is kept with probability `p = 1 - exp(-s / interval)` and
+///    weighed [`sampled_weight`] (`s / p`), the same Poisson-over-bytes
+///    sampler the eBPF large-object path uses, so the kept weights are an
+///    unbiased estimate of the bytes allocated at or above the floor.
+///    `interval` 0 keeps every call that passed the floor, weighed its size.
+#[derive(Clone, Debug)]
+pub struct NativeFilter {
+    min_size: u64,
+    interval: u64,
+    rng: u64,
+}
+
+impl NativeFilter {
+    pub fn new(min_size: u64, interval: u64, seed: u64) -> Self {
+        Self {
+            min_size,
+            interval,
+            // Never 0: xorshift is stuck at 0.
+            rng: seed | 1,
+        }
+    }
+
+    /// `Some(weight)` if this allocation of `size` bytes is kept, `None` if
+    /// the floor or the sampler dropped it.
+    pub fn keep(&mut self, size: u64) -> Option<u64> {
+        if size < self.min_size {
+            return None;
+        }
+        if self.interval == 0 {
+            return Some(size);
+        }
+        let ratio = size as f64 / self.interval as f64;
+        let p = -(-ratio).exp_m1();
+        if self.next_unit() < p {
+            Some(sampled_weight(size, self.interval))
+        } else {
+            None
+        }
+    }
+
+    /// A uniform number in `[0, 1)` from an xorshift64 generator. No crate,
+    /// no cross-sample correlation; the stream only drives sampling.
+    fn next_unit(&mut self) -> f64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        // Top 53 bits for an f64 mantissa.
+        (x >> 11) as f64 / ((1u64 << 53) as f64)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -129,4 +194,50 @@ pub fn monotonic_ns() -> u64 {
 #[cfg(target_os = "linux")]
 pub fn to_epoch(mono: u64, offset: i128) -> u64 {
     (mono as i128 + offset).clamp(0, u64::MAX as i128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_filter_floor_drops_small_calls() {
+        let mut f = NativeFilter::new(4096, 0, 1);
+        assert_eq!(f.keep(4095), None);
+        // Floor met, interval 0: kept and weighed its size.
+        assert_eq!(f.keep(4096), Some(4096));
+        assert_eq!(f.keep(1 << 20), Some(1 << 20));
+    }
+
+    #[test]
+    fn native_filter_keeps_large_relative_to_interval() {
+        let mut f = NativeFilter::new(4096, 512 << 10, 0x1234_5678);
+        // A 1 MiB request (p = 1 - e^-2 ~ 0.86) is kept almost always and
+        // weighs about its own size.
+        let mut kept = 0u64;
+        let mut sum = 0u64;
+        for _ in 0..1000 {
+            if let Some(w) = f.keep(1 << 20) {
+                kept += 1;
+                sum += w;
+            }
+        }
+        assert!((780..=940).contains(&kept), "kept {kept}/1000");
+        // The estimate of total bytes (sum of weights) is within 15% of the
+        // 1000 MiB actually requested.
+        let actual = 1000u64 * (1 << 20);
+        let err = (sum as f64 - actual as f64).abs() / actual as f64;
+        assert!(
+            err < 0.15,
+            "estimate off by {err} (sum {sum}, actual {actual})"
+        );
+    }
+
+    #[test]
+    fn native_filter_below_floor_never_sampled() {
+        let mut f = NativeFilter::new(1 << 20, 512 << 10, 7);
+        for _ in 0..10_000 {
+            assert_eq!(f.keep((1 << 20) - 1), None);
+        }
+    }
 }

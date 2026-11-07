@@ -113,6 +113,7 @@ mod guardian_sys;
 #[cfg(windows)]
 pub mod live;
 pub mod matcher;
+pub mod prepare;
 #[cfg(windows)]
 mod sys;
 
@@ -231,9 +232,9 @@ mod imp {
     use super::guardian::{self, Msg};
     use super::guardian_sys::Link;
     use super::matcher::{StackHistory, StackSample};
-    use super::sys::{Debugger, EtwAlloc, EtwSession};
+    use super::sys::{Debugger, EtwAlloc, EtwHeapAlloc, EtwSession, HeapEtwSession};
     use super::ARENA_SIZE;
-    use crate::common;
+    use crate::common::{self, NativeFilter};
     use crate::error::{Error, Result};
     use crate::recorder::{RecordContext, RunOutcome};
     use crate::session::now_ns;
@@ -241,6 +242,16 @@ mod imp {
     const SAMPLE_EVERY: Duration = Duration::from_millis(5);
     const MAX_DISTANCE_NS: u64 = 20_000_000;
     const HOLD_NS: u64 = 2_000_000_000;
+    /// Native heap events are held this long before matching, so the side
+    /// sampler's next stack can still be the nearest one.
+    const NATIVE_HOLD_NS: u64 = 50_000_000;
+    /// The side sampler runs faster on the native path than the 5 ms arena
+    /// path: a native allocation such as `malloc` + `memset` keeps its
+    /// Python frame on top for only tens of microseconds (ctypes drops the
+    /// GIL but the frame chain is unchanged), so a slower sampler almost
+    /// never catches the allocating frame. 1 ms raises the hit rate about
+    /// five-fold; the cost is heapspy's own, not the target's.
+    const NATIVE_SAMPLE_EVERY: Duration = Duration::from_millis(1);
 
     struct Exact {
         ts: u64,
@@ -252,6 +263,11 @@ mod imp {
     }
 
     pub fn run(etw: bool, debugger: bool, ctx: &mut RecordContext<'_>) -> Result<RunOutcome> {
+        // Native heap tracing is its own ETW path (the Heap provider, not the
+        // kernel VirtualAlloc session), so it has a dedicated run.
+        if ctx.opts.sampling.events.contains(EventKind::Native) {
+            return run_native(etw, debugger, ctx);
+        }
         let pid = ctx.target.pid;
         let want = ctx.opts.sampling.events;
         let mut skipped = Vec::new();
@@ -517,6 +533,162 @@ mod imp {
                 total_pause_ns: dbg_pause.as_nanos() as u64,
             },
             truncated: exited || lost > 0,
+        })
+    }
+
+    /// Record native C-heap allocations through ETW heap tracing. The target
+    /// must have been prepared (`heapspy record --prepare <image>`) before it
+    /// started, or no events arrive. The Heap provider gives the returned
+    /// pointer and the requested size but no Python stack, so a side thread
+    /// samples every Python thread's stack ([`NATIVE_SAMPLE_EVERY`]) and each
+    /// event takes the nearest sample of the same thread ([`super::matcher`]),
+    /// as the ETW arena path does; the frames are therefore approximate.
+    fn run_native(etw: bool, _debugger: bool, ctx: &mut RecordContext<'_>) -> Result<RunOutcome> {
+        let pid = ctx.target.pid;
+        let want = ctx.opts.sampling.events;
+        if !etw {
+            return Err(Error::Unsupported(
+                "native heap recording uses ETW; drop --mechanism debugger".into(),
+            ));
+        }
+        let mut skipped = Vec::new();
+        for (k, present) in [
+            (EventKind::Arena, want.contains(EventKind::Arena)),
+            (EventKind::Pool, want.contains(EventKind::Pool)),
+            (
+                EventKind::LargeObject,
+                want.contains(EventKind::LargeObject),
+            ),
+        ] {
+            if present {
+                skipped.push((k, "record native on its own (--events native)".to_string()));
+            }
+        }
+        common::note_events(
+            &mut ctx.sink,
+            EventKinds::of(&[EventKind::Native]),
+            &skipped,
+        )?;
+
+        let src = ctx.src;
+        let fo = ctx.target.offsets;
+        let rt = ctx.target.runtime.runtime_addr;
+        let max_frames = ctx.opts.sampling.max_frames as usize;
+        let min_size = ctx.opts.sampling.native_min_size as u64;
+        let interval = ctx.opts.sampling.byte_interval;
+
+        // The guardian stops the heap session if heapspy is killed. (There
+        // are no breakpoints on this path, so nothing else to restore.)
+        let link = match Link::start(pid, &guardian::log_path(&ctx.opts.output)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "heapspy: warning: no guardian ({e}); if heapspy is killed while recording, \
+                     the ETW heap session is not cleaned up"
+                );
+                None
+            }
+        };
+        let (tx, rx) = mpsc::channel::<EtwHeapAlloc>();
+        let session = HeapEtwSession::start(pid, tx)?;
+        if let Some(l) = &link {
+            l.send(&Msg::Etw(session.name.clone()));
+        }
+
+        let history = Mutex::new(StackHistory::new(HOLD_NS, MAX_DISTANCE_NS));
+        let sampling = AtomicBool::new(true);
+        let mut filter = NativeFilter::new(min_size, interval, now_ns() ^ pid as u64);
+        let mut queue: VecDeque<EtwHeapAlloc> = VecDeque::new();
+        let mut hits = 0u64;
+
+        std::thread::scope(|scope| -> Result<()> {
+            scope.spawn(|| {
+                while sampling.load(Ordering::Relaxed) {
+                    let t0 = Instant::now();
+                    if let Ok(ts) = frames::thread_states(src, &fo, rt) {
+                        for t in ts {
+                            if let Ok(st) = frames::read_stack(src, &fo, t.addr, max_frames) {
+                                let s = StackSample {
+                                    ts_ns: now_ns(),
+                                    frames: st.frames,
+                                    truncated: st.truncated,
+                                };
+                                history
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(t.native_thread_id, s);
+                            }
+                        }
+                    }
+                    std::thread::sleep(NATIVE_SAMPLE_EVERY.saturating_sub(t0.elapsed()));
+                }
+            });
+            let result = (|| -> Result<()> {
+                loop {
+                    let stop = ctx.should_stop();
+                    queue.extend(rx.try_iter());
+                    let cutoff = if stop {
+                        u64::MAX
+                    } else {
+                        now_ns().saturating_sub(NATIVE_HOLD_NS)
+                    };
+                    while queue.front().is_some_and(|e| e.ts_ns <= cutoff) {
+                        let e = queue.pop_front().unwrap();
+                        hits += 1;
+                        let Some(weight) = filter.keep(e.size) else {
+                            continue;
+                        };
+                        let mut s = SampleInput {
+                            timestamp_ns: e.ts_ns,
+                            tid: e.tid as u64,
+                            kind: EventKind::Native,
+                            address: e.addr,
+                            size: e.size,
+                            weight,
+                            native_return_address: None,
+                            flags: SampleFlags::NONE,
+                        };
+                        let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                        match h.nearest(e.tid as u64, e.ts_ns) {
+                            Some(st) => {
+                                if st.truncated {
+                                    s.flags = s.flags | SampleFlags::STACK_TRUNCATED;
+                                }
+                                let frames = st.frames.clone();
+                                drop(h);
+                                ctx.sink.add(&s, &frames, true)?;
+                            }
+                            None => {
+                                drop(h);
+                                ctx.sink.add(&s, &[], true)?;
+                            }
+                        }
+                    }
+                    if stop {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            })();
+            sampling.store(false, Ordering::Relaxed);
+            result
+        })?;
+
+        let lost = {
+            let n = session.lost;
+            drop(session);
+            n
+        };
+        Ok(RunOutcome {
+            mechanisms: Mechanisms::of(&[Mechanism::Etw]),
+            overhead: Overhead {
+                samples_taken: 0,
+                samples_dropped: lost,
+                probe_hits: hits,
+                total_pause_ns: 0,
+            },
+            truncated: lost > 0,
         })
     }
 }
