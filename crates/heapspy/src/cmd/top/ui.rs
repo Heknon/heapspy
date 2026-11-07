@@ -412,12 +412,12 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
             };
             Row::new(vec![
                 Line::from(name),
+                Line::from(Span::styled(holds, dim())),
                 Line::from(Span::styled(format_bytes(ret), bold())).right_aligned(),
                 Line::from(cell_bytes(py, Color::Cyan)).right_aligned(),
                 Line::from(cell_bytes(nat, Color::Magenta)).right_aligned(),
                 Line::from(rate_span(rate, ret.max(1))).right_aligned(),
                 Line::from(spark_span(&series, growing)),
-                Line::from(Span::styled(holds, dim())),
             ])
         })
         .collect();
@@ -425,16 +425,16 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
         f,
         tarea,
         vec![
-            "HOLDER", "RETAINED", "PYTHON", "NATIVE", "Δ/min", " TREND", "HOLDS",
+            "HOLDER", "HOLDS", "RETAINED", "PYTHON", "NATIVE", "Δ/min", " TREND",
         ],
         vec![
-            Constraint::Percentage(34),
+            Constraint::Percentage(28),
+            Constraint::Fill(1),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(11),
             Constraint::Length(11),
-            Constraint::Min(16),
         ],
         rows,
         app.selected[Tab::Holders.index()],
@@ -490,19 +490,26 @@ fn draw_objects(f: &mut Frame, app: &App, area: Rect) {
             let series = app.series(10, |p| p.types.get(&k).map(|x| x.1));
             let growing = rb.is_some_and(|x| x > 1024.0);
             let held = if w.leaked {
-                Span::styled("nothing: leaked", Style::default().fg(Color::LightRed))
+                Line::from(Span::styled(
+                    "nothing: leaked",
+                    Style::default().fg(Color::LightRed),
+                ))
             } else if w.key == INTERNALS {
-                Span::styled(
+                Line::from(Span::styled(
                     format!(
-                        "the interpreter ({}) · i expands",
+                        "interpreter · i expands · {}",
                         w.held_by.as_deref().unwrap_or("")
                     ),
                     dim(),
-                )
+                ))
             } else {
                 match &w.held_by {
-                    Some(h) => Span::raw(format!("{} {:.0}%", h, w.held_pct)),
-                    None => Span::styled("various", dim()),
+                    // The share first, so a long name is cut at its end.
+                    Some(h) => Line::from(vec![
+                        Span::styled(format!("{:>3.0}% ", w.held_pct), dim()),
+                        Span::raw(h.clone()),
+                    ]),
+                    None => Line::from(Span::styled("various", dim())),
                 }
             };
             Row::new(vec![
@@ -510,6 +517,7 @@ fn draw_objects(f: &mut Frame, app: &App, area: Rect) {
                     shorten(&w.label, name_w),
                     paint_color(w.paint),
                 )),
+                held,
                 Line::from(w.count.to_string()).right_aligned(),
                 Line::from(count_rate_span(rc)).right_aligned(),
                 Line::from(Span::styled(format_bytes(w.bytes), bold())).right_aligned(),
@@ -517,7 +525,6 @@ fn draw_objects(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(Span::styled(format_bytes(w.bytes / w.count.max(1)), dim()))
                     .right_aligned(),
                 Line::from(spark_span(&series, growing)),
-                Line::from(held),
             ])
         })
         .collect();
@@ -526,23 +533,23 @@ fn draw_objects(f: &mut Frame, app: &App, area: Rect) {
         tarea,
         vec![
             "WHAT",
+            "MOSTLY HELD BY",
             "COUNT",
             "Δ/min",
             "SIZE",
             "Δ/min",
             "EACH",
             " TREND",
-            "MOSTLY HELD BY",
         ],
         vec![
             Constraint::Length(name_w as u16),
+            Constraint::Fill(1),
             Constraint::Length(9),
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(11),
             Constraint::Length(9),
             Constraint::Length(11),
-            Constraint::Min(20),
         ],
         rows,
         app.selected[Tab::Objects.index()],

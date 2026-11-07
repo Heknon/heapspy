@@ -461,17 +461,20 @@ fn what_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         return;
     }
     out.push('\n');
-    let name_w = 34usize;
-    let held_w = w.saturating_sub(2 + name_w + 10 + 11 + 10 + 13 + 3).max(24);
+    // What, and who keeps it, side by side; the numbers after.
+    let name_w = 30usize;
+    let held_w = w
+        .saturating_sub(2 + name_w + 2 + 9 + 11 + 9 + 13)
+        .clamp(20, 48);
     let _ = writeln!(
         out,
-        "{}{}{}{}{}   {}",
-        pad_right(&st.paint(Paint::Heading, "What the memory is"), name_w + 2),
-        pad_left(&st.paint(Paint::Dim, "count"), 10),
+        "{}{}{}{}{}{}",
+        pad_right(&st.paint(Paint::Heading, "What the memory is"), name_w + 4),
+        pad_right(&st.paint(Paint::Dim, "mostly held by"), held_w),
+        pad_left(&st.paint(Paint::Dim, "count"), 9),
         pad_left(&st.paint(Paint::Dim, "size"), 11),
-        pad_left(&st.paint(Paint::Dim, "each"), 10),
+        pad_left(&st.paint(Paint::Dim, "each"), 9),
         pad_left(&st.paint(Paint::Dim, "keeps alive"), 13),
-        st.paint(Paint::Dim, "mostly held by")
     );
     let shown = rows.len().min(15);
     for x in &rows[..shown] {
@@ -480,29 +483,27 @@ fn what_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         let held = if x.leaked {
             st.paint(Paint::Leaked, "nothing: leaked")
         } else if x.key == INTERNALS {
-            st.paint(
-                Paint::Dim,
-                format!("the interpreter: {}", x.held_by.as_deref().unwrap_or("")),
-            )
+            st.paint(Paint::Dim, "the interpreter itself")
         } else {
             match &x.held_by {
+                // The share first, so a long name is cut at its end.
                 Some(h) => format!(
                     "{} {}",
-                    shorten(h, held_w.saturating_sub(6)),
-                    st.paint(Paint::Dim, format!("{:.0}%", x.held_pct))
+                    st.paint(Paint::Dim, format!("{:>3.0}%", x.held_pct)),
+                    super::style::shorten_left(h, held_w.saturating_sub(6))
                 ),
                 None => st.paint(Paint::Dim, "various"),
             }
         };
         let _ = writeln!(
             out,
-            "  {}{}{}{}{}   {}",
+            "  {}  {}{}{}{}{}",
             pad_right(&name, name_w),
-            pad_left(&x.count.to_string(), 10),
+            pad_right(&held, held_w),
+            pad_left(&x.count.to_string(), 9),
             pad_left(&st.paint(Paint::Strong, format_bytes(x.bytes)), 11),
-            pad_left(&st.paint(Paint::Dim, each), 10),
+            pad_left(&st.paint(Paint::Dim, each), 9),
             pad_left(&format_bytes(x.retained), 13),
-            held
         );
     }
     if rows.len() > shown {

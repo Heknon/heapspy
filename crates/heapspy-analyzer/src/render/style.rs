@@ -133,6 +133,17 @@ pub fn shorten(s: &str, w: usize) -> String {
     format!("{h}…{t}")
 }
 
+/// Plain `s` shortened to at most `w` characters by cutting its start, for
+/// names whose end says the most (`…events.REGISTRY.listeners`).
+pub fn shorten_left(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n <= w || w < 2 {
+        return s.to_string();
+    }
+    let t: String = s.chars().skip(n - (w - 1)).collect();
+    format!("…{t}")
+}
+
 /// A horizontal bar of `width` cells, `frac` of them filled.
 pub fn bar(frac: f64, width: usize) -> (String, String) {
     let cells = (frac.clamp(0.0, 1.0) * width as f64).round() as usize;
@@ -164,6 +175,16 @@ mod tests {
         assert_eq!(s.chars().count(), 15);
         assert!(s.starts_with("sys.mod"));
         assert!(s.ends_with("CACHE']"));
+    }
+
+    #[test]
+    fn shorten_left_keeps_the_end() {
+        assert_eq!(
+            shorten_left("app.events.REGISTRY.listeners", 20),
+            "….REGISTRY.listeners"
+        );
+        assert_eq!(shorten_left("abc", 5), "abc");
+        assert_eq!(shorten_left("abcdef", 4).chars().count(), 4);
     }
 
     #[test]
