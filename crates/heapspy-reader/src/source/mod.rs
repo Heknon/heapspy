@@ -38,6 +38,7 @@ use heapspy_snapshot::{Arch, MemoryRegion, Os, SourceKind};
 use crate::error::{Error, Result};
 
 pub mod elf_core;
+pub mod glibc_heap;
 pub mod linux_live;
 pub mod mem;
 pub mod minidump;
