@@ -117,7 +117,7 @@ use std::collections::HashSet;
 
 use heapspy_snapshot::{Arch, Os};
 
-use super::{MemorySource, NativeBlock, NativeBlockKind};
+use super::{MemorySource, NativeBlock, NativeBlockKind, NativeHeapStats};
 use crate::error::Result;
 
 /// The program's data starts this far into a chunk: past `prev_size` and
@@ -176,6 +176,19 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     src: &S,
     hints: &HeapHints,
 ) -> Result<Option<Vec<NativeBlock>>> {
+    Ok(walk_heap(src, hints)?.map(|(blocks, _)| blocks))
+}
+
+/// [`native_blocks`], and what the walk learned about the memory the
+/// allocator holds but has not handed out: free chunks (in bins, tcache and
+/// fastbins) and the top chunk of each heap. Free chunks are counted from
+/// their headers, so they include pages the kernel may not have made
+/// resident (or that `MADV_DONTNEED` returned); read the numbers as an upper
+/// bound on resident free memory.
+pub fn walk_heap<S: MemorySource + ?Sized>(
+    src: &S,
+    hints: &HeapHints,
+) -> Result<Option<(Vec<NativeBlock>, NativeHeapStats)>> {
     let t = src.target();
     if t.os != Os::Linux
         || t.pointer_size != 8
@@ -247,6 +260,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
         heaps.push(Heap {
             arena,
             first_chunk: h.first.then_some(start),
+            end: h.base + h.size,
             walk,
         });
     }
@@ -272,6 +286,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
                 heaps.push(Heap {
                     arena: 0,
                     first_chunk: Some(align_up(s, ALIGN)),
+                    end: e,
                     walk,
                 });
             }
@@ -310,6 +325,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
             heaps.push(Heap {
                 arena: 0,
                 first_chunk: Some(start),
+                end: r.end,
                 walk,
             });
         }
@@ -324,14 +340,20 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
     let mut arena_of: Vec<(u64, u32)> = Vec::new();
     let mut firsts: HashSet<u64> = HashSet::new();
     let mut tops: Vec<(u32, u64)> = Vec::new();
+    let mut stats = NativeHeapStats::default();
     for h in &heaps {
         all.extend_from_slice(&h.walk.chunks);
         arena_of.extend(h.walk.chunks.iter().map(|c| (c.addr, h.arena)));
         firsts.extend(h.first_chunk);
         if let End::Top(t) = h.walk.end {
             tops.push((h.arena, t));
+            stats.top_bytes += h.end.saturating_sub(t);
         }
     }
+    let mut arena_ids: Vec<u32> = heaps.iter().map(|h| h.arena).collect();
+    arena_ids.sort_unstable();
+    arena_ids.dedup();
+    stats.arenas = arena_ids.len() as u32;
     all.sort_unstable_by_key(|c| c.addr);
     arena_of.sort_unstable_by_key(|a| a.0);
 
@@ -368,6 +390,12 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
         }
     }
 
+    for c in &all {
+        if !c.busy || free.contains(&c.addr) {
+            stats.free_chunks += 1;
+            stats.free_bytes += c.size;
+        }
+    }
     let mut out: Vec<NativeBlock> = all
         .iter()
         .zip(&arena_of)
@@ -398,7 +426,7 @@ pub fn native_blocks<S: MemorySource + ?Sized>(
         }
         keep
     });
-    Ok(Some(out))
+    Ok(Some((out, stats)))
 }
 
 fn is_glibc(name: &str) -> bool {
@@ -522,6 +550,8 @@ impl HeapWalk {
 struct Heap {
     arena: u32,
     first_chunk: Option<u64>,
+    /// Where the heap's memory ends: the top chunk runs up to here.
+    end: u64,
     walk: HeapWalk,
 }
 

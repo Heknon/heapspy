@@ -46,6 +46,7 @@ mod imp;
 pub struct LiveProcess {
     pid: u32,
     target: TargetInfo,
+    heap_stats: std::sync::Mutex<Option<super::NativeHeapStats>>,
     #[cfg(target_os = "linux")]
     inner: imp::Inner,
 }
@@ -68,6 +69,7 @@ impl LiveProcess {
             Ok(LiveProcess {
                 pid,
                 target: inner.target(),
+                heap_stats: Default::default(),
                 inner,
             })
         }
@@ -90,6 +92,7 @@ impl LiveProcess {
             Ok(LiveProcess {
                 pid,
                 target: inner.target(),
+                heap_stats: Default::default(),
                 inner,
             })
         }
@@ -135,12 +138,18 @@ impl LiveProcess {
 #[cfg(target_os = "linux")]
 impl MemorySource for LiveProcess {
     fn native_blocks(&self) -> Result<Option<Vec<super::NativeBlock>>> {
-        super::glibc_heap::native_blocks(
+        let walked = super::glibc_heap::walk_heap(
             self,
             &super::glibc_heap::HeapHints {
                 brk: self.inner.brk_range(),
             },
-        )
+        )?;
+        let (blocks, stats) = walked.unzip();
+        *self.heap_stats.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+        Ok(blocks)
+    }
+    fn native_heap_stats(&self) -> Option<super::NativeHeapStats> {
+        *self.heap_stats.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn target(&self) -> TargetInfo {
         self.target

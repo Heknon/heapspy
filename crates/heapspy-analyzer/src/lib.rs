@@ -33,8 +33,9 @@ pub use flame::{
     MinWidth,
 };
 use report::{
-    Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryPart, MemoryTotals, Retainer,
-    RetainingPathReport, SchemaVersion, SnapshotSummary, SourceRef, Totals, TypeQueryReport,
+    Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryPart, MemoryTotals, NativeAllocator,
+    Retainer, RetainingPathReport, SchemaVersion, SizeGroup, SnapshotSummary, SourceRef, Totals,
+    TypeQueryReport,
 };
 
 /// Errors from analysis.
@@ -220,7 +221,9 @@ fn native_counts(a: &Analysis) -> NativeCounts {
 fn memory_totals(snap: &Snapshot, graph_bytes: u64, native: &NativeCounts) -> Result<MemoryTotals> {
     let rss = rss_bytes(snap)?;
     let outside = rss.map(|r| r.saturating_sub(graph_bytes));
-    let (breakdown, breakdown_basis) = memory_breakdown(snap, graph_bytes, native)?;
+    let native_allocator = native_allocator(snap)?;
+    let (breakdown, breakdown_basis) =
+        memory_breakdown(snap, graph_bytes, native, native_allocator.as_ref())?;
     Ok(MemoryTotals {
         rss_bytes: rss,
         graph_bytes,
@@ -228,7 +231,67 @@ fn memory_totals(snap: &Snapshot, graph_bytes: u64, native: &NativeCounts) -> Re
         outside_graph_pct: rss.zip(outside).map(|(r, o)| pct(o, r)),
         breakdown,
         breakdown_basis,
+        native_lost_by_size: Vec::new(),
+        native_allocator,
     })
+}
+
+/// `memory.native_allocator`, from the `native.*` meta the heap walk wrote.
+fn native_allocator(snap: &Snapshot) -> Result<Option<NativeAllocator>> {
+    let Some(free_bytes) = meta_u64(snap, "native.free_bytes")? else {
+        return Ok(None);
+    };
+    Ok(Some(NativeAllocator {
+        arenas: meta_u64(snap, "native.arenas")?.unwrap_or(0),
+        free_chunks: meta_u64(snap, "native.free_chunks")?.unwrap_or(0),
+        free_bytes,
+        top_bytes: meta_u64(snap, "native.top_bytes")?.unwrap_or(0),
+    }))
+}
+
+/// Leaked native blocks grouped by size, most bytes first, at most `top`.
+fn lost_by_size(a: &Analysis, top: usize) -> Vec<SizeGroup> {
+    let mut by: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+    for i in 0..a.snap.object_count() as u32 {
+        let o = a.snap.object(i);
+        if o.flags.contains(ObjectFlags::NATIVE) && !a.reachable(i) {
+            let e = by.entry(o.shallow_size).or_default();
+            e.0 += 1;
+            e.1 += o.shallow_size;
+        }
+    }
+    let mut v: Vec<SizeGroup> = by
+        .into_iter()
+        .map(|(size, (blocks, bytes))| SizeGroup {
+            size,
+            blocks,
+            bytes,
+        })
+        .collect();
+    v.sort_by(|x, y| y.bytes.cmp(&x.bytes).then(x.size.cmp(&y.size)));
+    v.truncate(top);
+    v
+}
+
+/// Per node, the bytes of native heap blocks in its dominator subtree.
+pub(crate) fn native_retained(a: &Analysis) -> Vec<u64> {
+    let n = a.root() as usize;
+    let mut acc = vec![0u64; n + 1];
+    for i in 0..n as u32 {
+        let o = a.snap.object(i);
+        if o.flags.contains(ObjectFlags::NATIVE) {
+            acc[i as usize] = o.shallow_size;
+        }
+    }
+    // Children come after their idom in `order`, so a reverse sweep adds
+    // every subtree into its parent before the parent is added upward.
+    for &v in a.order.iter().rev() {
+        let p = a.idom[v as usize];
+        if p != dominators::NONE && (v as usize) < acc.len() {
+            acc[p as usize] += acc[v as usize];
+        }
+    }
+    acc
 }
 
 fn meta_u64(snap: &Snapshot, key: &str) -> Result<Option<u64>> {
@@ -258,6 +321,7 @@ fn memory_breakdown(
     snap: &Snapshot,
     graph_bytes: u64,
     native_blocks: &NativeCounts,
+    allocator: Option<&NativeAllocator>,
 ) -> Result<(Vec<MemoryPart>, Option<String>)> {
     let Some(regions) = snap.memory_summary() else {
         return Ok((Vec::new(), None));
@@ -308,10 +372,14 @@ fn memory_breakdown(
         let held = native_blocks.bytes - lost;
         parts.push(part("native_heap", held));
         parts.push(part("native_lost", lost));
-        parts.push(part(
-            "native_other",
-            native.saturating_sub(native_blocks.bytes),
-        ));
+        let other = native.saturating_sub(native_blocks.bytes);
+        // Free chunks and top chunks are counted from headers, which can
+        // include pages that are not resident: never more than what is left.
+        let free = allocator.map_or(0, |f| (f.free_bytes + f.top_bytes).min(other));
+        if allocator.is_some() {
+            parts.push(part("native_free", free));
+        }
+        parts.push(part("native_other", other - free));
     } else {
         parts.push(part("native_unknown", native));
     }
@@ -361,10 +429,18 @@ pub(crate) fn analyze_with(
         native_lost_blocks: native.lost_blocks,
         native_lost_bytes: native.lost_bytes,
     };
-    let memory = memory_totals(snap, a.shallow_total - native.bytes, &native)?;
+    let mut memory = memory_totals(snap, a.shallow_total - native.bytes, &native)?;
+    if native.lost_blocks > 0 {
+        memory.native_lost_by_size = lost_by_size(a, opts.top);
+    }
 
     let mut top_retainers = Vec::new();
     let nodes = a.top_retainers(opts.top)?;
+    let native_ret = if native.blocks > 0 {
+        native_retained(a)
+    } else {
+        Vec::new()
+    };
     for (i, &v) in nodes.iter().enumerate() {
         let o = snap.object(v);
         let bytes = a.retained[v as usize];
@@ -378,6 +454,7 @@ pub(crate) fn analyze_with(
             retained_objects: a.retained_count[v as usize] as u64,
             retained_pct: pct(bytes, reachable_bytes),
             path: a.path(v)?.unwrap_or_default(),
+            native_retained_bytes: Some(native_ret.get(v as usize).copied().unwrap_or(0)),
             allocated_at: None,
             type_location,
             type_location_reason,

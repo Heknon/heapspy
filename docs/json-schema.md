@@ -349,6 +349,8 @@ address in it: label `<address>`), another block, or a `native` root.
 | `outside_graph_pct` | float, nullable | `outside_graph_bytes / rss_bytes * 100` |
 | `breakdown` | array | what the process's memory is, by kind: `{part, bytes}` (below). Empty without a memory map |
 | `breakdown_basis` | string, nullable | `resident`, or `committed` where the source does not record residency (Windows minidumps); committed can exceed RSS |
+| `native_lost_by_size` | array | leaked native blocks (nothing points to them) grouped by block size, most bytes first, at most `--top`: `{size, blocks, bytes}`, `size` including the allocator's header. Empty without a heap walk or leaks. Added in 0.3 |
+| `native_allocator` | object, nullable | what the heap walk found about memory the native allocator keeps: `{arenas, free_chunks, free_bytes, top_bytes}` (free chunks in bins, tcache and fastbins, and the heaps' top chunks, sized from their headers). `null` without a glibc heap walk. Added in 0.3 |
 
 `breakdown[].part`:
 
@@ -362,7 +364,8 @@ address in it: label `<address>`), another block, or a `native` root.
 | `python_large_objects` | Python objects too big for pymalloc, which come from `malloc` |
 | `native_heap` | native heap blocks something points to (with a heap walk) |
 | `native_lost` | native heap blocks nothing points to: leaked (with a heap walk) |
-| `native_other` | private memory outside any heap block: allocator overhead and free space, memory C code mapped itself (with a heap walk) |
+| `native_free` | free and top chunks the native allocator keeps and has not returned to the OS (with a glibc heap walk; added in 0.3). Sized from chunk headers and capped at what is left of private memory, since free pages may not be resident |
+| `native_other` | private memory outside any heap block: allocator overhead, memory C code mapped itself, and (without `native_free`) the allocator's free space (with a heap walk) |
 | `native_unknown` | all private memory C code allocated, when the heaps were not walked |
 
 Retainer (`top_retainers[]`):
@@ -377,6 +380,7 @@ Retainer (`top_retainers[]`):
 | `retained_objects` | integer | number of objects it dominates, itself included |
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
+| `native_retained_bytes` | integer, nullable | the part of `retained_bytes` that is native heap blocks (memory C code allocated, such as a numpy array's buffer) rather than Python objects. Added in 0.3; `null` in older documents |
 | `allocated_at` | AllocatedAt, nullable | added in M7: allocation stacks of the sampled objects this entry retains, see [AllocatedAt](#allocatedat); `null` without `--allocations` |
 | `type_location` | SourceLocation, nullable | where the object's type is defined ([Source locations](#source-locations)) |
 | `type_location_reason` | string, nullable | why `type_location` is `null` |

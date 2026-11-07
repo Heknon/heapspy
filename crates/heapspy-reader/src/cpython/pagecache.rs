@@ -96,6 +96,9 @@ impl MemorySource for PageCache<'_> {
         self.inner.native_blocks()
     }
 
+    fn native_heap_stats(&self) -> Option<crate::source::NativeHeapStats> {
+        self.inner.native_heap_stats()
+    }
     fn find_symbol(&self, module: &Module, name: &str) -> Result<Option<u64>> {
         self.inner.find_symbol(module, name)
     }

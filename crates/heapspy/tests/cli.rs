@@ -63,11 +63,12 @@ fn analyze_text_and_json() {
     let ps = p.to_str().unwrap();
 
     let text = ok_stdout(&["analyze", ps]);
-    assert!(text.contains("Top retainers by retained size"), "{text}");
+    assert!(text.contains("What is holding memory"), "{text}");
     assert!(
-        text.contains("builtins.dict  sys.modules['app'].__dict__['CACHE']"),
+        text.contains("sys.modules['app'].__dict__['CACHE']"),
         "{text}"
     );
+    assert!(text.contains("builtins.dict · "), "{text}");
 
     let json = ok_stdout(&["analyze", ps, "--json", "--top=1"]);
     let r: AnalyzeReport = serde_json::from_str(&json).unwrap();

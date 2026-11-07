@@ -52,7 +52,9 @@
       { "part": "python_large_objects", "bytes": 148897792 },
       { "part": "native_unknown", "bytes": 1471781273 }
     ],
-    "breakdown_basis": "resident"
+    "breakdown_basis": "resident",
+    "native_lost_by_size": [],
+    "native_allocator": null
   },
   "top_retainers": [
     {
@@ -95,6 +97,7 @@
           "source_loc_reason": null
         }
       ],
+      "native_retained_bytes": 0,
       "allocated_at": {
         "linked_objects": 60180,
         "linked_bytes": 62914560,
@@ -155,6 +158,7 @@
           "source_loc_reason": null
         }
       ],
+      "native_retained_bytes": 0,
       "allocated_at": {
         "linked_objects": 1024,
         "linked_bytes": 1048576,

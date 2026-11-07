@@ -2112,6 +2112,15 @@ impl<'a> Walker<'a> {
             self.out
                 .add_meta("pymalloc.arena_bytes", &p.arena_bytes().to_string())?;
         }
+        if let Some(h) = self.src.native_heap_stats() {
+            self.out.add_meta("native.arenas", &h.arenas.to_string())?;
+            self.out
+                .add_meta("native.free_chunks", &h.free_chunks.to_string())?;
+            self.out
+                .add_meta("native.free_bytes", &h.free_bytes.to_string())?;
+            self.out
+                .add_meta("native.top_bytes", &h.top_bytes.to_string())?;
+        }
         Ok(self.stats)
     }
 

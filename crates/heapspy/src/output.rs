@@ -7,6 +7,23 @@ use heapspy_analyzer::report::ErrorReport;
 use heapspy_snapshot::SourceKind;
 use serde::Serialize;
 
+/// How to style text on stdout for `--color`.
+pub fn style(choice: crate::cli::ColorChoice) -> heapspy_analyzer::render::Style {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    let color = match choice {
+        crate::cli::ColorChoice::Always => true,
+        crate::cli::ColorChoice::Never => false,
+        crate::cli::ColorChoice::Auto => tty && std::env::var_os("NO_COLOR").is_none(),
+    };
+    let width = if tty {
+        crossterm::terminal::size().map_or(100, |(w, _)| w as usize)
+    } else {
+        100
+    };
+    heapspy_analyzer::render::Style { color, width }
+}
+
 /// Print a report as pretty JSON on stdout.
 pub fn print_json<T: Serialize>(report: &T) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();

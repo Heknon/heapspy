@@ -175,6 +175,20 @@ pub struct NativeBlock {
     pub data_offset: u64,
 }
 
+/// What a heap walk learned about memory the native allocator holds but has
+/// not handed out. See [`MemorySource::native_heap_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeHeapStats {
+    /// Arenas (glibc) or heaps the walk found.
+    pub arenas: u32,
+    /// Free chunks inside the heaps: in bins, tcache or fastbins.
+    pub free_chunks: u64,
+    /// Their bytes.
+    pub free_bytes: u64,
+    /// Bytes of each heap's top chunk (the unused tail the heap grows into).
+    pub top_bytes: u64,
+}
+
 /// A read-only view of one process's memory. See the module docs for the
 /// rules every implementation must follow.
 pub trait MemorySource: Send + Sync {
@@ -185,6 +199,13 @@ pub trait MemorySource: Send + Sync {
     /// asked of the target.
     fn native_blocks(&self) -> Result<Option<Vec<NativeBlock>>> {
         Ok(None)
+    }
+
+    /// Free memory inside the native heaps, as learned by the last
+    /// [`MemorySource::native_blocks`] call; `None` before it, or when the
+    /// source does not walk free lists.
+    fn native_heap_stats(&self) -> Option<NativeHeapStats> {
+        None
     }
 
     /// OS, architecture, pointer size and byte order of the target.

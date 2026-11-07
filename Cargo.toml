@@ -24,7 +24,7 @@ heapspy-record = { path = "crates/heapspy-record", version = "0.2.0" }
 heapspy-analyzer = { path = "crates/heapspy-analyzer", version = "0.2.0" }
 
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
 # Only the SVG renderer: no CLI, no threads, no name-attribute files.
 inferno = { version = "0.12.8", default-features = false }
 libc = "0.2"

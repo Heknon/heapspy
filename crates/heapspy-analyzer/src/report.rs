@@ -338,6 +338,39 @@ pub struct MemoryTotals {
     /// (`"committed"`). Committed memory can be larger than RSS.
     #[serde(default)]
     pub breakdown_basis: Option<String>,
+    /// Native heap blocks nothing points to (leaked), grouped by block size,
+    /// most bytes first. At most `--top`. Empty without a heap walk.
+    #[serde(default)]
+    pub native_lost_by_size: Vec<SizeGroup>,
+    /// What the heap walk found about the native allocator's free memory.
+    /// `null` when the heaps were not walked or the walker does not read
+    /// free lists (Windows).
+    #[serde(default)]
+    pub native_allocator: Option<NativeAllocator>,
+}
+
+/// One entry of `memory.native_lost_by_size`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeGroup {
+    /// Block size in bytes, allocator header included.
+    pub size: u64,
+    pub blocks: u64,
+    pub bytes: u64,
+}
+
+/// `memory.native_allocator`: memory the native allocator holds but has not
+/// handed out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeAllocator {
+    /// Heaps or arenas found (glibc: the main arena and one per thread arena).
+    pub arenas: u64,
+    /// Free chunks in the heaps (bins, tcache, fastbins).
+    pub free_chunks: u64,
+    /// Their bytes, as the chunk headers say (may include pages that are
+    /// not resident).
+    pub free_bytes: u64,
+    /// Bytes of the heaps' top chunks: the unused tail each heap grows into.
+    pub top_bytes: u64,
 }
 
 /// One line of `memory.breakdown`.
@@ -369,6 +402,11 @@ pub struct Retainer {
     pub retained_pct: f64,
     /// Shortest retaining path from a root to this object.
     pub path: RetainingPath,
+    /// The part of `retained_bytes` that is native heap blocks (memory C
+    /// code allocated) rather than Python objects. `null` in reports
+    /// written before this field existed.
+    #[serde(default)]
+    pub native_retained_bytes: Option<u64>,
     /// Allocation stacks of the sampled objects this entry retains. `null`
     /// without `--allocations`.
     #[serde(default)]

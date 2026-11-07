@@ -93,6 +93,8 @@ pub struct ElfCore {
     missing_bytes: u64,
     /// Mapped module files, opened on first use. `None`: missing or unreadable.
     file_cache: Mutex<HashMap<usize, Option<Arc<Mmap>>>>,
+    /// Free memory found by the last heap walk.
+    heap_stats: Mutex<Option<super::NativeHeapStats>>,
 }
 
 impl std::fmt::Debug for ElfCore {
@@ -382,6 +384,7 @@ impl ElfCore {
             captured_at,
             missing_bytes,
             file_cache: Mutex::new(HashMap::new()),
+            heap_stats: Mutex::new(None),
         };
         core.modules = core.build_modules(entry);
         Ok(core)
@@ -551,7 +554,13 @@ fn parse_prstatus(desc: &[u8], arch: Arch) -> Result<ThreadInfo> {
 
 impl MemorySource for ElfCore {
     fn native_blocks(&self) -> Result<Option<Vec<NativeBlock>>> {
-        glibc_heap::native_blocks(self, &HeapHints::default())
+        let (blocks, stats) = glibc_heap::walk_heap(self, &HeapHints::default())?.unzip();
+        *self.heap_stats.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+        Ok(blocks)
+    }
+
+    fn native_heap_stats(&self) -> Option<super::NativeHeapStats> {
+        *self.heap_stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn target(&self) -> TargetInfo {
