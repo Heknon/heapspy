@@ -381,3 +381,89 @@ mod tests {
         assert!(find_in_bytes(&[], "x").is_err());
     }
 }
+
+/// The data symbols of an ELF file (C globals and statics), for naming the
+/// global a pointer was found in. Sorted by address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DataSymbols {
+    /// Lowest `PT_LOAD` virtual address, as in [`FileSymbol::load_base`].
+    pub load_base: u64,
+    /// `(vaddr, size, name)`, sorted by `vaddr`, sizes of at least 1.
+    pub symbols: Vec<(u64, u64, String)>,
+}
+
+impl DataSymbols {
+    /// The symbol covering target address `addr` of a module mapped at
+    /// `module_base`, and the offset into it.
+    pub fn lookup(&self, module_base: u64, addr: u64) -> Option<(&str, u64)> {
+        let vaddr = addr.wrapping_sub(module_base).wrapping_add(self.load_base);
+        let i = self.symbols.partition_point(|s| s.0 <= vaddr);
+        let (start, size, name) = self.symbols.get(i.checked_sub(1)?)?;
+        (vaddr < start + size).then(|| (name.as_str(), vaddr - start))
+    }
+}
+
+/// Read the data symbols (`.symtab` and `.dynsym` entries of kind data,
+/// with a size) of the ELF file at `path`. Files without a symbol table (a
+/// stripped library) give an empty list.
+pub fn data_symbols(path: &Path) -> Result<DataSymbols> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: as in `find_in_file`.
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    data_symbols_in(&map)
+}
+
+/// [`data_symbols`] on an in-memory copy of the file.
+pub fn data_symbols_in(data: &[u8]) -> Result<DataSymbols> {
+    let obj = object::File::parse(data).map_err(|e| Error::Format(e.to_string()))?;
+    let load_base = obj
+        .segments()
+        .map(|s| s.address())
+        .min()
+        .map(|a| a & !(PAGE - 1))
+        .ok_or_else(|| Error::Format("ELF file has no loadable segments".into()))?;
+    let mut symbols = Vec::new();
+    for sym in obj.symbols().chain(obj.dynamic_symbols()) {
+        if sym.kind() != object::SymbolKind::Data || sym.is_undefined() || sym.size() == 0 {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push((sym.address(), sym.size(), name.to_string()));
+    }
+    symbols.sort();
+    symbols.dedup_by(|a, b| a.0 == b.0);
+    Ok(DataSymbols { load_base, symbols })
+}
+
+#[cfg(test)]
+mod data_symbol_tests {
+    use super::*;
+
+    #[test]
+    fn lookup_finds_the_covering_global() {
+        let d = DataSymbols {
+            load_base: 0,
+            symbols: vec![
+                (0x1000, 0x100, "g_cache".into()),
+                (0x2000, 8, "g_ptr".into()),
+            ],
+        };
+        // Mapped at 0x7f0000000000.
+        let base = 0x7f00_0000_0000;
+        assert_eq!(d.lookup(base, base + 0x1010), Some(("g_cache", 0x10)));
+        assert_eq!(d.lookup(base, base + 0x2000), Some(("g_ptr", 0)));
+        assert_eq!(d.lookup(base, base + 0x1100), None);
+        assert_eq!(d.lookup(base, base + 0x0fff), None);
+    }
+
+    #[test]
+    fn reads_this_test_binarys_globals() {
+        // The test binary itself has a symbol table with data objects.
+        let exe = std::env::current_exe().unwrap();
+        let d = data_symbols(&exe).unwrap();
+        assert!(d.symbols.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+}

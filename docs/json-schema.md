@@ -455,10 +455,10 @@ KeptBy (`kept_by[]`):
 
 | field | type | meaning |
 |---|---|---|
-| `kind` | string | `holder`: in the dominator subtree of `holder`, one of the heap's 64 largest disjoint holders (as `top_retainers` picks them); `other`: reachable but under none of them; `unreachable`: nothing reaches them (leaked for `native.*`, garbage awaiting collection for Python objects) |
+| `kind` | string | `holder`: in the dominator subtree of `holder`, one of the heap's 64 largest disjoint holders (as `top_retainers` picks them); `interpreter`: held by the interpreter itself (libpython's C globals, interpreter state, code objects), all such holders together; `other`: reachable but under none of those, or under a holder with less than 1% of the type's bytes; `unreachable`: nothing reaches them (leaked for `native.*`, garbage awaiting collection for Python objects) |
 | `holder` | string, nullable | the holder's root path; `null` unless `kind` is `holder` |
 | `holder_address` | string, nullable | the holder's address |
-| `through` | string, nullable | the most common path from the holder to the instances (from a root for `other`), keys and indices generalised, the type reached after each hop: `"[<key>] app.session.Session → .payload"`. `null` for `unreachable` |
+| `through` | string, nullable | the most common path from the holder to the instances, keys and indices generalised, the type reached after each hop: `"[<key>] app.session.Session → .payload"`. A run of raw pointers through native memory is one `C memory` step; an int used as a pointer is `its value as an address`. `null` for `unreachable`, `interpreter` and `other` |
 | `through_pct` | integer, nullable | percent of sampled instances (up to 256 per group) that `through` describes |
 | `instances` | integer | instances in the group |
 | `bytes` | integer | their shallow bytes |

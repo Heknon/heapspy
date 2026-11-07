@@ -218,6 +218,13 @@ impl App {
         for g in memory_groups(&r.memory) {
             *p.groups.entry(g.key).or_default() += g.bytes;
         }
+        let interp: u64 = r
+            .top_retainers
+            .iter()
+            .filter(|x| heapspy_analyzer::is_interpreter_holder(&root_path_string(&x.path)))
+            .map(|x| x.retained_bytes)
+            .sum();
+        p.holders.insert(super::ui::INTERP_SITE.to_string(), interp);
         for x in &r.top_retainers {
             p.holders
                 .insert(root_path_string(&x.path), x.retained_bytes);

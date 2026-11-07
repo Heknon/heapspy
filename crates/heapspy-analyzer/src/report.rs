@@ -654,8 +654,11 @@ pub struct KeptBy {
     /// `"holder"`: in the dominator subtree of `holder`, one of the largest
     /// disjoint holders of the heap (as `top_retainers` lists them).
     /// `"other"`: reachable, but under none of those (held by many small
-    /// holders). `"unreachable"`: nothing reaches them (for native blocks:
-    /// leaked; for Python objects: garbage awaiting collection).
+    /// holders, or holders with less than 1% of the type's bytes).
+    /// `"interpreter"`: held by the interpreter itself (libpython's C
+    /// globals, interpreter state, code objects). `"unreachable"`: nothing
+    /// reaches them (for native blocks: leaked; for Python objects: garbage
+    /// awaiting collection).
     pub kind: String,
     /// Root path of the holder; `null` unless `kind` is `"holder"`.
     pub holder: Option<String>,

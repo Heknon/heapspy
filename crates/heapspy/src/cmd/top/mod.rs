@@ -301,6 +301,40 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
                 ui::native_rows(app)
             };
             let Some((site, r)) = rows.get(i) else { return };
+            if site == ui::INTERP_SITE {
+                let mut v = vec![
+                    "Holders that belong to the interpreter itself: libpython's C globals,"
+                        .to_string(),
+                    "interpreter state (sys.modules, caches), and code objects. Folded so the"
+                        .into(),
+                    "table shows the program's holders; one that grows gets its own row.".into(),
+                    "Press i to list them.".into(),
+                    String::new(),
+                    "# Holders".into(),
+                ];
+                if let Some(s) = &app.latest {
+                    for r in s.report.top_retainers.iter().filter(|r| {
+                        heapspy_analyzer::is_interpreter_holder(
+                            &heapspy_analyzer::root_path_string(&r.path),
+                        )
+                    }) {
+                        v.push(format!(
+                            "  {:<60} {:>10}",
+                            heapspy_analyzer::render::summary::holder_name(
+                                &heapspy_analyzer::root_path_string(&r.path)
+                            ),
+                            format_bytes(r.retained_bytes)
+                        ));
+                    }
+                }
+                app.detail = Some(Detail {
+                    id,
+                    title: site.clone(),
+                    lines: Some(Ok(v)),
+                    scroll: 0,
+                });
+                return;
+            }
             let title = if r.is_some() {
                 heapspy_analyzer::render::summary::holder_name(site)
             } else {

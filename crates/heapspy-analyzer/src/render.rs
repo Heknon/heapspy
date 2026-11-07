@@ -417,6 +417,7 @@ fn kept_by_section(out: &mut String, r: &TypeQueryReport) {
                     "nothing: leaked (no pointer to them anywhere)".to_string()
                 }
                 ("unreachable", _) => "nothing: garbage awaiting collection".to_string(),
+                ("interpreter", _) => "the interpreter itself".to_string(),
                 _ => "smaller holders".to_string(),
             };
             vec![

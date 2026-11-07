@@ -79,6 +79,14 @@ something points to and leaked blocks nothing points to. `keeps alive` is
 what the objects retain, themselves included. `mostly held by` names the
 holder that keeps most of them alive, and how much of them.
 
+Holders are named the way code names them. A pointer in a library's C
+globals is named by the global when the library has a symbol table
+(`libfoo.so: g_cache`, `python3.13: _PyRuntime`), and a chain of raw
+pointers through native memory reads as `→ C memory`. The interpreter's own
+holders (libpython's C globals, interpreter state, code objects) are one
+`the interpreter itself` entry; holders with less than 1% of a type's bytes
+are `smaller holders`.
+
 **Who holds it** lists the objects that keep the most memory alive (their
 retained size: what would be freed if they went away), split into Python
 and native bytes. Holders are named the way code names them:

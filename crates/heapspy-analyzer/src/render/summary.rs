@@ -147,7 +147,40 @@ pub fn holder_name(path: &str) -> String {
         }
         s = format!("{}.{}{}", &s[..i], key, &tail[j + 2..]);
     }
-    s
+    collapse_c_hops(&s)
+}
+
+/// A run of raw native hops (` <+16>`, ` <contents>`) is one ` → C memory`.
+fn collapse_c_hops(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    let mut in_c = false;
+    while !rest.is_empty() {
+        let hop = if rest.starts_with(" <contents>") {
+            Some(" <contents>".len())
+        } else {
+            rest.strip_prefix(" <+").and_then(|r| {
+                let end = r.find('>')?;
+                (end > 0 && r[..end].chars().all(|c| c.is_ascii_digit())).then_some(3 + end + 1)
+            })
+        };
+        match hop {
+            Some(n) => {
+                if !in_c {
+                    out.push_str(" → C memory");
+                    in_c = true;
+                }
+                rest = &rest[n..];
+            }
+            None => {
+                let c = rest.chars().next().unwrap_or(' ');
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+                in_c = false;
+            }
+        }
+    }
+    out
 }
 
 /// How a type is shown: friendly names for native heap blocks.
@@ -221,7 +254,13 @@ pub fn what_rows(r: &AnalyzeReport) -> Vec<WhatRow> {
                 count,
                 bytes,
                 retained: t.retained_bytes,
-                held_by: t.held_by.as_deref().map(holder_name),
+                held_by: t.held_by.as_deref().map(|h| {
+                    if crate::is_interpreter_holder(h) {
+                        "the interpreter".to_string()
+                    } else {
+                        holder_name(h)
+                    }
+                }),
                 held_by_rank: t.held_by_rank,
                 held_pct: t
                     .held_by_bytes
@@ -538,9 +577,14 @@ fn holders_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         return;
     }
     let what = what_rows(r);
-    for (i, x) in r.top_retainers.iter().take(10).enumerate() {
+    // The interpreter's own holders are one line at the end.
+    let (interp, program): (Vec<_>, Vec<_>) = r
+        .top_retainers
+        .iter()
+        .partition(|x| crate::is_interpreter_holder(&root_path_string(&x.path)));
+    for (i, x) in program.into_iter().take(10).enumerate() {
         let path = shorten(&holder_name(&root_path_string(&x.path)), path_w);
-        let rank = format!("{:>2}", x.rank);
+        let rank = format!("{:>2}", i + 1);
         let rank = if i < 3 {
             st.paint(Paint::Warn, rank)
         } else {
@@ -595,6 +639,22 @@ fn holders_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         if let Some(at) = &x.allocated_at {
             out.push_str(&allocated_at_lines(at, "      "));
         }
+    }
+    if !interp.is_empty() {
+        let bytes: u64 = interp.iter().map(|x| x.retained_bytes).sum();
+        let _ = writeln!(
+            out,
+            "{}",
+            st.paint(
+                Paint::Dim,
+                format!(
+                    "    + the interpreter itself: {} holders, {} (libpython's C globals, \
+                     interpreter state, code objects)",
+                    interp.len(),
+                    format_bytes(bytes)
+                )
+            )
+        );
     }
 }
 
@@ -733,6 +793,11 @@ mod tests {
             "m.D['user:1']"
         );
         assert_eq!(holder_name("python3.13 globals"), "python3.13 globals");
+        assert_eq!(
+            holder_name("python3.13: _PyRuntime <+32> <contents> <+8>"),
+            "python3.13: _PyRuntime → C memory"
+        );
+        assert_eq!(holder_name("m.X <+3x>"), "m.X <+3x>");
         assert_eq!(holder_name("x.__dict__['a b']"), "x.__dict__['a b']");
     }
 

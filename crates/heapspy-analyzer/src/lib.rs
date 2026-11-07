@@ -163,6 +163,22 @@ pub fn root_path_string(path: &[report::PathHop]) -> String {
     s
 }
 
+/// Whether a holder's root path belongs to the interpreter itself rather
+/// than the program: libpython's C globals (`python3.13: _PyRuntime`,
+/// `libpython3.12.so.1.0 globals`), interpreter state (`interp sys[...]`),
+/// and code objects (`….__code__`, `.co_consts`).
+pub fn is_interpreter_holder(path: &str) -> bool {
+    let lib = path.strip_prefix("lib").unwrap_or(path);
+    let python_lib = lib
+        .strip_prefix("python")
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        && (lib.contains(": ") || lib.contains(" globals"));
+    python_lib
+        || path.starts_with("interp ")
+        || path.contains(".__code__")
+        || path.contains(".co_consts")
+}
+
 /// `part / whole * 100`, rounded to two decimals; 0 when `whole` is 0.
 fn pct(part: u64, whole: u64) -> f64 {
     if whole == 0 {
@@ -621,6 +637,27 @@ pub fn diff(
 mod tests {
     use super::*;
     use heapspy_snapshot::SnapshotBuilder;
+
+    #[test]
+    fn interpreter_holders() {
+        for p in [
+            "python3.13: _PyRuntime",
+            "libpython3.12.so.1.0 globals",
+            "python312.dll: x",
+            "interp sys['path_importer_cache']",
+            "sys.modules['os'].__dict__['walk'].__code__",
+        ] {
+            assert!(is_interpreter_holder(p), "{p}");
+        }
+        for p in [
+            "sys.modules['app.cache'].__dict__['CACHE']",
+            "libfoo.so: g_cache",
+            "python_helpers globals",
+            "thread 12 stack",
+        ] {
+            assert!(!is_interpreter_holder(p), "{p}");
+        }
+    }
 
     #[test]
     fn summary_from_snapshot() {

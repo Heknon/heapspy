@@ -282,8 +282,62 @@ fn kept_by(a: &Analysis, inst: &[u32], top: usize) -> Result<(Vec<KeptBy>, Vec<S
         });
     }
     out.sort_by(|x, y| y.bytes.cmp(&x.bytes).then_with(|| x.holder.cmp(&y.holder)));
+    let mut out = fold_kept_by(out);
     out.truncate(top);
     Ok((out, size_groups(&all_sizes, top)))
+}
+
+/// Holders below this share of the type's bytes are folded into `other`.
+const SMALL_GROUP_PCT: u64 = 1;
+
+/// Fold the interpreter's own holders into one `interpreter` group, and
+/// holders with less than [`SMALL_GROUP_PCT`] of the bytes into `other`.
+/// The unreachable group is never folded.
+fn fold_kept_by(groups: Vec<KeptBy>) -> Vec<KeptBy> {
+    let total: u64 = groups.iter().map(|g| g.bytes).sum();
+    let mut out = Vec::new();
+    let mut interp: Option<KeptBy> = None;
+    let mut other: Option<KeptBy> = None;
+    let merge = |into: &mut Option<KeptBy>, g: KeptBy, kind: &str| {
+        let t = into.get_or_insert_with(|| KeptBy {
+            kind: kind.to_string(),
+            holder: None,
+            holder_address: None,
+            through: None,
+            through_pct: None,
+            instances: 0,
+            bytes: 0,
+            sizes: Vec::new(),
+        });
+        t.instances += g.instances;
+        t.bytes += g.bytes;
+        let mut sizes: HashMap<u64, (u64, u64)> = HashMap::new();
+        for s in t.sizes.iter().chain(g.sizes.iter()) {
+            let e = sizes.entry(s.size).or_default();
+            e.0 += s.blocks;
+            e.1 += s.bytes;
+        }
+        t.sizes = size_groups(&sizes, 3);
+    };
+    for g in groups {
+        let interpreter = g.kind == "holder"
+            && g.holder
+                .as_deref()
+                .is_some_and(crate::is_interpreter_holder);
+        if interpreter {
+            merge(&mut interp, g, "interpreter");
+        } else if g.kind == "other"
+            || (g.kind == "holder" && g.bytes * 100 < total * SMALL_GROUP_PCT)
+        {
+            merge(&mut other, g, "other");
+        } else {
+            out.push(g);
+        }
+    }
+    out.extend(interp);
+    out.extend(other);
+    out.sort_by_key(|x| std::cmp::Reverse(x.bytes));
+    out
 }
 
 /// The path from `keeper` to `v`, generalised: `[<key>] app.Session → .payload`.
@@ -296,24 +350,46 @@ fn through_path(a: &Analysis, keeper: Option<u32>, v: u32) -> Result<String> {
         .and_then(|k| chain.iter().position(|&(x, _)| x == k))
         .map_or(0, |i| i + 1);
     let mut out = String::new();
+    // Hops into native memory through raw words (`<+16>`, `<contents>`)
+    // say nothing to a reader: a run of them is one `C memory` step.
+    let mut in_c = false;
     for (i, &(x, e)) in chain.iter().enumerate().skip(start) {
+        let native = a
+            .snap
+            .object(x)
+            .flags
+            .contains(heapspy_snapshot::ObjectFlags::NATIVE);
         match a.edge_label(e) {
             Some(l) => {
                 let label = generalised_label(a.snap, l)?;
+                let raw = native && (label.starts_with("<+") || label == "<contents>");
+                if raw && in_c {
+                    continue;
+                }
                 if !out.is_empty() {
                     out.push_str(" → ");
                 }
-                out.push_str(&label);
+                if raw {
+                    out.push_str("C memory");
+                    in_c = true;
+                    continue;
+                }
+                in_c = false;
+                out.push_str(match label.as_str() {
+                    "<address>" => "its value as an address",
+                    l => l,
+                });
             }
             None => {
                 if let Some((label, _)) = a.g.root_label(a.snap, e)? {
                     out.push_str(&label);
                 }
+                in_c = false;
             }
         }
         // Name the type reached after each hop but the last (that is the
-        // queried type itself).
-        if i + 1 < chain.len() {
+        // queried type itself); native blocks are named by `C memory`.
+        if i + 1 < chain.len() && !native {
             let t = a.type_name(x);
             out.push(' ');
             out.push_str(t.strip_prefix("builtins.").unwrap_or(t));
@@ -456,4 +532,48 @@ pub fn retaining_path(
         targets,
         notes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g(kind: &str, holder: Option<&str>, bytes: u64) -> KeptBy {
+        KeptBy {
+            kind: kind.into(),
+            holder: holder.map(String::from),
+            holder_address: None,
+            through: None,
+            through_pct: None,
+            instances: 1,
+            bytes,
+            sizes: vec![SizeGroup {
+                size: bytes,
+                blocks: 1,
+                bytes,
+            }],
+        }
+    }
+
+    #[test]
+    fn interpreter_and_small_holders_fold() {
+        let out = fold_kept_by(vec![
+            g("holder", Some("sys.modules['app'].__dict__['CACHE']"), 900),
+            g("unreachable", None, 50),
+            g("holder", Some("python3.13: _PyRuntime"), 30),
+            g("holder", Some("interp sys['modules']"), 10),
+            g("holder", Some("sys.modules['app'].__dict__['TINY']"), 5),
+            g("other", None, 5),
+        ]);
+        let kinds: Vec<(&str, u64)> = out.iter().map(|k| (k.kind.as_str(), k.bytes)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("holder", 900),
+                ("unreachable", 50),
+                ("interpreter", 40),
+                ("other", 10)
+            ]
+        );
+    }
 }

@@ -18,6 +18,28 @@ use super::state::{sparkline, AllocState, App, Sort, Tab};
 use crate::live::thread_label;
 
 pub const LEAKED_SITE: &str = "(leaked native blocks)";
+/// Pseudo-holder for the interpreter's own holders, folded into one row.
+pub const INTERP_SITE: &str = "(the interpreter itself)";
+
+/// Retained and native bytes of a pseudo-holder row.
+pub fn pseudo(app: &App, site: &str) -> (u64, u64) {
+    let Some(s) = &app.latest else { return (0, 0) };
+    if site == INTERP_SITE {
+        s.report
+            .top_retainers
+            .iter()
+            .filter(|r| heapspy_analyzer::is_interpreter_holder(&root_path_string(&r.path)))
+            .fold((0, 0), |a, r| {
+                (
+                    a.0 + r.retained_bytes,
+                    a.1 + r.native_retained_bytes.unwrap_or(0).min(r.retained_bytes),
+                )
+            })
+    } else {
+        let l = s.report.totals.native_lost_bytes;
+        (l, l)
+    }
+}
 
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
@@ -326,12 +348,24 @@ pub fn holder_rows(app: &App) -> Vec<(String, Option<&Retainer>)> {
     let Some(s) = &app.latest else {
         return Vec::new();
     };
-    let mut v: Vec<(String, Option<&Retainer>, u64)> = s
-        .report
-        .top_retainers
-        .iter()
-        .map(|r| (root_path_string(&r.path), Some(r), r.retained_bytes))
-        .collect();
+    let mut v: Vec<(String, Option<&Retainer>, u64)> = Vec::new();
+    let mut folded = false;
+    for r in &s.report.top_retainers {
+        let site = root_path_string(&r.path);
+        // The interpreter's own holders are one row, unless asked for or
+        // growing.
+        if !app.show_internals
+            && heapspy_analyzer::is_interpreter_holder(&site)
+            && holder_rate(app, &site).is_none_or(|x| x <= 1024.0)
+        {
+            folded = true;
+            continue;
+        }
+        v.push((site, Some(r), r.retained_bytes));
+    }
+    if folded {
+        v.push((INTERP_SITE.to_string(), None, pseudo(app, INTERP_SITE).0));
+    }
     let leaked = s.report.totals.native_lost_bytes;
     if leaked > 0 {
         v.push((LEAKED_SITE.to_string(), None, leaked));
@@ -350,6 +384,8 @@ fn holder_value(site: &str) -> impl Fn(&super::state::SnapPoint) -> Option<u64> 
     move |p| {
         if site == LEAKED_SITE {
             Some(p.leaked)
+        } else if site == INTERP_SITE {
+            p.holders.get(INTERP_SITE).copied()
         } else {
             p.holders.get(site).copied()
         }
@@ -376,19 +412,15 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
                     r.retained_bytes,
                     r.native_retained_bytes.unwrap_or(0).min(r.retained_bytes),
                 ),
-                None => {
-                    let l = app
-                        .latest
-                        .as_ref()
-                        .map_or(0, |s| s.report.totals.native_lost_bytes);
-                    (l, l)
-                }
+                None => pseudo(app, site),
             };
             let py = ret - nat;
             let rate = holder_rate(app, site);
             let growing = rate.is_some_and(|x| x > 1024.0);
             let series = app.series(10, holder_value(site));
-            let name = if r.is_none() {
+            let name = if site == INTERP_SITE {
+                Span::styled(site.clone(), dim())
+            } else if r.is_none() {
                 Span::styled(site.clone(), Style::default().fg(Color::LightRed))
             } else {
                 Span::raw(holder_name(site))
@@ -401,6 +433,9 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
                     .map(|w| format!("{} {}", w.label, format_bytes(w.bytes)))
                     .collect::<Vec<_>>()
                     .join(", "),
+                None if site == INTERP_SITE => {
+                    "libpython's C globals, interpreter state, code · i expands".into()
+                }
                 None => "malloc blocks nothing points to".into(),
             };
             let cell_bytes = |b: u64, c: Color| {
@@ -577,14 +612,12 @@ pub fn native_rows(app: &App) -> Vec<(String, Option<&Retainer>)> {
         .into_iter()
         .filter(|(_, r)| r.is_none_or(|r| r.native_retained_bytes.unwrap_or(0) > 0))
         .collect();
-    let nat = |r: &Option<&Retainer>| match r {
+    let nat = |site: &str, r: &Option<&Retainer>| match r {
         Some(r) => r.native_retained_bytes.unwrap_or(0),
-        None => app
-            .latest
-            .as_ref()
-            .map_or(0, |s| s.report.totals.native_lost_bytes),
+        None => pseudo(app, site).1,
     };
-    v.sort_by_key(|b| std::cmp::Reverse(nat(&b.1)));
+    v.retain(|(site, r)| nat(site, r) > 0);
+    v.sort_by_key(|b| std::cmp::Reverse(nat(&b.0, &b.1)));
     v
 }
 
@@ -661,7 +694,7 @@ fn draw_native(f: &mut Frame, app: &App, area: Rect) {
         .map(|(site, r)| {
             let nat = match r {
                 Some(r) => r.native_retained_bytes.unwrap_or(0),
-                None => t.native_lost_bytes,
+                None => pseudo(app, &site).1,
             };
             let rate = holder_rate(app, &site);
             let series = app.series(12, holder_value(&site));
