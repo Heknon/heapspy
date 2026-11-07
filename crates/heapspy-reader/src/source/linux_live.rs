@@ -46,6 +46,7 @@ mod imp;
 pub struct LiveProcess {
     pid: u32,
     target: TargetInfo,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     heap_stats: std::sync::Mutex<Option<super::NativeHeapStats>>,
     #[cfg(target_os = "linux")]
     inner: imp::Inner,

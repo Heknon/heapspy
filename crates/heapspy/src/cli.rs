@@ -60,7 +60,13 @@ not. Run `heapspy <command> --help` for details, or see docs/cli.md.";
 )]
 pub struct Cli {
     /// When to color text output.
-    #[arg(long, value_name = "WHEN", default_value = "auto", global = true)]
+    #[arg(
+        long,
+        value_name = "WHEN",
+        default_value = "auto",
+        global = true,
+        display_order = 900
+    )]
     pub color: ColorChoice,
     #[command(subcommand)]
     pub command: Command,
@@ -71,7 +77,9 @@ pub struct Cli {
 pub enum ColorChoice {
     /// Color when writing to a terminal and NO_COLOR is not set.
     Auto,
+    /// Always color, also when piped.
     Always,
+    /// Never color.
     Never,
 }
 
@@ -99,7 +107,8 @@ pub enum Command {
             s           change the sort column    Esc     close details\n  \
             d           take a snapshot now       w       save the latest snapshot to a file\n  \
             a           start/stop allocation sampling (needs eBPF on Linux)\n  \
-            space       pause refreshing          q       quit\n\n\
+            space       pause refreshing          ?       help on the screen\n  \
+            q / Esc     quit\n\n\
             \x1b[1;4mExamples\x1b[0m\n  \
             sudo heapspy top --pid 1234\n  \
             sudo heapspy top --pid 1234 --every 60s           # a large heap: walk less often\n  \
@@ -299,26 +308,35 @@ pub struct TopArgs {
     /// How often to take a full snapshot (holders, types, native blocks):
     /// 10s, 1m, ... The memory totals and thread stacks refresh every second
     /// regardless.
-    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = parse_duration)]
+    #[arg(long, value_name = "DURATION", default_value = "10s", value_parser = parse_duration,
+          help_heading = "Snapshots")]
     pub every: Duration,
     /// Do not stop the process for snapshots. The walk then races with the
     /// process, so counts and sizes are approximate and a walk can fail.
-    #[arg(long)]
+    #[arg(long, help_heading = "Snapshots")]
     pub no_stop: bool,
-    /// Skip a scheduled snapshot when the last one stopped the process for
-    /// longer than this (the header says so). `d` still takes one.
-    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    /// Stop taking scheduled snapshots while the last one stopped the
+    /// process for longer than this (the status line says so). `d` still
+    /// takes one.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration, help_heading = "Snapshots")]
     pub max_pause: Option<Duration>,
     /// Start allocation sampling (as `heapspy record`) right away, for
-    /// --alloc-for. `a` toggles it too.
-    #[arg(long)]
+    /// --alloc-for. The `a` key starts and stops it too. Linux: eBPF only
+    /// (root, or CAP_BPF and CAP_PERFMON); Windows: ETW.
+    #[arg(long, help_heading = "Allocation sampling")]
     pub alloc: bool,
     /// How long allocation sampling runs before it stops by itself.
-    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = parse_duration)]
+    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = parse_duration,
+          help_heading = "Allocation sampling")]
     pub alloc_for: Duration,
     /// Allocation events to sample: arena, large, pool, native (see
     /// `heapspy record --help`).
-    #[arg(long, value_name = "KINDS", default_value = "arena,large")]
+    #[arg(
+        long,
+        value_name = "KINDS",
+        default_value = "arena,large",
+        help_heading = "Allocation sampling"
+    )]
     pub alloc_events: heapspy_alloc::EventKinds,
     /// Rows per table.
     #[arg(long, value_name = "N", default_value_t = 50)]

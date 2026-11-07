@@ -368,7 +368,7 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
                 v.push(format!(
                     "  {}  {}{}",
                     f.function,
-                    f.location,
+                    short_location(f),
                     if f.approximate { "  ~approximate" } else { "" }
                 ));
             }
@@ -491,7 +491,7 @@ fn holder_detail(
                 s.linked_objects
             ));
             for f in s.frames.iter().take(6) {
-                v.push(format!("      {}  {}", f.function, f.location));
+                v.push(format!("      {}  {}", f.function, short_location(f)));
             }
         }
     }
@@ -501,4 +501,17 @@ fn holder_detail(
         r.address
     ));
     v
+}
+
+/// `app/cache.py:10` for a sampled frame.
+fn short_location(f: &heapspy_analyzer::report::StackFrame) -> String {
+    let file = f
+        .file
+        .as_deref()
+        .map(live::short_file)
+        .unwrap_or_else(|| "?".into());
+    match f.line {
+        Some(l) => format!("{file}:{l}"),
+        None => file,
+    }
 }

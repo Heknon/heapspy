@@ -263,11 +263,20 @@ fn apply_diff(round: &mut Round, d: &DiffReport, prev: Option<&Round>) {
             round.leaked_bytes as i64 - p.leaked_bytes as i64,
         );
     }
-    let best = d
+    // The largest grower; among sites within 10% of it, the outermost one
+    // (`CACHE` rather than `CACHE[<str len=12>]`).
+    let max = d
         .by_site
         .iter()
         .filter(|s| !is_namespace(&s.site))
-        .max_by_key(|s| s.delta_retained_bytes);
+        .map(|s| s.delta_retained_bytes)
+        .max()
+        .unwrap_or(0);
+    let best = d
+        .by_site
+        .iter()
+        .filter(|s| !is_namespace(&s.site) && s.delta_retained_bytes * 10 >= max * 9)
+        .min_by_key(|s| s.site.len());
     let leaked = round.deltas.get(LEAKED).copied().unwrap_or(0);
     match best {
         Some(s) if s.delta_retained_bytes > 0 && s.delta_retained_bytes >= leaked => {
@@ -462,6 +471,16 @@ fn summary(
         }
         holders.sort_by_key(|y| std::cmp::Reverse(y.delta_retained_bytes));
     }
+    // Leave out holders whose change is noise next to the largest one.
+    let biggest = holders
+        .iter()
+        .map(|h| h.delta_retained_bytes.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    holders.retain(|h| {
+        let d = h.delta_retained_bytes.unsigned_abs();
+        d >= 4096 && d * 100 >= biggest
+    });
     let mut holders = outermost(holders);
     holders.truncate(args.top);
     if args.json {
@@ -499,7 +518,7 @@ fn summary(
                     rounds.len()
                 )
             ),
-            56
+            64
         ),
         pad_left(&st.paint(Paint::Dim, "Δ retained"), 12),
         pad_left(&st.paint(Paint::Dim, "per minute"), 16),
@@ -529,7 +548,7 @@ fn summary(
         };
         println!(
             "  {}{}{}   {}",
-            pad_right(&st.paint(Paint::Strong, shorten(&h.site, 52)), 54),
+            pad_right(&st.paint(Paint::Strong, shorten(&h.site, 60)), 62),
             pad_left(&delta_cell(h.delta_retained_bytes, st), 12),
             pad_left(
                 &format!("{}/min", format_delta_bytes(h.bytes_per_min.round() as i64)),

@@ -406,3 +406,91 @@ fn python313_locations() {
 fn python314_locations() {
     run_locations(14);
 }
+
+/// `analyze --pid`, `watch` and `dump --no-stop` against a live process.
+fn run_live_commands(minor: u8) {
+    let py = python(minor);
+    let dir = tempfile::tempdir().unwrap();
+    let v = start_victim(&py, dir.path());
+    let pid = v.pid.to_string();
+
+    let r: AnalyzeReport = json_of(&["analyze", "--pid", &pid, "--json"]);
+    assert!(
+        r.snapshot.path.starts_with(&format!("pid {pid}")),
+        "{}",
+        r.snapshot.path
+    );
+    let top = &r.top_retainers[0];
+    assert!(
+        crate_path(top).ends_with("['CACHE']"),
+        "{}",
+        crate_path(top)
+    );
+    assert!(top.native_retained_bytes.is_some());
+
+    let keep = dir.path().join("kept.hpy");
+    let out = heapspy(&["analyze", "--pid", &pid, "--keep", keep.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("What is holding memory"), "{text}");
+    assert!(text.contains("Threads"), "{text}");
+    assert!(keep.exists());
+
+    let wdir = dir.path().join("w");
+    let out = heapspy(&[
+        "watch",
+        "--pid",
+        &pid,
+        "--every",
+        "500ms",
+        "--rounds",
+        "3",
+        "--dir",
+        wdir.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Growth over"), "{text}");
+    assert!(wdir.join("first.hpy").exists() && wdir.join("last.hpy").exists());
+    assert!(!wdir.join(".next.hpy").exists());
+
+    let approx = dir.path().join("approx.hpy");
+    let out = heapspy(&[
+        "dump",
+        "--pid",
+        &pid,
+        "--no-stop",
+        "-o",
+        approx.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    check_analyze(&approx);
+}
+
+fn crate_path(r: &heapspy_analyzer::report::Retainer) -> String {
+    heapspy_analyzer::root_path_string(&r.path)
+}
+
+#[test]
+#[ignore = "needs ptrace and /usr/bin/python3.12"]
+fn python312_live_commands() {
+    run_live_commands(12);
+}
+
+#[test]
+#[ignore = "needs ptrace and /usr/local/bin/python3.13"]
+fn python313_live_commands() {
+    run_live_commands(13);
+}

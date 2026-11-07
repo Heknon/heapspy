@@ -4,7 +4,7 @@ Read the object graph of a running Python process from the outside, and find out
 
 py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
 
-> **Status: early development.** `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query`, `diff` and `flamegraph` work on them. `heapspy record` samples allocation stacks on Linux. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). An end-to-end suite ([tests/e2e](tests/e2e/README.md)) checks on Linux that known leaks in real 3.12 to 3.14 processes are found, by `--pid` and from `gcore` cores. The MCP server is in [python/heapspy-mcp](python/heapspy-mcp/README.md). Nothing is published on PyPI yet, and the Windows code paths have only been compile-checked, not run on Windows.
+> **Status: early development.** `heapspy top`, `watch` and `analyze --pid` look at a live process ([docs/cli.md](docs/cli.md)). `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query`, `diff` and `flamegraph` work on them. `heapspy record` samples allocation stacks on Linux. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). An end-to-end suite ([tests/e2e](tests/e2e/README.md)) checks on Linux that known leaks in real 3.12 to 3.14 processes are found, by `--pid` and from `gcore` cores. The MCP server is in [python/heapspy-mcp](python/heapspy-mcp/README.md). Nothing is published on PyPI yet, and the Windows code paths have only been compile-checked, not run on Windows.
 
 ## What it answers, and what it doesn't
 
@@ -32,6 +32,38 @@ Everything else reads the snapshot file. You can re-analyze without re-dumping, 
 
 ## Planned usage
 
+### Look at a running process
+
+```sh
+sudo heapspy top --pid 1234                 # live view; Enter on a row for details
+sudo heapspy analyze --pid 1234             # one readable report, right now
+sudo heapspy watch --pid 1234 --every 30s   # is it growing, and what?
+```
+
+`top` splits the process's memory into Python objects, native memory in use,
+leaked native blocks (nothing points to them), free memory malloc keeps, and
+code/files/stacks, with a growth rate for each, and lists what holds it,
+Python and native together. Memory totals and thread stacks refresh every
+second without stopping the process; the split and the holders come from a
+snapshot taken every `--every` (10 s by default), which stops the process
+briefly unless `--no-stop`. `a` (or `--alloc`) samples allocations so the
+Allocated tab can say which code allocated what is still alive.
+
+![heapspy top on a process with a growing cache, a buffer list and a native leak](docs/images/top.png)
+
+`analyze --pid` prints the same as one report, with what each thread is
+running; `watch` prints one line per snapshot and, at the end, each holder's
+growth with a verdict (likely leak, keep watching, fine). Every command, its
+options and what it costs the process are in [docs/cli.md](docs/cli.md).
+
+<details><summary>analyze --pid and watch output</summary>
+
+![heapspy analyze --pid](docs/images/analyze-pid.png)
+
+![heapspy watch](docs/images/watch.png)
+
+</details>
+
 ### Capture a snapshot
 
 ```sh
@@ -55,18 +87,21 @@ heapspy dump --pid 1234 --capture-contents --max-str 128 -o app.hpy
 heapspy analyze app.hpy
 ```
 
-Example output (illustrative):
+Example output (abridged; the full report also lists the biggest types, leaked native blocks by size and allocator free space):
 
 ```
-Top retainers by retained size
+Where the 1.91 GiB of resident memory is
+  ■ Python objects       448.0 MiB  23%   pymalloc 82.0 MiB · larger objects from malloc 366.0 MiB
+  ■ Native, in use       905.0 MiB  46%   malloc'd blocks something still points to
+  ■ Native, leaked       118.0 MiB   6%   malloc'd blocks nothing points to
+  ■ Allocator free       298.0 MiB  15%   freed by C code, kept by malloc in 16 arenas, not returned to the OS
+  ■ Code, files, stacks  118.0 MiB   6%   libraries 74.0 MiB · mapped files 38.0 MiB · thread stacks 6.0 MiB
 
-  retained   shallow   type                  root path
-  412.6 MiB  36.9 MiB  builtins.dict         sys.modules['app.cache'].__dict__['CACHE']
-   18.2 MiB   1.1 KiB  app.events.Registry   sys.modules['app.events'].__dict__['REGISTRY']
-    4.0 MiB  12.0 KiB  builtins.list         frame worker:run -> local 'pending'
-
-Python graph accounts for 448 MiB of 1.9 GiB RSS. The rest is outside the
-object graph (native allocations, C extensions, untracked objects).
+What is holding memory                                     retained    python    native   share
+ 1  sys.modules['app.features'].__dict__['EMBEDDINGS']    614.3 MiB   2.1 MiB 612.2 MiB   44.1%
+      builtins.list · 825 objects
+ 2  sys.modules['app.cache'].__dict__['CACHE']            412.6 MiB 412.6 MiB         0   29.6%
+      builtins.dict · 301236 objects
 ```
 
 ### Drill into a type or object
@@ -303,6 +338,7 @@ The end-to-end tests run heapspy against fixture processes with known leaks (an 
 | `docs/alloc-format.md` | byte-level specification of `.hpya` files |
 | `docs/allocation-sampling.md` | M7 design: allocation sampling from outside the process |
 | `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
+| `docs/cli.md` | every command, its output, and what it costs the target |
 | `python/heapspy-mcp` | the `heapspy-mcp` MCP server (Python) |
 | `docs/releasing.md` | how to cut a release and the one-time PyPI setup |
 | `pyproject.toml` | maturin config that packages the `heapspy` binary as a PyPI wheel |
