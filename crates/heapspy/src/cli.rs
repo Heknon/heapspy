@@ -163,7 +163,10 @@ pub struct RecordArgs {
     /// Take a snapshot right after recording stops.
     #[arg(long, value_name = "SNAP")]
     pub then_dump: Option<PathBuf>,
-    /// auto, ebpf, ptrace (Linux), etw, debugger (Windows).
+    /// auto, ebpf, ptrace (Linux), etw, debugger (Windows). On Windows,
+    /// auto is etw; debugger (exact stacks) stops the target's threads at
+    /// every breakpoint, for most of the window, and is used only when
+    /// asked for.
     #[arg(long, value_name = "MECH", default_value = "auto")]
     pub mechanism: heapspy_record::MechanismChoice,
     /// Print a JSON report (schema version 1) on stdout. The summary lines

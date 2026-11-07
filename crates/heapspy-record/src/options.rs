@@ -18,8 +18,8 @@ pub const MAX_FRAMES_LIMIT: u32 = 1024;
 /// `--mechanism`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MechanismChoice {
-    /// Linux: eBPF, falling back to ptrace. Windows: ETW plus debugger
-    /// breakpoints.
+    /// Linux: eBPF, falling back to ptrace. Windows: ETW alone (the
+    /// debugger pauses the target, so it runs only when asked for).
     #[default]
     Auto,
     /// Only this mechanism. On Windows, `etw` alone gives approximate

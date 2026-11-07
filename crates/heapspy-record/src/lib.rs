@@ -16,7 +16,7 @@
 //! | non-stopping reader of a running process | [`live`] | done |
 //! | Linux eBPF recorder: arenas, large objects | [`linux_ebpf`] | done |
 //! | Linux ptrace fallback: arenas | [`linux_ptrace`] | done |
-//! | Windows ETW + debugger recorder | [`windows`] | done, untested on Windows |
+//! | Windows ETW + debugger recorder | [`windows`] | done, tested on `windows-latest`; a guardian cleans up after a killed recorder |
 //!
 //! # Flow
 //!
