@@ -33,7 +33,8 @@ class Interpreter:
 _PROBE = (
     "import json, sys, sysconfig;"
     "print(json.dumps([list(sys.version_info[:3]),"
-    " bool(sysconfig.get_config_var('Py_GIL_DISABLED')), hasattr(sys, 'gettotalrefcount')]))"
+    " bool(sysconfig.get_config_var('Py_GIL_DISABLED')), hasattr(sys, 'gettotalrefcount'),"
+    " sys.prefix != sys.base_prefix and getattr(sys, '_base_executable', None)]))"
 )
 
 
@@ -43,7 +44,15 @@ def _probe(label: str | None, path: str) -> Interpreter:
     )
     if out.returncode != 0:
         raise pytest.UsageError(f"cannot run interpreter {path}: {out.stderr.strip()}")
-    (major, minor, micro), free_threaded, debug = json.loads(out.stdout)
+    (major, minor, micro), free_threaded, debug, base = json.loads(out.stdout)
+    # A Windows venv's Scripts\python.exe is a launcher: it loads no
+    # python3XY.dll and runs the base interpreter as a child process, so
+    # `dump --pid` of the victim's pid would find no _PyRuntime. Run the base
+    # interpreter instead. Inside `uv run`, `uv python find` returns the
+    # suite's own .venv when its version matches, so this is the common case.
+    # (On Linux the venv's python is a symlink to the real one.)
+    if harness.IS_WINDOWS and base:
+        path = base
     if (major, minor) < (3, 12) or free_threaded or debug:
         raise pytest.UsageError(
             f"{path} is CPython {major}.{minor}.{micro}"
