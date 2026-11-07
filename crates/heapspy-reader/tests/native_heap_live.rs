@@ -156,6 +156,18 @@ fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
                     .filter(|r| r.file.is_none() && r.perms.read && r.perms.write && r.size > (16 << 20))
                     .map(|r| format!("{:#x}+{:#x}", r.start, r.size))
                     .collect();
+                let mut hdr = [0u8; 16];
+                let hdr = src.read(*p - 16, &mut hdr).map(|()| {
+                    (
+                        u64::from_le_bytes(hdr[..8].try_into().unwrap()),
+                        u64::from_le_bytes(hdr[8..].try_into().unwrap()),
+                    )
+                });
+                let mut page = vec![0u8; 4096];
+                let page = src.read((*p - 16) & !4095, &mut page).map(|()| "ok");
+                let mut wide = vec![0u8; 64 << 10];
+                let wide = src.read((*p - 16) & !0xffff, &mut wide).map(|()| "ok");
+                eprintln!("header at p-16: {hdr:x?}; its page: {page:?}; its 64K block: {wide:?}");
                 panic!(
                     "{what}: {kind} malloc({size}) at {p:#x} is in no block\n\
                      blocks near: {blocks:#x?}\nmaps near: {maps:#?}\nstack pointers: {sps:?}\n\
