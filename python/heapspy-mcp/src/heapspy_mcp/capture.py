@@ -12,14 +12,12 @@ import psutil
 
 from . import summarize as S
 from .cli import HeapspyCLI, HeapspyError
-from .config import Config
+from .config import MAX_STR_LIMIT, Config
 from .processes import describe_cmdline, matches_allowlist
 from .snapshots import SnapshotStore
 from .summarize import human_bytes
 
 log = logging.getLogger("heapspy_mcp.capture")
-
-MAX_STR_LIMIT = 4096
 
 
 class CaptureRefused(Exception):
@@ -143,13 +141,8 @@ def capture_snapshot(
         raise CaptureRefused("invalid_argument", "max_str only applies with capture_contents=true")
     if max_str is not None and not 1 <= max_str <= MAX_STR_LIMIT:
         raise CaptureRefused("invalid_argument", f"max_str must be between 1 and {MAX_STR_LIMIT}")
-    if capture_contents and not config.allow_contents:
-        raise CaptureRefused(
-            "contents_not_allowed",
-            "capture_contents=true needs the server to be started with --allow-contents "
-            "(or HEAPSPY_MCP_ALLOW_CONTENTS=1). String contents often hold credentials and user "
-            "data. Capture without contents instead.",
-        )
+    if capture_contents and max_str is None:
+        max_str = config.max_str
 
     target: dict[str, Any]
     core = minidump = None
@@ -232,6 +225,7 @@ def capture_snapshot(
         "target": target,
         "python_version": result.python_version,
         "contents_captured": capture_contents,
+        "max_str": max_str if capture_contents else None,
         "stats": stats,
         "notes": S.notes(list(result.notes)),
         # "json": the dump report; "stderr_line": an older heapspy without

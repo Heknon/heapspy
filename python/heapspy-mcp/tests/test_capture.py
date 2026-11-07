@@ -73,23 +73,53 @@ async def test_refuses_over_rss_guard(call, child_python, argv_log) -> None:
     assert argv_log() == []
 
 
-async def test_refuses_contents_without_server_permission(call, child_python, argv_log):
-    err, out = await call(
-        "capture_snapshot",
-        {"pid": child_python.pid, "confirm": True, "capture_contents": True},
-        allow=[f"pid:{child_python.pid}"],
-    )
-    assert err and out["error"]["reason"] == "contents_not_allowed"
-    assert "--allow-contents" in out["error"]["message"]
-    assert argv_log() == []
-
-
-async def test_refuses_contents_for_core_too(call, core_file) -> None:
+async def test_contents_use_server_default_max_str(call, core_file, argv_log) -> None:
     err, out = await call(
         "capture_snapshot",
         {"core_path": str(core_file), "confirm": True, "capture_contents": True},
     )
-    assert err and out["error"]["reason"] == "contents_not_allowed"
+    assert not err, out
+    assert out["contents_captured"] is True
+    assert out["max_str"] == 1024
+    assert "--max-str=1024" in argv_log()[-1]
+
+
+async def test_contents_default_max_str_is_configurable(call, core_file, argv_log) -> None:
+    err, out = await call(
+        "capture_snapshot",
+        {"core_path": str(core_file), "confirm": True, "capture_contents": True},
+        max_str=8192,
+    )
+    assert not err, out
+    assert "--max-str=8192" in argv_log()[-1]
+
+
+async def test_call_can_raise_max_str_past_default(call, core_file, argv_log) -> None:
+    err, out = await call(
+        "capture_snapshot",
+        {
+            "core_path": str(core_file),
+            "confirm": True,
+            "capture_contents": True,
+            "max_str": 1024 * 1024,
+        },
+    )
+    assert not err, out
+    assert out["max_str"] == 1024 * 1024
+    assert f"--max-str={1024 * 1024}" in argv_log()[-1]
+
+
+async def test_refuses_max_str_above_limit(call, core_file) -> None:
+    err, out = await call(
+        "capture_snapshot",
+        {
+            "core_path": str(core_file),
+            "confirm": True,
+            "capture_contents": True,
+            "max_str": 1024 * 1024 + 1,
+        },
+    )
+    assert err and out["error"]["reason"] == "invalid_argument"
 
 
 @pytest.mark.parametrize(
@@ -173,15 +203,12 @@ async def test_live_capture_allowed_by_name_pattern(call, child_python) -> None:
     assert out["target"]["allowlist_entry"] == "*time.sleep(120)*"
 
 
-async def test_contents_capture_when_permitted_is_logged(
-    call, child_python, argv_log, caplog
-) -> None:
+async def test_contents_capture_is_logged(call, child_python, argv_log, caplog) -> None:
     caplog.set_level(logging.INFO, logger="heapspy_mcp")
     err, out = await call(
         "capture_snapshot",
         {"pid": child_python.pid, "confirm": True, "capture_contents": True, "max_str": 64},
         allow=[f"pid:{child_python.pid}"],
-        allow_contents=True,
     )
     assert not err, out
     assert out["contents_captured"] is True
