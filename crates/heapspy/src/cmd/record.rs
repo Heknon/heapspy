@@ -16,6 +16,7 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         events: args.events,
         byte_interval: args.interval,
         max_frames: args.max_frames,
+        native_min_size: args.native_min_size.min(u32::MAX as u64) as u32,
     };
     opts.then_dump = args.then_dump;
     opts.mechanism = args.mechanism;

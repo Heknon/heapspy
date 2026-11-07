@@ -391,6 +391,7 @@ impl Profile {
                 events: EventKinds(rd_u32(b, H_EVENTS)),
                 byte_interval: rd_u64(b, H_BYTE_INTERVAL),
                 max_frames: rd_u32(b, H_MAX_FRAMES),
+                native_min_size: rd_u32(b, H_NATIVE_MIN_SIZE),
             },
             overhead: Overhead {
                 samples_taken: rd_u64(b, H_SAMPLES_TAKEN),

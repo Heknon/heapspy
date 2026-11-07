@@ -88,7 +88,7 @@ table.
 | 40 | 8 | `end_ns` | when recording stopped |
 | 48 | 8 | `byte_interval` | mean bytes between kept large-object samples; 0 = every event kept |
 | 56 | 4 | `max_frames` | most Python frames recorded per sample |
-| 60 | 4 | reserved | |
+| 60 | 4 | `native_min_size` | smallest native heap allocation sampled (`native` events); 0 = no floor, and every file written before this field existed reads as 0 |
 | 64 | 8 | `samples_taken` | samples that reached the writer (normally the samples count) |
 | 72 | 8 | `samples_dropped` | samples lost before the writer: ring buffer full, stack unreadable, rate limit |
 | 80 | 8 | `probe_hits` | times a probe fired, including events the byte sampler skipped |
@@ -278,8 +278,17 @@ object of a fixture source compiled by CPython 3.12, 3.13 and 3.14
 | 1 | `arena` | a pymalloc arena was mapped (`mmap` / `VirtualAlloc`, 1 MiB on 3.10+) |
 | 2 | `pool` | pymalloc carved a new 16 KiB pool out of an arena |
 | 3 | `large_object` | an allocation above pymalloc's small-object threshold (512 bytes) went to the system allocator |
+| 4 | `native` | a call to the C heap (`RtlAllocateHeap` / `RtlReAllocateHeap`), from any caller; `address` is the pointer the call returned (inside the block, after the header), `size` the requested bytes |
 
-Codes 4-255 are reserved; a reader decodes them as `Unknown(code)`.
+Codes 5-255 are reserved; a reader decodes them as `Unknown(code)`.
+
+`large_object` and `native` describe one allocation each and are sampled by
+byte interval. The difference is `address`: a `large_object` sample's
+`address` is the block start, so the object is linked when its start and
+size match; a `native` sample's `address` is the pointer *inside* the block
+that the allocator returned, so the object is linked when its range contains
+that pointer (see `docs/allocation-sampling.md`, "Native samples: by
+containment").
 
 Sample `flags`:
 
@@ -290,11 +299,13 @@ Sample `flags`:
 | 2 | `NO_THREAD_STATE` | the allocating thread had no Python thread state (a native thread); no frames |
 
 `weight`: arena and pool events are never sub-sampled and weigh their
-`size`. Large objects are sampled by byte interval: the recorder keeps an
-allocation of `s` bytes with probability `p = 1 - exp(-s / byte_interval)`
-and weighs it `s / p` (`heapspy_alloc::sampled_weight`), so the sum of
-weights estimates the bytes allocated. With `byte_interval` 0 every event
-is kept and weighs its size.
+`size`. Large objects and native heap calls are sampled by byte interval:
+the recorder keeps an allocation of `s` bytes with probability
+`p = 1 - exp(-s / byte_interval)` and weighs it `s / p`
+(`heapspy_alloc::sampled_weight`), so the sum of weights estimates the bytes
+allocated. With `byte_interval` 0 every event is kept and weighs its size.
+Native calls below `native_min_size` are not sampled at all, so native
+weights estimate only the bytes of calls at or above the floor.
 
 Invariants, checked on open:
 

@@ -15,6 +15,7 @@ fn sample_builder() -> ProfileBuilder {
             events: EventKinds::of(&[EventKind::Arena, EventKind::LargeObject]),
             byte_interval: 1 << 20,
             max_frames: 32,
+            native_min_size: 8192,
         };
         i.overhead = Overhead {
             samples_taken: 5,
@@ -83,6 +84,7 @@ fn check(p: &Profile) {
     );
     assert_eq!(i.sampling.byte_interval, 1 << 20);
     assert_eq!(i.sampling.max_frames, 32);
+    assert_eq!(i.sampling.native_min_size, 8192);
     assert!(i.sampling.events.contains(EventKind::LargeObject));
     assert!(!i.sampling.events.contains(EventKind::Pool));
     assert_eq!(i.overhead.samples_dropped, 2);
@@ -187,6 +189,50 @@ fn round_trip_file_mmap() {
     assert_eq!(stats.codes, 4);
     assert_eq!(stats.bytes_written, std::fs::metadata(&path).unwrap().len());
     check(&Profile::open(&path).unwrap());
+}
+
+/// Native heap samples: kind code 4, the returned pointer and the requested
+/// size, a byte-sampler weight, the native caller, and the size floor in
+/// the header.
+#[test]
+fn native_samples_round_trip() {
+    let mut b = ProfileBuilder::new();
+    b.info_mut().os = Os::Windows;
+    b.info_mut().mechanisms = Mechanisms::of(&[Mechanism::Debugger]);
+    b.info_mut().sampling.events = EventKinds::of(&[EventKind::Native]);
+    b.info_mut().sampling.native_min_size = 4096;
+    let pin = b.code_with_lines(0x7f00_1000, "pin_buffer", "shop/native.py", 7, &[(16, 8)]);
+    b.sample(EventKind::Native, 0x2a0_0000_1040, 1 << 20)
+        .weight(sampled_weight(1 << 20, 512 << 10))
+        .native_return(0x7ffa_1234_5678)
+        .frame(pin, 4);
+    let bytes = b.to_bytes().unwrap();
+    // The kind byte of the one sample record is 4.
+    let samples = section_entry(&bytes, SK_SAMPLES);
+    let off = u64::from_le_bytes(bytes[samples + 8..samples + 16].try_into().unwrap()) as usize;
+    assert_eq!(bytes[off + RECORD_SECTION_HEADER_LEN + 60], 4);
+
+    let p = Profile::from_bytes(bytes.clone()).unwrap();
+    assert_eq!(p.info().sampling.native_min_size, 4096);
+    assert_eq!(
+        p.info().sampling.events.iter().collect::<Vec<_>>(),
+        [EventKind::Native]
+    );
+    let s = p.sample(0).unwrap();
+    assert_eq!(s.kind, EventKind::Native);
+    assert!(s.kind.is_byte_sampled());
+    assert_eq!(s.kind.as_str(), "native");
+    assert_eq!(s.range(), 0x2a0_0000_1040..0x2a0_0010_1040);
+    assert_eq!(s.weight, sampled_weight(1 << 20, 512 << 10));
+    assert_eq!(s.native_return_address, Some(0x7ffa_1234_5678));
+    let st: Vec<String> = p.stack(&s).map(|f| f.to_string()).collect();
+    assert_eq!(st, ["pin_buffer (shop/native.py:8)"]);
+
+    // A file written before the field existed has zeros there: no floor.
+    let mut old = bytes;
+    old[H_NATIVE_MIN_SIZE..H_NATIVE_MIN_SIZE + 4].copy_from_slice(&[0; 4]);
+    let p = Profile::from_bytes(old).unwrap();
+    assert_eq!(p.info().sampling.native_min_size, 0);
 }
 
 fn writer_flow(spill: Option<&std::path::Path>) -> Vec<u8> {

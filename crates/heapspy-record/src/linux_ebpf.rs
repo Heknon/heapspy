@@ -290,6 +290,12 @@ mod imp {
                 "pool carving is inlined in every supported build".to_string(),
             ));
         }
+        if want.contains(EventKind::Native) {
+            skipped.push((
+                EventKind::Native,
+                "native heap tracing is a Windows (ETW) mechanism".to_string(),
+            ));
+        }
         let arenas = want.contains(EventKind::Arena);
         let mut large = want.contains(EventKind::LargeObject);
         let mut large_sites_found = Vec::new();

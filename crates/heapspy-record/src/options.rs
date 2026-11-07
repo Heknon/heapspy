@@ -107,7 +107,7 @@ impl RecordOptions {
         if let Some(k) = s.events.iter().find(|k| {
             !matches!(
                 k,
-                EventKind::Arena | EventKind::Pool | EventKind::LargeObject
+                EventKind::Arena | EventKind::Pool | EventKind::LargeObject | EventKind::Native
             )
         }) {
             return bad(format!("event kind {k} cannot be recorded"));

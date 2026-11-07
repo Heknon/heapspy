@@ -151,12 +151,19 @@ pub struct RecordArgs {
     /// Output allocation profile (.hpya).
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: PathBuf,
-    /// Events to sample, comma-separated: arena, pool, large.
+    /// Events to sample, comma-separated: arena, pool, large, native.
+    /// `native` traces the C heap (Windows only) and needs the target
+    /// prepared before it starts (`--prepare`).
     #[arg(long, value_name = "KINDS", default_value = "arena,large")]
     pub events: heapspy_alloc::EventKinds,
-    /// Mean bytes between large-object samples (512K, 1M; 0 keeps every one).
+    /// Mean bytes between large-object and native samples (512K, 1M; 0 keeps
+    /// every one).
     #[arg(long, value_name = "BYTES", default_value = "512K", value_parser = heapspy_record::parse_bytes)]
     pub interval: u64,
+    /// Smallest native heap allocation sampled (`--events native`): smaller
+    /// requests are ignored so the trap rate stays bounded. Default 4K.
+    #[arg(long, value_name = "BYTES", default_value = "4K", value_parser = heapspy_record::parse_bytes)]
+    pub native_min_size: u64,
     /// Most Python frames kept per sample.
     #[arg(long, value_name = "N", default_value_t = heapspy_alloc::DEFAULT_MAX_FRAMES)]
     pub max_frames: u32,
