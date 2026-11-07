@@ -23,12 +23,13 @@ The workflow in `.github/workflows/ci.yml` runs only when asked:
 |---|---|
 | PR label `ci` | fmt, clippy and `cargo test --workspace` on ubuntu-latest |
 | PR label `ci:windows` | `cargo test --workspace` on windows-latest |
-| tag push matching `v*` | both jobs |
+| every release (called by `release.yml`) | both jobs |
 | manual dispatch (Actions tab) | both jobs |
 
 Once a label is on a PR, later pushes to that PR run the labelled jobs again.
-Remove the label to stop that. Pushes to `master` do not run CI. Changes that
-touch only Markdown files or `docs/` do not trigger a PR run.
+Remove the label to stop that. Pushes to `master` run CI only when they
+release a new version. Changes that touch only Markdown files or `docs/` do
+not trigger a PR run.
 
 End-to-end tests (`.github/workflows/e2e.yml`) run heapspy against real
 CPython processes on Linux and Windows, for Python 3.12, 3.13 and 3.14:
@@ -36,7 +37,7 @@ CPython processes on Linux and Windows, for Python 3.12, 3.13 and 3.14:
 | Trigger | What runs |
 |---|---|
 | PR label `ci:e2e` | the Linux and Windows e2e matrices |
-| tag push matching `v*` | both |
+| every release (called by `release.yml`) | both |
 | manual dispatch (Actions tab) | both; `mcp_ref` also smoke-tests heapspy-mcp from that ref |
 
 Run them locally before adding the label (Linux, needs ptrace permission and
@@ -57,7 +58,7 @@ CPython 3.12, 3.13 and 3.14 processes through every mechanism:
 | Trigger | What runs |
 |---|---|
 | PR label `ci:record` | Linux (eBPF, ptrace, as root) and Windows (ETW, debugger) |
-| tag push matching `v*` | both |
+| every release (called by `release.yml`) | both |
 | manual dispatch (Actions tab) | both, or one with `side: linux` or `side: windows` |
 
 On Linux the job prints what the runner's kernel supports
@@ -96,16 +97,18 @@ Close xperf, WPR and Process Monitor first: the ETW tests need the
 ### Release workflow
 
 `.github/workflows/release.yml` builds the PyPI wheels and sdists and
-publishes them. It also runs only when asked:
+publishes them. Releasing is a version bump merged to `master`:
 
 | Trigger | What runs |
 |---|---|
-| tag push matching `v*` | version check, all builds, publish to PyPI, GitHub release |
-| manual dispatch, `publish: none` | version check and all builds; artifacts on the run page |
+| push to `master`, version already tagged | only the `gate` job, which stops |
+| push to `master`, version not tagged yet | CI, E2E, Record, version check, all builds, publish to PyPI, tag `vX.Y.Z`, GitHub release |
+| tag push matching `v*` | the same, for the tagged commit |
+| manual dispatch, `publish: none` | CI, E2E, Record, version check and all builds; artifacts on the run page |
 | manual dispatch, `publish: testpypi` | the same, then upload to TestPyPI |
 
-It has no PR or branch push triggers. A tag push runs both this workflow and
-`ci.yml`. See [docs/releasing.md](docs/releasing.md) for the release steps.
+It has no PR triggers. See [docs/releasing.md](docs/releasing.md) for the
+release steps.
 
 ## Commits
 

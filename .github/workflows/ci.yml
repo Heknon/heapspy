@@ -2,13 +2,13 @@
 #
 #   - Label a PR `ci` to run fmt, clippy and tests on Linux.
 #   - Label a PR `ci:windows` to run the tests on Windows.
-#   - Tag pushes (v*) and manual dispatch run both jobs.
+#   - Every release (release.yml) and manual dispatch run both jobs.
 name: CI
 
 on:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
+  # release.yml runs this on every release commit, before publishing.
+  workflow_call:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     paths-ignore:
@@ -16,8 +16,11 @@ on:
       - "docs/**"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A literal prefix, not github.workflow: when release.yml calls this file,
+  # github.workflow is "Release" for every called workflow, and they would
+  # cancel each other. Only superseded pull-request runs are cancelled.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,15 +1,30 @@
 # Builds and publishes a release. See docs/releasing.md.
 #
-#   - Pushing a tag v* builds everything, publishes heapspy and heapspy-mcp
-#     to PyPI, then creates a GitHub release with the binaries attached.
-#   - Manual dispatch builds everything. With `publish: testpypi` it also
-#     uploads to TestPyPI. It never publishes to PyPI or creates a release.
+# Releasing is a version bump. Raise `[workspace.package] version` in
+# Cargo.toml (and python/heapspy-mcp's version to match), merge to master,
+# and the release runs itself:
 #
-# There are no pull_request or branch push triggers on purpose.
+#   1. gate: a push to master whose version has no vX.Y.Z tag yet is a
+#      release. Any other push to master stops here.
+#   2. ci.yml, e2e.yml and record.yml run on the release commit
+#      (workflow_call), so nothing is published that they would refuse.
+#   3. heapspy wheels, sdist, binaries and heapspy-mcp are built.
+#   4. both packages are published to PyPI with trusted publishing. The job
+#      runs in the `pypi` environment, which records a GitHub deployment.
+#   5. the commit is tagged vX.Y.Z and the GitHub release is created with the
+#      binaries and SHA256SUMS.
+#
+# Pushing a tag vX.Y.Z by hand still works and goes through the same steps.
+# Manual dispatch builds everything; with `publish: testpypi` it also uploads
+# to TestPyPI. It never publishes to PyPI or creates a release.
+#
+# The tag is pushed with this workflow's own token, which does not start other
+# workflows, so tagging does not run the tests a second time.
 name: Release
 
 on:
   push:
+    branches: [master]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -21,9 +36,10 @@ on:
           - testpypi
         default: none
 
+# Two merges in quick succession release one after the other, never at once,
+# and a run that may be halfway through publishing is never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # Never cancel a run that may be halfway through publishing.
+  group: release
   cancel-in-progress: false
 
 permissions: {}
@@ -32,8 +48,72 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: anything to release?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.gate.outputs.release }}
+      version: ${{ steps.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Is the Cargo.toml version tagged yet?
+        id: gate
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          version=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A tag push or a manual dispatch builds by definition.
+          if [ "$EVENT" != push ] || [ "$REF_TYPE" = tag ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git ls-remote --exit-code origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already released and this push does not bump the version: nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version has no tag yet: releasing it."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  ci:
+    name: CI
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  e2e:
+    name: E2E
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e.yml
+    with:
+      mcp_ref: ${{ github.sha }}
+
+  record:
+    name: Record
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/record.yml
+
   check-version:
     name: check versions
+    needs: [gate, ci, e2e, record]
+    if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -55,6 +135,18 @@ jobs:
           else
             python scripts/check-version.py
           fi
+      - name: An existing tag for this version must be on this commit
+        shell: bash
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Checked here, before the publish that PyPI will not let us undo.
+          at=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | awk 'END {print $1}')
+          if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+            echo "::error::v$VERSION is already on $at, not on the commit this run would publish ($GITHUB_SHA)"
+            exit 1
+          fi
       - name: Look for python/heapspy-mcp
         id: mcp
         run: |
@@ -67,7 +159,7 @@ jobs:
 
   wheels:
     name: wheel (${{ matrix.target }})
-    needs: check-version
+    needs: [gate, check-version]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -114,11 +206,13 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
-          if [ "$REF_TYPE" = "tag" ]; then
-            name="heapspy-$REF_NAME-$TARGET"
+          # Releases (tag pushes and version bumps on master) name the binary
+          # after the version; dispatch builds are dev builds.
+          if [ "$EVENT" = "push" ]; then
+            name="heapspy-v$VERSION-$TARGET"
           else
             name="heapspy-dev-${GITHUB_SHA::7}-$TARGET"
           fi
@@ -183,13 +277,14 @@ jobs:
 
   publish-pypi:
     name: publish to PyPI
-    needs: [check-version, wheels, sdist, mcp]
+    needs: [gate, check-version, wheels, sdist, mcp]
     # `mcp` may be skipped, which would skip this job too without the
-    # explicit result checks. Only tag pushes publish.
+    # explicit result checks. Only release pushes publish: a version bump
+    # merged to master, or a tag pushed by hand.
     if: >-
       !cancelled() &&
       github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/tags/v') &&
+      needs.gate.outputs.release == 'true' &&
       needs.check-version.result == 'success' &&
       needs.wheels.result == 'success' &&
       needs.sdist.result == 'success' &&
@@ -270,20 +365,41 @@ jobs:
           skip-existing: true
 
   github-release:
-    name: GitHub release
-    needs: [wheels, publish-pypi]
-    # Runs after PyPI accepted the upload, so a failed publish leaves no
-    # release behind.
+    name: tag and GitHub release
+    needs: [gate, wheels, publish-pypi]
+    # Runs after PyPI accepted the upload, so a failed publish leaves no tag
+    # and no release behind.
     if: >-
       !cancelled() &&
       github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/tags/v') &&
       needs.publish-pypi.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Tag the published commit
+        shell: bash
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          at=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | awk 'END {print $1}')
+          if [ -n "$at" ]; then
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::$tag is already on $at, not on the commit this run published ($GITHUB_SHA)"
+              exit 1
+            fi
+            echo "$tag already exists on this commit (tag-push path)"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "heapspy $VERSION"
+            git push origin "$tag"
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           pattern: binary-*
@@ -296,6 +412,8 @@ jobs:
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true

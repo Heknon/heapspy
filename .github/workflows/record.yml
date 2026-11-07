@@ -3,7 +3,7 @@
 # only. See CONTRIBUTING.md.
 #
 #   - Label a PR `ci:record` to run both jobs.
-#   - Tag pushes (v*) run both.
+#   - Every release (release.yml) runs both.
 #   - Manual dispatch runs both, or one side with `side: linux|windows`.
 #
 # Linux runs the ignored tests that need root (record_live, cpython_live,
@@ -21,8 +21,8 @@ on:
         type: choice
         options: [both, linux, windows]
         default: both
-  push:
-    tags: ["v*"]
+  # release.yml runs this on every release commit, before publishing.
+  workflow_call:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     paths-ignore:
@@ -30,8 +30,10 @@ on:
       - "docs/**"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.side || 'both' }}
-  cancel-in-progress: true
+  # A literal prefix, not github.workflow: under workflow_call that is the
+  # caller's name. Only superseded pull-request runs are cancelled.
+  group: record-${{ github.ref }}-${{ inputs.side || 'both' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
