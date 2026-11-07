@@ -42,6 +42,31 @@
 //! `approximate` flags keep their schema meaning (frames matched to events
 //! by time).
 //!
+//! # Native samples: by containment
+//!
+//! A native heap sample is different: its `address` is the pointer the
+//! allocator *returned*, which lies **inside** the block, after the
+//! allocator's header (and, for a large block, at a randomised offset). The
+//! snapshot object for a native block has that block's start as its address
+//! and the block's size as its shallow size, so the returned pointer falls
+//! in `(object.addr, object.addr + object.shallow_size)`, not at the start.
+//! The object-address sweep above, which asks whether the object's *start*
+//! is in a sample's range, therefore never links a native block, and native
+//! samples are left out of that sweep ([`Join::new`] gives them an empty
+//! range). This keeps every arena, pool, large-object and Python link
+//! byte-for-byte as it was.
+//!
+//! [`native_link`] then runs a second pass. For each native sample whose
+//! timestamp is in the window, in time order, it finds the snapshot object
+//! whose range contains the returned pointer and whose range also contains
+//! the whole requested block (`object.addr <= address` and
+//! `address + size <= object.addr + object.shallow_size`,
+//! [`native_contains`]). That object is linked to the sample, unless it is
+//! already linked by the sweep above (an exact large-object match or an
+//! arena/pool link is kept). A later native sample over the same object
+//! supersedes an earlier native one, as for the sweep. A native link is the
+//! object's own allocation, so it is exact.
+//!
 //! A large-object sample never shadows a legitimate arena link. Blocks from
 //! the system allocator (the `brk` heap, or their own `mmap`) and pymalloc
 //! arenas (1 MiB `mmap`s) do not overlap while both are mapped. A sample
@@ -164,11 +189,12 @@ pub fn sampled_note() -> Note {
     note(
         "allocations_sampled",
         "Allocation stacks cover only allocations made while recording, and only the sampled \
-         events (arena, pool, large object); objects allocated before recording started have no \
-         stack. Links through arena and pool samples are approximate: they name the most recent \
-         growth event that created the memory, not necessarily the call that allocated the \
-         object. Links through large-object samples are exact: the object starts where the \
-         sampled allocation starts and has its size."
+         events (arena, pool, large object, native heap); objects allocated before recording \
+         started have no stack. Links through arena and pool samples are approximate: they name \
+         the most recent growth event that created the memory, not necessarily the call that \
+         allocated the object. Links through large-object samples are exact: the object starts \
+         where the sampled allocation starts and has its size. Links through native heap samples \
+         are exact: the object's block contains the pointer the allocator returned."
             .to_string(),
     )
 }
@@ -232,6 +258,55 @@ pub fn matches_large_object(obj: &Object, address: u64, size: u64) -> bool {
     let s = obj.shallow_size;
     let below = obj.flags.contains(ObjectFlags::IS_TYPE) || size.saturating_add(SIZE_SLACK) >= s;
     below && size <= s.saturating_add(SIZE_SLACK)
+}
+
+/// Whether the block `[address, address + size)` the allocator returned
+/// fits entirely inside `obj`'s range `[obj.addr, obj.addr + shallow_size)`.
+/// A native sample's `address` is the returned pointer (inside the block,
+/// after the header) and `size` the requested bytes, so a native block is
+/// the object this is true of. Requiring the whole requested range to fit,
+/// not just the pointer, rejects a smaller object whose memory was reused
+/// by a later, unsampled allocation.
+pub fn native_contains(obj: &Object, address: u64, size: u64) -> bool {
+    obj.addr <= address && address.saturating_add(size) <= obj.addr.saturating_add(obj.shallow_size)
+}
+
+/// Link reachable-or-not objects to native heap samples by containment (see
+/// the module docs). `link` is the per-object link from the address sweep;
+/// native samples were excluded from it, so every object they match is
+/// either unlinked or linked by an earlier native sample. `obj_addr` gives
+/// an object's address; objects are in address order. Only samples before
+/// `cutoff` are used.
+fn native_link(snap: &Snapshot, profile: &Profile, link: &mut [u32], cutoff: u64) {
+    let n = snap.object_count();
+    if n == 0 {
+        return;
+    }
+    // Objects are stored in address order, so a binary search finds the
+    // last object starting at or before the returned pointer.
+    let obj_addrs: Vec<u64> = (0..n as u32).map(|i| snap.object_addr(i)).collect();
+    // Which objects this pass already filled, so a later native sample may
+    // supersede an earlier native one but never an arena/pool/large link.
+    let mut by_native = vec![false; n];
+    for (i, s) in profile.samples().enumerate() {
+        if s.kind != EventKind::Native || s.timestamp_ns >= cutoff {
+            continue;
+        }
+        // The last object with addr <= returned pointer.
+        let pos = obj_addrs.partition_point(|&a| a <= s.address);
+        if pos == 0 {
+            continue;
+        }
+        let v = pos - 1;
+        let obj = snap.object(v as u32);
+        if !native_contains(&obj, s.address, s.size) {
+            continue;
+        }
+        if link[v] == NO_LINK || by_native[v] {
+            link[v] = i as u32;
+            by_native[v] = true;
+        }
+    }
 }
 
 /// The note added when the profile does not line up with the snapshot and
@@ -305,7 +380,8 @@ const EV_OTHER: u8 = 1 << 0;
 const EV_ARENA: u8 = 1 << 1;
 const EV_POOL: u8 = 1 << 2;
 const EV_LARGE: u8 = 1 << 3;
-const EV_UNKNOWN: u8 = 1 << 4;
+const EV_NATIVE: u8 = 1 << 4;
+const EV_UNKNOWN: u8 = 1 << 5;
 
 fn event_bit(k: EventKind) -> u8 {
     match k {
@@ -313,6 +389,7 @@ fn event_bit(k: EventKind) -> u8 {
         EventKind::Arena => EV_ARENA,
         EventKind::Pool => EV_POOL,
         EventKind::LargeObject => EV_LARGE,
+        EventKind::Native => EV_NATIVE,
         EventKind::Unknown(_) => EV_UNKNOWN,
     }
 }
@@ -322,6 +399,7 @@ fn event_names(mask: u8) -> Vec<String> {
     let mut v: Vec<String> = [
         (EV_ARENA, "arena"),
         (EV_LARGE, "large_object"),
+        (EV_NATIVE, "native"),
         (EV_OTHER, "other"),
         (EV_POOL, "pool"),
         (EV_UNKNOWN, "unknown"),
@@ -438,7 +516,9 @@ impl Stacks {
                 *slot |= a;
             }
             estimated = estimated.saturating_add(s.weight);
-            let exact = if s.kind == EventKind::LargeObject {
+            // Large-object and native samples each describe one allocation,
+            // so a link through them is the object's own allocation: exact.
+            let exact = if s.kind.is_byte_sampled() {
                 EXACT_BIT
             } else {
                 0
@@ -542,7 +622,10 @@ impl<'a, 's> Join<'a, 's> {
             let ranges: Vec<(u64, u64)> = profile
                 .samples()
                 .map(|s| {
-                    if s.timestamp_ns < cutoff {
+                    // Native samples link by containment of the returned
+                    // pointer in an object, not of the object's start in a
+                    // range, so they take no part in this sweep.
+                    if s.timestamp_ns < cutoff && s.kind != EventKind::Native {
                         (s.address, s.address.saturating_add(s.size))
                     } else {
                         (0, 0)
@@ -566,6 +649,8 @@ impl<'a, 's> Join<'a, 's> {
                     }
                 }
             }
+            // Native heap samples link by containment, as a second pass.
+            native_link(snap, profile, &mut link, cutoff);
             link
         } else {
             notes.push(not_linked_note());
@@ -989,9 +1074,114 @@ mod tests {
     #[test]
     fn event_names_are_sorted() {
         assert_eq!(
-            event_names(EV_POOL | EV_ARENA | EV_LARGE),
-            ["arena", "large_object", "pool"]
+            event_names(EV_POOL | EV_ARENA | EV_LARGE | EV_NATIVE),
+            ["arena", "large_object", "native", "pool"]
         );
         assert!(event_names(0).is_empty());
+    }
+
+    #[test]
+    fn native_contains_checks_the_whole_block() {
+        let obj = |addr, size| {
+            let mut b = SnapshotBuilder::new();
+            let t = b.ty("builtins", "bytes");
+            b.object(addr, t, size).untracked();
+            let s = b.build().unwrap();
+            s.object(0)
+        };
+        // Block [0x10000, 0x11000); the allocator returned 0x10040.
+        let block = obj(0x1_0000, 0x1000);
+        assert!(native_contains(&block, 0x1_0040, 0xf00));
+        // The pointer is inside but the requested range runs past the block:
+        // a smaller object whose memory was reused.
+        assert!(!native_contains(&block, 0x1_0040, 0x1000));
+        // Pointer before the block.
+        assert!(!native_contains(&block, 0x0_ffff, 8));
+        // Exactly the block (header offset 0, full size).
+        assert!(native_contains(&block, 0x1_0000, 0x1000));
+    }
+
+    /// A profile of only native samples, each `(timestamp_ns, returned
+    /// pointer, requested size)`, with a header that matches [`snap`].
+    fn native_profile(samples: &[(u64, u64, u64)]) -> Profile {
+        let mut b = ProfileBuilder::new();
+        b.info_mut().pid = 42;
+        b.info_mut().python = PythonVersion::new(3, 12, 0);
+        b.info_mut().start_ns = 100 * NS_PER_S;
+        b.info_mut().sampling.events = heapspy_alloc::EventKinds::of(&[EventKind::Native]);
+        b.info_mut().sampling.native_min_size = 4096;
+        let code = b.code_with_lines(0x7f00_9000, "pin_buffer", "shop/native.py", 7, &[(16, 8)]);
+        for &(ts, addr, size) in samples {
+            b.sample(EventKind::Native, addr, size)
+                .at(ts)
+                .native_return(0x7ffa_0000_1000)
+                .frame(code, 0);
+        }
+        b.build().unwrap()
+    }
+
+    /// A snapshot (pid 42, captured_at 200) with each object
+    /// `(addr, shallow_size)`, untracked bytes blocks in address order.
+    fn blocks(objs: &[(u64, u64)]) -> Snapshot {
+        let mut b = SnapshotBuilder::new();
+        b.info_mut().source.reference = "42".into();
+        b.info_mut().captured_at = 200;
+        let bytes = b.ty("builtins", "bytes");
+        for &(addr, size) in objs {
+            b.object(addr, bytes, size).untracked();
+        }
+        b.build().unwrap()
+    }
+
+    #[test]
+    fn native_links_block_that_contains_the_returned_pointer() {
+        let snap = blocks(&[(0x1_0000, 0x1000), (0x2_0000, 1 << 20)]);
+        // One native sample: a 1 MiB request whose pointer is 64 bytes into
+        // the big block.
+        let p = native_profile(&[(100 * NS_PER_S, 0x2_0040, (1 << 20) - 0x40)]);
+        let links = object_links(&snap, &p).unwrap();
+        // Object 0 (the small block) is not linked; object 1 (the big block)
+        // links to sample 0.
+        assert_eq!(links, [NO_LINK, 0]);
+    }
+
+    #[test]
+    fn native_does_not_link_a_block_the_request_overruns() {
+        let snap = blocks(&[(0x1_0000, 0x1000)]);
+        // The pointer is inside, but the request runs past the block end:
+        // reused memory, not this allocation.
+        let p = native_profile(&[(100 * NS_PER_S, 0x1_0040, 0x1000)]);
+        assert_eq!(object_links(&snap, &p).unwrap(), [NO_LINK]);
+    }
+
+    #[test]
+    fn latest_native_sample_over_a_block_wins() {
+        let snap = blocks(&[(0x2_0000, 1 << 20)]);
+        let p = native_profile(&[
+            (100 * NS_PER_S, 0x2_0040, 0x1000),
+            (101 * NS_PER_S, 0x2_0080, 0x2000),
+        ]);
+        // Both contain the block's pointer; the later sample (index 1) wins.
+        assert_eq!(object_links(&snap, &p).unwrap(), [1]);
+    }
+
+    #[test]
+    fn native_samples_after_the_snapshot_do_not_link() {
+        let snap = blocks(&[(0x2_0000, 1 << 20)]);
+        // captured_at is 200 s; a sample at 250 s is past the window.
+        let p = native_profile(&[(250 * NS_PER_S, 0x2_0040, 0x1000)]);
+        assert_eq!(object_links(&snap, &p).unwrap(), [NO_LINK]);
+    }
+
+    #[test]
+    fn native_link_is_counted_exact() {
+        let snap = blocks(&[(0x2_0000, 1 << 20)]);
+        let p = native_profile(&[(100 * NS_PER_S, 0x2_0040, 0x800)]);
+        let a = Analysis::new(&snap).unwrap();
+        let j = Join::new(&a, &p).unwrap();
+        // The block is unreachable (no roots), so coverage stays zero, but
+        // the sample's group is still marked exact.
+        assert!(j.stacks.of_sample.iter().any(|&s| s & EXACT_BIT != 0));
+        assert_eq!(j.stacks.of_sample.len(), 1);
     }
 }

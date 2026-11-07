@@ -481,31 +481,35 @@ allocation profile written by `heapspy record` (format:
 check the profile (its notes are added).
 
 Samples are an estimate of where growth came from during the recording
-window, not a full allocation history: only arena, pool and large-object
-events are sampled, blocks reused from freed memory are not, and objects
-allocated before recording started have no sample. An object is *linked*
-to a sample when its address lies inside the sampled range and no later
-sample covers that address. For a `large_object` sample the object must
-also be that allocation: it starts at the sample's address plus 0, 16 or
-32 bytes (no GC header, the GC header, or the GC header and the managed
+window, not a full allocation history: only arena, pool, large-object and
+native heap events are sampled, blocks reused from freed memory are not,
+and objects allocated before recording started have no sample. An object
+is *linked* to a sample when its address lies inside the sampled range and
+no later sample covers that address. For a `large_object` sample the object
+must also be that allocation: it starts at the sample's address plus 0, 16
+or 32 bytes (no GC header, the GC header, or the GC header and the managed
 dict and weakref words), and the sample's requested size is within 16
 bytes of the object's `shallow_size` (for a type object, at most 16 bytes
 above it). When the latest covering sample is a `large_object` sample the
 object does not match, the object is not linked at all and is counted in
-`coverage.unlinked_reused_*`. Samples taken after the snapshot's capture
-second are not used for linking. When the profile does not match the
-snapshot (the `allocations_*_mismatch` and `allocations_after_snapshot`
-notes), nothing is linked and the report carries `allocations_not_linked`.
-The algorithm is described in `docs/allocation-sampling.md`, "Joining with
-a snapshot".
+`coverage.unlinked_reused_*`. A `native` sample is matched differently: its
+address is the pointer *inside* the block that the allocator returned, so
+the object linked is the one whose range contains the whole returned block;
+this runs as a separate pass and never overrides an exact or arena/pool
+link (see `docs/allocation-sampling.md`, "Native samples: by containment").
+Samples taken after the snapshot's capture second are not used for linking.
+When the profile does not match the snapshot (the `allocations_*_mismatch`
+and `allocations_after_snapshot` notes), nothing is linked and the report
+carries `allocations_not_linked`. The algorithm is described in
+`docs/allocation-sampling.md`, "Joining with a snapshot".
 
-Links through `large_object` samples are *exact*: the sample is the
-object's own allocation. Links through `arena` and `pool` samples (and `other`) are
-*approximate*: the sample is the most recent growth event that created
-the memory, not necessarily the call that allocated the object. The
-`exact_linked_*` fields give the exact part of each linked count. The
-`approximate` flags mean something else: Python frames matched to the
-event by time (ETW).
+Links through `large_object` and `native` samples are *exact*: the sample
+is the object's own allocation. Links through `arena` and `pool` samples
+(and `other`) are *approximate*: the sample is the most recent growth event
+that created the memory, not necessarily the call that allocated the
+object. The `exact_linked_*` fields give the exact part of each linked
+count. The `approximate` flags mean something else: Python frames matched
+to the event by time (ETW).
 
 ### Allocations (`allocations`)
 
@@ -517,8 +521,8 @@ event by time (ETW).
 | `started_at` | integer | Unix seconds when recording started |
 | `duration_ms` | integer | length of the recording window in milliseconds |
 | `mechanisms` | array of string | mechanisms that ran: `"ebpf"`, `"ptrace"`, `"etw"`, `"debugger"` |
-| `sampling.events` | array of string | event kinds enabled: `"arena"`, `"pool"`, `"large_object"` |
-| `sampling.byte_interval` | integer | mean bytes between large-object samples; 0 means every one was kept |
+| `sampling.events` | array of string | event kinds enabled: `"arena"`, `"pool"`, `"large_object"`, `"native"` |
+| `sampling.byte_interval` | integer | mean bytes between large-object and native samples; 0 means every one was kept |
 | `sampling.max_frames` | integer | most Python frames kept per sample |
 | `overhead.samples_taken` | integer | samples written |
 | `overhead.samples_dropped` | integer | samples lost before they were written (buffer full, stack unreadable) |
@@ -531,7 +535,7 @@ event by time (ETW).
 | `coverage.linked_objects` | integer | reachable objects linked to a sample |
 | `coverage.linked_bytes` | integer | their shallow bytes |
 | `coverage.linked_pct` | float | `coverage.linked_bytes / totals.reachable_bytes * 100` |
-| `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` samples (exact links) |
+| `coverage.exact_linked_objects` | integer | the part of `coverage.linked_objects` linked through `large_object` or `native` samples (exact links) |
 | `coverage.exact_linked_bytes` | integer | their shallow bytes |
 | `coverage.unlinked_reused_objects` | integer | reachable objects not linked because the latest sample over their address is a `large_object` sample they do not match: the sampled block was freed and the memory reused by an allocation that was not sampled. Added after the first M7 release; reads as 0 when missing |
 | `coverage.unlinked_reused_bytes` | integer | their shallow bytes; reads as 0 when missing |
@@ -547,7 +551,7 @@ AllocationStack (`top_stacks[]`):
 | `samples` | integer | samples with this stack |
 | `events` | array of string | event kinds among them, sorted |
 | `linked_bytes` | integer | shallow bytes of reachable objects linked to these samples |
-| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` or `native` samples |
 | `approximate` | bool | any frame of any of these samples was approximate |
 
 Two samples have the same stack when their frames have the same
@@ -575,7 +579,7 @@ objects has `linked_objects: 0` and no stacks.
 |---|---|---|
 | `linked_objects` | integer | objects in the subtree linked to a sample |
 | `linked_bytes` | integer | their shallow bytes |
-| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` or `native` samples |
 | `stacks` | array of AllocatedAtStack | by `linked_bytes`, at most 5 |
 | `approximate` | bool | any listed stack is approximate |
 
@@ -586,7 +590,7 @@ AllocatedAtStack:
 | `frames` | array of StackFrame | innermost first |
 | `linked_objects` | integer | linked objects in the subtree allocated through this stack |
 | `linked_bytes` | integer | their shallow bytes |
-| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` samples |
+| `exact_linked_bytes` | integer | the part of `linked_bytes` linked through `large_object` or `native` samples |
 | `top_stack_rank` | integer, nullable | `rank` of the same stack in `allocations.top_stacks`, if it is listed there; always `null` on query reports |
 
 ## `retaining_path`

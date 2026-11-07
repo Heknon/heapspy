@@ -620,6 +620,7 @@ fn encode_header(
     wr_u64(&mut h, H_END_NS, info.end_ns);
     wr_u64(&mut h, H_BYTE_INTERVAL, info.sampling.byte_interval);
     wr_u32(&mut h, H_MAX_FRAMES, info.sampling.max_frames);
+    wr_u32(&mut h, H_NATIVE_MIN_SIZE, info.sampling.native_min_size);
     wr_u64(&mut h, H_SAMPLES_TAKEN, info.overhead.samples_taken);
     wr_u64(&mut h, H_SAMPLES_DROPPED, info.overhead.samples_dropped);
     wr_u64(&mut h, H_PROBE_HITS, info.overhead.probe_hits);

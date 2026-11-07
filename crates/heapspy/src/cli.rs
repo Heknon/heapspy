@@ -142,21 +142,37 @@ pub struct DiffArgs {
 
 #[derive(Debug, Args)]
 pub struct RecordArgs {
-    /// Process to record.
-    #[arg(long, value_name = "PID")]
-    pub pid: u32,
+    /// Process to record. Not needed with --prepare/--unprepare.
+    #[arg(long, value_name = "PID", required_unless_present_any = ["prepare", "unprepare"])]
+    pub pid: Option<u32>,
     /// How long to record: 60s, 500ms, 5m, 1h, or seconds.
-    #[arg(long, value_name = "DURATION", value_parser = heapspy_record::parse_duration)]
-    pub duration: std::time::Duration,
+    #[arg(long, value_name = "DURATION", value_parser = heapspy_record::parse_duration, required_unless_present_any = ["prepare", "unprepare"])]
+    pub duration: Option<std::time::Duration>,
     /// Output allocation profile (.hpya).
-    #[arg(short = 'o', long = "output", value_name = "OUT")]
-    pub output: PathBuf,
-    /// Events to sample, comma-separated: arena, pool, large.
+    #[arg(short = 'o', long = "output", value_name = "OUT", required_unless_present_any = ["prepare", "unprepare"])]
+    pub output: Option<PathBuf>,
+    /// Turn on Windows heap tracing for an executable (by file name, e.g.
+    /// python.exe), so `--events native` can see its C-heap allocations.
+    /// Sets an Image File Execution Options registry value; needs admin and
+    /// applies only to processes started afterwards. Undo with --unprepare.
+    #[arg(long, value_name = "IMAGE.exe", conflicts_with = "unprepare")]
+    pub prepare: Option<String>,
+    /// Remove the heap-tracing setting added by --prepare for an executable.
+    #[arg(long, value_name = "IMAGE.exe")]
+    pub unprepare: Option<String>,
+    /// Events to sample, comma-separated: arena, pool, large, native.
+    /// `native` traces the C heap (Windows only) and needs the target
+    /// prepared before it starts (`--prepare`).
     #[arg(long, value_name = "KINDS", default_value = "arena,large")]
     pub events: heapspy_alloc::EventKinds,
-    /// Mean bytes between large-object samples (512K, 1M; 0 keeps every one).
+    /// Mean bytes between large-object and native samples (512K, 1M; 0 keeps
+    /// every one).
     #[arg(long, value_name = "BYTES", default_value = "512K", value_parser = heapspy_record::parse_bytes)]
     pub interval: u64,
+    /// Smallest native heap allocation sampled (`--events native`): smaller
+    /// requests are ignored so the trap rate stays bounded. Default 4K.
+    #[arg(long, value_name = "BYTES", default_value = "4K", value_parser = heapspy_record::parse_bytes)]
+    pub native_min_size: u64,
     /// Most Python frames kept per sample.
     #[arg(long, value_name = "N", default_value_t = heapspy_alloc::DEFAULT_MAX_FRAMES)]
     pub max_frames: u32,
@@ -292,9 +308,11 @@ mod tests {
         let Command::Record(r) = parse(&["--duration", "60s"]).unwrap().command else {
             panic!("not record");
         };
-        assert_eq!(r.duration, std::time::Duration::from_secs(60));
+        assert_eq!(r.duration, Some(std::time::Duration::from_secs(60)));
+        assert_eq!(r.pid, Some(1));
         assert_eq!(r.events, heapspy_alloc::EventKinds::DEFAULT);
         assert_eq!(r.interval, 512 * 1024);
+        assert_eq!(r.native_min_size, 4096);
         assert_eq!(r.max_frames, 64);
         assert_eq!(r.mechanism, heapspy_record::MechanismChoice::Auto);
         let Command::Record(r) = parse(&[
@@ -318,9 +336,34 @@ mod tests {
             &["--duration", "1s", "--events", "heap"],
             &["--duration", "1s", "--interval", "lots"],
             &["--duration", "1s", "--mechanism", "dtrace"],
+            &["--duration", "1s", "--native-min-size", "lots"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+        // native is a valid event kind.
+        assert!(parse(&["--duration", "1s", "--events", "native"]).is_ok());
+
+        // --prepare / --unprepare need neither pid, duration nor output.
+        let Command::Record(r) =
+            Cli::try_parse_from(["heapspy", "record", "--prepare", "python.exe"])
+                .unwrap()
+                .command
+        else {
+            panic!("not record");
+        };
+        assert_eq!(r.prepare.as_deref(), Some("python.exe"));
+        assert!(r.pid.is_none() && r.duration.is_none() && r.output.is_none());
+        assert!(Cli::try_parse_from(["heapspy", "record", "--unprepare", "python.exe"]).is_ok());
+        // Can't do both at once.
+        assert!(Cli::try_parse_from([
+            "heapspy",
+            "record",
+            "--prepare",
+            "a.exe",
+            "--unprepare",
+            "a.exe"
+        ])
+        .is_err());
     }
 
     #[test]

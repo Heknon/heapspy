@@ -268,7 +268,7 @@ mod imp {
         let pid = ctx.target.pid;
         let want = ctx.opts.sampling.events;
         let mut skipped = Vec::new();
-        for k in [EventKind::Pool, EventKind::LargeObject] {
+        for k in [EventKind::Pool, EventKind::LargeObject, EventKind::Native] {
             if want.contains(k) {
                 skipped.push((k, "the ptrace recorder records arenas only".to_string()));
             }

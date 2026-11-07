@@ -53,6 +53,9 @@ pub const H_START_NS: usize = 32;
 pub const H_END_NS: usize = 40;
 pub const H_BYTE_INTERVAL: usize = 48;
 pub const H_MAX_FRAMES: usize = 56;
+/// Reserved (zero) in files written before native heap sampling, which
+/// reads as "no floor".
+pub const H_NATIVE_MIN_SIZE: usize = 60;
 pub const H_SAMPLES_TAKEN: usize = 64;
 pub const H_SAMPLES_DROPPED: usize = 72;
 pub const H_PROBE_HITS: usize = 80;
