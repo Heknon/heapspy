@@ -232,6 +232,14 @@ pub(super) struct Walker<'a> {
 
 /// Words of native heap block contents read in one walk: 2 GiB.
 const NATIVE_SCAN_TOTAL: u64 = 1 << 28;
+/// User-space addresses on x86-64 and arm64 are below this (48-bit virtual
+/// addresses; a kernel address or a non-canonical one is above). A word
+/// read from memory at or above it is not a pointer to an object.
+const USER_ADDRESS_LIMIT: u64 = 1 << 48;
+/// Largest shallow size an object can plausibly have. A stale object in
+/// freed memory can carry any length; one that claims more than this, or
+/// more than is readable, is not live.
+const MAX_OBJECT_BYTES: u64 = 1 << 34;
 /// Words read from one native block at a time.
 const NATIVE_CHUNK_WORDS: u64 = 1 << 16;
 
@@ -389,6 +397,33 @@ impl<'a> Walker<'a> {
         i > 0 && addr < self.heap_ranges[i - 1].1
     }
 
+    /// Whether `addr..addr + size` lies in heap memory with no gap: within one
+    /// heap range, or a run of ranges that touch. True when the source lists
+    /// no ranges, so a source without them is only held to readability.
+    fn heap_extent(&self, addr: u64, size: u64) -> bool {
+        if self.heap_ranges.is_empty() {
+            return true;
+        }
+        let Some(end) = addr.checked_add(size) else {
+            return false;
+        };
+        let mut i = self.heap_ranges.partition_point(|&(s, _)| s <= addr);
+        if i == 0 || addr >= self.heap_ranges[i - 1].1 {
+            return false;
+        }
+        let mut reach = self.heap_ranges[i - 1].1;
+        while reach < end {
+            match self.heap_ranges.get(i) {
+                Some(&(s, e)) if s == reach => {
+                    reach = e;
+                    i += 1;
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     // ---- small read helpers -------------------------------------------------
 
     fn ptr(&self, addr: u64) -> Result<u64> {
@@ -448,7 +483,7 @@ impl<'a> Walker<'a> {
     /// the type-subclass flag). Used to tell pointers from other words when a
     /// layout is unknown.
     fn is_object(&self, addr: u64) -> bool {
-        if addr == 0 || addr & 7 != 0 {
+        if addr == 0 || addr & 7 != 0 || addr >= USER_ADDRESS_LIMIT {
             return false;
         }
         if self.is_tracked(addr) {
@@ -469,7 +504,7 @@ impl<'a> Walker<'a> {
         let Some(Ok(t)) = addr.checked_add(8).map(|a| self.ptr(a)) else {
             return false;
         };
-        if t == 0 || t & 7 != 0 {
+        if t == 0 || t & 7 != 0 || t >= USER_ADDRESS_LIMIT {
             return false;
         }
         if !self
@@ -1911,12 +1946,12 @@ impl<'a> Walker<'a> {
         while let Some(a) = self.queue.pop() {
             // Only objects whose header and type are readable, and not static
             // type objects (they live in the interpreter image, not the heap).
+            if a % 8 != 0 || a >= USER_ADDRESS_LIMIT {
+                continue;
+            }
             let Ok(t) = self.ptr(a + 8) else {
                 continue;
             };
-            if a % 8 != 0 {
-                continue;
-            }
             let ti = self.type_info(t)?;
             if ti.id.is_unknown() {
                 continue;
@@ -1926,6 +1961,19 @@ impl<'a> Walker<'a> {
                 if !own.heap {
                     continue;
                 }
+            }
+            // An object reached only through untracked edges may be stale
+            // memory with a live-looking header (scanned native memory holds
+            // such words): its own size must make sense, and be readable. A
+            // freed str with a garbage length otherwise counts as terabytes.
+            // An object in the heap must also end in the heap mapping it
+            // starts in, not run past it into whatever happens to follow.
+            let size = self.base_size(a, &ti);
+            if size > MAX_OBJECT_BYTES
+                || (self.in_heap(a) && !self.heap_extent(a, size.max(1)))
+                || self.src.read_u8(a + size.max(1) - 1).is_err()
+            {
+                continue;
             }
             self.emit(a, false)?;
         }
