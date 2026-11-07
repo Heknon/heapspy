@@ -12,7 +12,7 @@ from pathlib import Path
 
 ENV_BIN = "HEAPSPY_BIN"
 ENV_ALLOW = "HEAPSPY_MCP_ALLOW"
-ENV_ALLOW_CONTENTS = "HEAPSPY_MCP_ALLOW_CONTENTS"
+ENV_MAX_STR = "HEAPSPY_MCP_MAX_STR"
 ENV_MAX_RSS = "HEAPSPY_MCP_MAX_RSS"
 ENV_SNAPSHOT_DIR = "HEAPSPY_MCP_SNAPSHOT_DIR"
 ENV_TIMEOUT = "HEAPSPY_MCP_TIMEOUT"
@@ -22,6 +22,10 @@ GIB = 1024**3
 DEFAULT_MAX_RSS = 8 * GIB
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_CAPTURE_TIMEOUT = 900.0
+# Default per-string cap for capture_contents when the tool call gives none.
+DEFAULT_MAX_STR = 1024
+# Hard ceiling on max_str, from a tool call or the server default.
+MAX_STR_LIMIT = 1024 * 1024
 
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?i?b?)?\s*$", re.IGNORECASE)
 _SIZE_UNITS = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
@@ -169,7 +173,7 @@ class Config:
     heapspy_bin: Path | None
     snapshot_dir: Path = field(default_factory=default_snapshot_dir)
     allow: list[str] = field(default_factory=list)
-    allow_contents: bool = False
+    max_str: int = DEFAULT_MAX_STR
     max_rss_bytes: int = DEFAULT_MAX_RSS
     timeout: float = DEFAULT_TIMEOUT
     capture_timeout: float = DEFAULT_CAPTURE_TIMEOUT
@@ -188,7 +192,7 @@ class Config:
         heapspy_bin: str | None = None,
         snapshot_dir: str | None = None,
         allow: list[str] | None = None,
-        allow_contents: bool = False,
+        max_str: int | None = None,
         max_rss: str | None = None,
         timeout: float | None = None,
         capture_timeout: float | None = None,
@@ -205,7 +209,7 @@ class Config:
             heapspy_bin=resolve_binary(heapspy_bin, env),
             snapshot_dir=Path(snap_dir).expanduser() if snap_dir else default_snapshot_dir(),
             allow=allow_list,
-            allow_contents=allow_contents or parse_bool(env.get(ENV_ALLOW_CONTENTS)),
+            max_str=_max_str(max_str, env),
             max_rss_bytes=parse_size(rss_text) if rss_text else DEFAULT_MAX_RSS,
             timeout=timeout or _float_env(env, ENV_TIMEOUT, DEFAULT_TIMEOUT),
             capture_timeout=capture_timeout
@@ -359,3 +363,18 @@ def diagnostics_from_args(args: argparse.Namespace) -> DiagnosticsConfig:
         max_cmdline_chars=getattr(args, "max_cmdline_chars", None),
         allow_load_probes=bool(getattr(args, "allow_load_probes", False)),
     )
+
+
+def _max_str(flag_value: int | None, env: dict[str, str]) -> int:
+    """The default max_str: the flag, else $HEAPSPY_MCP_MAX_STR, else 1024."""
+    value: int = DEFAULT_MAX_STR
+    if flag_value is not None:
+        value = flag_value
+    elif env.get(ENV_MAX_STR):
+        try:
+            value = int(env[ENV_MAX_STR])
+        except ValueError:
+            raise ConfigError(f"{ENV_MAX_STR}={env[ENV_MAX_STR]!r} is not an integer") from None
+    if not 1 <= value <= MAX_STR_LIMIT:
+        raise ConfigError(f"max-str must be between 1 and {MAX_STR_LIMIT}, got {value}")
+    return value

@@ -180,8 +180,11 @@ def build_server(config: Config) -> MCPServer:
             "confirm must be true, and you must ask the user before setting it. Live capture "
             "only works for processes on the allowlist the user configured when starting the "
             "server, and under its RSS limit; refusals explain which gate failed, and only the "
-            "user can change the gates. capture_contents=true records string/bytes contents "
-            "(may include secrets) and needs --allow-contents on the server. Returns a snapshot "
+            "user can change the gates. capture_contents=true also records the text of str and "
+            "bytes objects and real dict keys, so you can see what the data is and where it came "
+            "from (it may include secrets; say so when you report it). Each string is cut at "
+            "max_str characters (server default 1024, up to 1048576); raise max_str and capture "
+            "again when the prefixes are too short to tell what the data is. Returns a snapshot "
             "handle to pass to heap_summary, retaining_path, type_detail and diff_snapshots, "
             "and the dump's stats (objects, roots, pause_ms, truncated, missing_bytes, "
             "read_errors) and notes. A failed dump returns heapspy's error code (e.g. "
@@ -202,7 +205,13 @@ def build_server(config: Config) -> MCPServer:
         ] = False,
         max_str: Annotated[
             int | None,
-            Field(description="Cap on captured text per string, in characters (with contents)."),
+            Field(
+                description=(
+                    "Cap on captured text per string, in characters, 1 to 1048576 (with "
+                    "contents). Omit for the server default (1024). Larger values grow the "
+                    "snapshot."
+                )
+            ),
         ] = None,
     ) -> dict[str, Any]:
         return _guard(
