@@ -73,7 +73,7 @@ fn debugger_warning(m: heapspy_record::MechanismChoice) -> Option<&'static str> 
     (cfg!(windows) && m == heapspy_record::MechanismChoice::Only(heapspy_alloc::Mechanism::Debugger))
         .then_some(
             "heapspy: warning: --mechanism debugger stops every thread of the target at each \
-             breakpoint; on windows-latest the target was paused for 2.8-3.0 s of a 3 s recording. \
+             breakpoint; on windows-latest the target was paused for 2.5-2.9 s of a 3 s recording. \
              A guardian process puts the target back (breakpoint bytes, debugger) if heapspy is \
              killed. Without --mechanism, Windows records with etw, which does not pause the target.",
         )

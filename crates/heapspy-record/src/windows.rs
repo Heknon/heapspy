@@ -3,10 +3,11 @@
 //! **Status: runs on `windows-latest`** with CPython 3.12 to 3.14, in the
 //! `record.yml` workflow (`crates/heapspy/tests/record_live_windows.rs`).
 //! The pure parts ([`clock`], [`matcher`], [`debug`]) are unit-tested
-//! everywhere. Known gap: if heapspy is killed while recording, the
-//! debugger's `int3` stays in `VirtualAlloc` and the target dies at its next
-//! call, and the ETW session stays running. The test plan and results are
-//! in `docs/windows-record-test-plan.md`.
+//! everywhere. `auto` is ETW alone; the debugger runs only with
+//! `--mechanism debugger`. If heapspy is killed while recording, a
+//! guardian process restores the target and stops the ETW session: see
+//! [`guardian`]. The test plan and results are in
+//! `docs/windows-record-test-plan.md`.
 //!
 //! What differs from the design below, as built:
 //!
@@ -14,7 +15,8 @@
 //!   Image File Execution Options) applies only to processes started after
 //!   it is set, so it cannot attach to a running one. Asked for, they are
 //!   listed in meta `heapspy.skipped_events`. Arenas only, on both paths.
-//! - The ETW session is the classic "NT Kernel Logger" with
+//! - The ETW session is heapspy's own `heapspy-<recorder pid>` in system
+//!   logger mode (the "NT Kernel Logger" where that mode is refused), with
 //!   `EVENT_TRACE_FLAG_VIRTUAL_ALLOC`; no ETW stack walks (native return
 //!   addresses come from the debugger path only). A real-time consumer
 //!   gets FILETIME timestamps, converted by [`clock`].

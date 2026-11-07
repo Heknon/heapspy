@@ -193,3 +193,25 @@ version).
 | 5.3-5.5 | | | not automated | |
 | 6 | | | not checked | Defender's ETW sessions run on the runner (`logman`); whether real-time protection is on was not checked. Nothing blocked `DebugActiveProcess` |
 | 7 | | | pass | python-build-standalone 3.12, 3.13, 3.14 |
+
+### Kill safety (the guardian)
+
+Record workflow runs 42358155568 and 42359502629 on PR #37 (November 2026).
+Run 42359502629 passed all 17 `record_live_windows` tests on 3.12, 3.13 and
+3.14; the Linux job stayed green in both.
+
+| test | result |
+|---|---|
+| `kill_mid_run_debugger` | target running, no debugger attached, `VirtualAlloc` unchanged. Guardian log, run 1: restored `0xcc -> 0x48`, detached. Run 2: the same, plus thread 5372 with its trap flag set and a pending `EXCEPTION_SINGLE_STEP` (cleared, continued) |
+| `kill_mid_run_etw` | target running; the guardian stopped `heapspy-<recorder pid>`; no session left |
+| `guardian_idle_after_clean_finish_{etw,debugger}` | no guardian output, no log |
+| `stale_session_is_cleaned_up` | `heapspy-<dead pid>` stopped by the next recording, reported on stderr |
+| `foreign_sessions_are_untouched` | `heapspy-foreign`, `heapspyx-<pid>`, `other-<pid>` all still running |
+| `python313_auto` | `mechanisms: ["etw"]`, 117 samples, paused 0 ms |
+| ETW session | `heapspy-<pid>` in system logger mode starts and delivers events on windows-latest; `NT Kernel Logger` is not used |
+
+Run 1 failed every ETW test that stops a session: `ControlTraceW` with the
+start properties block (system trace GUID, kernel flags) returns
+`ERROR_INVALID_PARAMETER` (87) for a system logger session. Control calls now
+pass a bare block. In run 1 `python314_etw` also missed the statistical top-5
+check once; it passed in run 2.
