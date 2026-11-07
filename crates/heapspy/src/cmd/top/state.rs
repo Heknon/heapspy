@@ -4,7 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use heapspy_analyzer::render::summary::{memory_groups, what_rows, MemoryGroup};
+use heapspy_analyzer::render::summary::{
+    is_internal, memory_groups, what_rows, MemoryGroup, INTERNALS,
+};
 use heapspy_analyzer::root_path_string;
 
 use super::workers::Snap;
@@ -119,6 +121,8 @@ pub struct App {
     pub selected: [usize; 5],
     pub sort: [Sort; 5],
     pub paused: bool,
+    /// Show interpreter internals type by type instead of as one row.
+    pub show_internals: bool,
     pub show_help: bool,
     pub detail: Option<Detail>,
     pub next_detail_id: u64,
@@ -153,6 +157,7 @@ impl App {
             selected: [0; 5],
             sort: [Sort::Size; 5],
             paused: false,
+            show_internals: false,
             show_help: false,
             detail: None,
             next_detail_id: 1,
@@ -217,7 +222,13 @@ impl App {
             p.holders
                 .insert(root_path_string(&x.path), x.retained_bytes);
         }
-        for w in what_rows(r) {
+        let rows = what_rows(r);
+        let internal = rows
+            .iter()
+            .filter(|w| !w.leaked && is_internal(&w.type_name));
+        let sum = internal.fold((0, 0), |a, w| (a.0 + w.count, a.1 + w.bytes));
+        p.types.insert(INTERNALS.to_string(), sum);
+        for w in rows {
             p.types.insert(w.key, (w.count, w.bytes));
         }
         self.history.push_back(p);

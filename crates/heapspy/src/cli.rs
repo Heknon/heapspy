@@ -108,6 +108,7 @@ pub enum Command {
             s           change the sort column    Esc     close details\n  \
             d           take a snapshot now       w       save the latest snapshot to a file\n  \
             a           start/stop allocation sampling (needs eBPF on Linux)\n  \
+            i           list interpreter internals (code, classes, descriptors) by type\n  \
             space       pause refreshing          ?       help on the screen\n  \
             q / Esc     quit\n\n\
             \x1b[1;4mExamples\x1b[0m\n  \

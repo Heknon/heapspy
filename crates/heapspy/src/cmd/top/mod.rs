@@ -147,6 +147,14 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
                     let _ = snap_tx.send(SnapRequest::Paused(app.paused));
                 }
                 KeyCode::Char('w') => save_snapshot(&mut app),
+                KeyCode::Char('i') => {
+                    app.show_internals = !app.show_internals;
+                    app.set_status(if app.show_internals {
+                        "showing interpreter internals type by type"
+                    } else {
+                        "interpreter internals folded into one row"
+                    });
+                }
                 KeyCode::Char('a') => match &app.alloc {
                     AllocState::Running { .. } => {
                         if let Some(s) = &alloc_stop {

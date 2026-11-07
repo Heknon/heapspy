@@ -2,7 +2,9 @@
 
 use heapspy_analyzer::render::format_bytes;
 use heapspy_analyzer::render::style::shorten;
-use heapspy_analyzer::render::summary::{holder_name, what_rows, WhatRow};
+use heapspy_analyzer::render::summary::{
+    fold_internals, holder_name, what_rows, WhatRow, INTERNALS,
+};
 use heapspy_analyzer::render::Paint;
 use heapspy_analyzer::report::Retainer;
 use heapspy_analyzer::root_path_string;
@@ -192,6 +194,7 @@ fn draw_memory(f: &mut Frame, app: &App, area: Rect) {
             "waiting for the first snapshot (the process may stop briefly while it is taken)",
             dim(),
         ));
+        lines.push(Line::from(spans));
     } else {
         let width = 24usize;
         let (mut cells, mut cum) = (0usize, 0u64);
@@ -205,22 +208,37 @@ fn draw_memory(f: &mut Frame, app: &App, area: Rect) {
             cells = end.max(cells);
         }
         spans.push(Span::raw("  "));
+        // Legend items; those that do not fit go on the next line, under
+        // the first item.
+        let indent = 1 + width + 2;
+        let max = area.width as usize;
+        let mut col = indent;
         for g in &groups {
             let key = g.key;
             let r = app.rate(|p| p.groups.get(key).copied());
-            spans.push(Span::styled("■ ", Style::default().fg(group_color(key))));
-            spans.push(Span::raw(format!("{} ", short_group(key))));
-            spans.push(Span::styled(compact(g.bytes), bold()));
+            let mut item = vec![
+                Span::styled("■ ", Style::default().fg(group_color(key))),
+                Span::raw(format!("{} ", short_group(key))),
+                Span::styled(compact(g.bytes), bold()),
+            ];
             if r.is_some_and(|x| x > total as f64 * 0.002) {
-                spans.push(Span::styled(
+                item.push(Span::styled(
                     format!(" ▲{}/m", compact(r.unwrap_or(0.0) as u64)),
                     Style::default().fg(Color::LightRed),
                 ));
             }
-            spans.push(Span::raw("  "));
+            item.push(Span::raw("  "));
+            let w: usize = item.iter().map(|s| s.content.chars().count()).sum();
+            if col + w > max && col > indent {
+                lines.push(Line::from(std::mem::take(&mut spans)));
+                spans.push(Span::raw(" ".repeat(indent)));
+                col = indent;
+            }
+            spans.extend(item);
+            col += w;
         }
+        lines.push(Line::from(spans));
     }
-    lines.push(Line::from(spans));
     f.render_widget(Paragraph::new(lines).style(Style::default()), area);
 }
 
@@ -429,11 +447,15 @@ pub fn object_rows(app: &App) -> Vec<WhatRow> {
     let Some(s) = &app.latest else {
         return Vec::new();
     };
-    let mut v = what_rows(&s.report);
     let rate = |k: &str| {
         app.rate(|p| p.types.get(k).map(|x| x.1))
             .unwrap_or(f64::MIN)
     };
+    let mut v = what_rows(&s.report);
+    if !app.show_internals {
+        // A growing internal type stays on its own row: growth is news.
+        v = fold_internals(v, |w| rate(&w.key) > 1024.0);
+    }
     match app.sort[Tab::Objects.index()] {
         Sort::Growth => v.sort_by(|a, b| {
             rate(&b.key)
@@ -451,6 +473,7 @@ fn paint_color(p: Paint) -> Style {
         Paint::Native => Style::default().fg(Color::Magenta),
         Paint::Leaked => Style::default().fg(Color::LightRed),
         Paint::Type => Style::default().fg(Color::LightCyan),
+        Paint::Dim => dim(),
         _ => Style::default(),
     }
 }
@@ -468,6 +491,14 @@ fn draw_objects(f: &mut Frame, app: &App, area: Rect) {
             let growing = rb.is_some_and(|x| x > 1024.0);
             let held = if w.leaked {
                 Span::styled("nothing: leaked", Style::default().fg(Color::LightRed))
+            } else if w.key == INTERNALS {
+                Span::styled(
+                    format!(
+                        "the interpreter ({}) · i expands",
+                        w.held_by.as_deref().unwrap_or("")
+                    ),
+                    dim(),
+                )
             } else {
                 match &w.held_by {
                     Some(h) => Span::raw(format!("{} {:.0}%", h, w.held_pct)),
@@ -967,6 +998,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(Span::styled("Keys", bold())),
         Line::raw("  ↑↓ jk PgUp PgDn  move     enter  details     esc  close"),
         Line::raw("  s  sort      d  snapshot now     w  save the latest snapshot"),
+        Line::raw("  i  show interpreter internals type by type (folded by default)"),
         Line::raw("  a  start/stop allocation sampling   space  pause   q  quit"),
         Line::raw(""),
         Line::from(Span::styled(

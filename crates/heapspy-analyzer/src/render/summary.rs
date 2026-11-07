@@ -252,6 +252,72 @@ pub fn what_rows(r: &AnalyzeReport) -> Vec<WhatRow> {
     out
 }
 
+/// Types that make up the interpreter itself rather than the program's
+/// data: code, classes, descriptors, modules. Folded into one row by
+/// [`fold_internals`].
+pub fn is_internal(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "builtins.code"
+            | "builtins.type"
+            | "builtins.module"
+            | "builtins.wrapper_descriptor"
+            | "builtins.method_descriptor"
+            | "builtins.classmethod_descriptor"
+            | "builtins.builtin_function_or_method"
+            | "builtins.getset_descriptor"
+            | "builtins.member_descriptor"
+            | "builtins.staticmethod"
+            | "builtins.classmethod"
+            | "builtins.property"
+            | "builtins.mappingproxy"
+            | "builtins.method-wrapper"
+            | "builtins.weakref"
+            | "weakref.ReferenceType"
+            | "abc.ABCMeta"
+            | "enum.EnumType"
+            | "_abc._abc_data"
+            | "native.large_allocation"
+    ) || (type_name.starts_with("_ctypes.") && type_name.ends_with("Type"))
+        || type_name.starts_with("_frozen_importlib")
+}
+
+/// Key of the folded row.
+pub const INTERNALS: &str = "internals";
+
+/// `rows` with the interpreter's own objects ([`is_internal`]) folded into
+/// one row, except those `keep` wants shown (in `top`: the growing ones).
+pub fn fold_internals(rows: Vec<WhatRow>, keep: impl Fn(&WhatRow) -> bool) -> Vec<WhatRow> {
+    let (mut out, mut folded) = (Vec::new(), Vec::new());
+    for r in rows {
+        if !r.leaked && is_internal(&r.type_name) && !keep(&r) {
+            folded.push(r);
+        } else {
+            out.push(r);
+        }
+    }
+    if folded.is_empty() {
+        return out;
+    }
+    let names: Vec<String> = folded.iter().take(3).map(|r| r.label.clone()).collect();
+    out.push(WhatRow {
+        key: INTERNALS.to_string(),
+        type_name: INTERNALS.to_string(),
+        label: "interpreter internals".to_string(),
+        paint: Paint::Dim,
+        count: folded.iter().map(|r| r.count).sum(),
+        bytes: folded.iter().map(|r| r.bytes).sum(),
+        retained: folded.iter().map(|r| r.bytes).sum(),
+        held_by: Some(format!("{} types: {}, …", folded.len(), names.join(", "))),
+        held_by_rank: None,
+        held_pct: 0.0,
+        leaked: false,
+        location: None,
+    });
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.key.cmp(&b.key)));
+    out
+}
+
 /// A share of `total` as ` 12%`.
 fn share(part: u64, total: u64) -> String {
     if total == 0 {
@@ -390,7 +456,7 @@ fn memory_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
 }
 
 fn what_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
-    let rows = what_rows(r);
+    let rows = fold_internals(what_rows(r), |_| false);
     if rows.is_empty() {
         return;
     }
@@ -413,6 +479,11 @@ fn what_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         let each = format_bytes(x.bytes / x.count.max(1));
         let held = if x.leaked {
             st.paint(Paint::Leaked, "nothing: leaked")
+        } else if x.key == INTERNALS {
+            st.paint(
+                Paint::Dim,
+                format!("the interpreter: {}", x.held_by.as_deref().unwrap_or("")),
+            )
         } else {
             match &x.held_by {
                 Some(h) => format!(
@@ -662,5 +733,39 @@ mod tests {
         );
         assert_eq!(holder_name("python3.13 globals"), "python3.13 globals");
         assert_eq!(holder_name("x.__dict__['a b']"), "x.__dict__['a b']");
+    }
+
+    fn row(t: &str, bytes: u64) -> WhatRow {
+        WhatRow {
+            key: t.into(),
+            type_name: t.into(),
+            label: t.into(),
+            paint: Paint::Strong,
+            count: 1,
+            bytes,
+            retained: bytes,
+            held_by: None,
+            held_by_rank: None,
+            held_pct: 0.0,
+            leaked: false,
+            location: None,
+        }
+    }
+
+    #[test]
+    fn internals_fold_into_one_row_unless_kept() {
+        let rows = vec![
+            row("builtins.bytes", 100),
+            row("builtins.code", 30),
+            row("builtins.type", 20),
+            row("app.Session", 10),
+        ];
+        let f = fold_internals(rows.clone(), |_| false);
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[1].key, INTERNALS);
+        assert_eq!(f[1].bytes, 50);
+        let k = fold_internals(rows, |r| r.type_name == "builtins.type");
+        assert!(k.iter().any(|r| r.key == "builtins.type"));
+        assert_eq!(k.iter().find(|r| r.key == INTERNALS).unwrap().bytes, 30);
     }
 }

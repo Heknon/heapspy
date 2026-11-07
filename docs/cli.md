@@ -70,7 +70,9 @@ Who holds it                                                    retained    pyth
 ```
 
 **What the memory is** has one row per type, by the bytes its objects take
-themselves (`size`). Native `malloc` blocks are rows too, split into blocks
+themselves (`size`). The interpreter's own objects (code, classes,
+descriptors, modules) are folded into one `interpreter internals` row; in
+`top`, one that grows keeps its own row, and `i` lists them all. Native `malloc` blocks are rows too, split into blocks
 something points to and leaked blocks nothing points to. `keeps alive` is
 what the objects retain, themselves included. `mostly held by` names the
 holder that keeps most of them alive, and how much of them.
@@ -130,7 +132,8 @@ A full-screen view that keeps refreshing:
 
 Keys: `↑↓`/`jk` move, `PgUp`/`PgDn`, `Enter` details, `Esc` close, `s` sort,
 `d` snapshot now, `w` save the latest snapshot to
-`heapspy-PID-TIME.hpy`, `a` start or stop allocation sampling, `space`
+`heapspy-PID-TIME.hpy`, `a` start or stop allocation sampling, `i` list
+interpreter internals type by type, `space`
 pause, `?` help, `q` quit.
 
 | Option | Default | |
