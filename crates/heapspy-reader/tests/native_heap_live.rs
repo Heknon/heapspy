@@ -122,10 +122,28 @@ fn start(dir: &Path) -> Victim {
 }
 
 fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
-    let blocks: Vec<NativeBlock> = src
-        .native_blocks()
-        .unwrap()
-        .unwrap_or_else(|| panic!("{what}: no native blocks (allocator not recognised?)"));
+    let blocks: Vec<NativeBlock> = src.native_blocks().unwrap().unwrap_or_else(|| {
+        // What the walker had to go on: libc, and the anonymous memory
+        // a heap could be in.
+        let modules: Vec<String> = src
+            .modules()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|p| p.contains("libc"))
+            .collect();
+        let maps: Vec<String> = src
+            .mapped_ranges()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.perms.write)
+            .map(|r| format!("{:#x}+{:#x} {:?}", r.start, r.size, r.file))
+            .collect();
+        panic!(
+            "{what}: no native blocks (allocator not recognised?)\n\
+                 libc modules: {modules:?}\nwritable mappings: {maps:#?}"
+        )
+    });
     eprintln!("{what}: {} native blocks", blocks.len());
     // A CPython has thousands; the C victim only what it asked for, and its
     // stdio buffers.
@@ -232,6 +250,10 @@ fn native_blocks_of_a_live_cpython_and_its_core() {
     let dir = tempfile::tempdir().unwrap();
     let v = start(dir.path());
     let pid = v.child.id();
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        let heap: Vec<&str> = maps.lines().filter(|l| l.ends_with("[heap]")).collect();
+        eprintln!("victim [heap]: {heap:?}");
+    }
     {
         let live = LiveProcess::attach(pid).expect("attach (ptrace permission?)");
         check(&live, &v.allocs, "live");
