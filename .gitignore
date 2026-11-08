@@ -5,3 +5,4 @@
 core.*
 *.dmp
 dist/
+__pycache__/
