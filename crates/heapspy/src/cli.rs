@@ -15,8 +15,9 @@ const TOP_HELP: &str = "\
 
 \x1b[1;4mLook at a running process\x1b[0m
   top         Live view: what the memory is, what holds it, what grows
-  watch       Snapshot every N seconds and print what grew, one line per round
+  watch       Snapshot every N seconds and print what grew, or sample live counters
   analyze     One readable report of a process (--pid) or of a snapshot file
+  agent       Collect memory profiles continuously and send them to Pyroscope
 
 \x1b[1;4mCapture\x1b[0m
   dump        Write a snapshot of a process, an ELF core or a minidump
@@ -37,6 +38,7 @@ const TOP_AFTER: &str = "\
   sudo heapspy top --pid 1234                 # live view; Enter on a row for details
   sudo heapspy analyze --pid 1234             # one report, right now
   sudo heapspy watch --pid 1234 --every 30s   # is it growing, and what?
+  sudo heapspy agent --server http://pyroscope:4040 --pid 1234   # continuous profiles
   sudo heapspy dump --pid 1234 -o app.hpy     # keep a snapshot to analyze later
   heapspy query app.hpy --retaining-path-type app.session.Session
 
@@ -149,6 +151,36 @@ pub enum Command {
             heapspy diff watch-1234/first.hpy watch-1234/last.hpy"
     )]
     Watch(WatchArgs),
+    /// Collect memory profiles continuously and send them to Pyroscope.
+    #[command(
+        long_about = "Collect memory profiles of Python processes continuously and send them \
+            to Pyroscope (or Grafana Cloud Profiles), where they are flame graphs over time, \
+            next to CPU profiles.\n\n\
+            Three profiles, each opt-in:\n  \
+            --memory    where the process's memory is: Python objects by pymalloc block \
+            size, free space in pymalloc, malloc's heaps, the rest of RSS. Read from \
+            counters, never pauses the process, every --memory-every. The default when \
+            nothing is chosen. (heapspy_memory:resident:bytes)\n  \
+            --retained  who holds the memory: a snapshot every --retained-every, as stacks \
+            of holders weighted by retained bytes. Taken without stopping the process \
+            (approximate, Linux) unless --stop. (memory:inuse_space:bytes)\n  \
+            --alloc     what allocated it: allocation sampling (eBPF on Linux, ETW on \
+            Windows) for --alloc-for every --alloc-every. (memory:alloc_space:bytes)\n\n\
+            Watch processes with --pid (repeatable), or --discover TEXT to pick up every \
+            CPython process whose command line contains TEXT, now and as they start. Each \
+            profile is labelled service_name (--app-name, else the script or module name), \
+            pid, hostname and every --tag. Credentials come from the environment: \
+            HEAPSPY_PYROSCOPE_PASSWORD with --basic-auth-user (Grafana Cloud: the stack's \
+            user id and an access token), or HEAPSPY_PYROSCOPE_TOKEN as a bearer token.",
+        after_long_help = "\x1b[1;4mExamples\x1b[0m\n  \
+            sudo heapspy agent --server http://pyroscope:4040 --pid 1234\n  \
+            sudo heapspy agent --server http://pyroscope:4040 --discover gunicorn --tag env=prod\n  \
+            sudo heapspy agent --server http://pyroscope:4040 --pid 1234 --memory --retained --alloc\n  \
+            HEAPSPY_PYROSCOPE_PASSWORD=$TOKEN heapspy agent --pid 1234 \\\n      \
+            --server https://profiles-prod-001.grafana.net --basic-auth-user 123456\n  \
+            sudo heapspy agent --dry-run profiles/ --pid 1234 --once   # look before sending"
+    )]
+    Agent(AgentArgs),
     /// Capture a snapshot from a live process, an ELF core, or a minidump.
     #[command(
         long_about = "Capture a snapshot from a live process, an ELF core, or a minidump.\n\n\
@@ -249,7 +281,7 @@ impl Command {
             Command::Analyze(a) => a.json,
             Command::Query(a) => a.json,
             Command::Diff(a) => a.json,
-            Command::Flamegraph(_) | Command::Top(_) => false,
+            Command::Flamegraph(_) | Command::Top(_) | Command::Agent(_) => false,
             Command::Record(a) => a.json,
             Command::Watch(a) => a.json,
         }
@@ -317,6 +349,84 @@ pub struct AnalyzeArgs {
     /// Allocation profile from `heapspy record` to join with the snapshot.
     #[arg(long, value_name = "FILE.hpya")]
     pub allocations: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("targets").required(true).multiple(true).args(["pids", "discover"])))]
+#[command(group(clap::ArgGroup::new("sink").required(true).args(["server", "dry_run"])))]
+pub struct AgentArgs {
+    /// Pyroscope to send to: http://host:4040, or a Grafana Cloud
+    /// Profiles URL.
+    #[arg(long, value_name = "URL", help_heading = "Where")]
+    pub server: Option<String>,
+    /// Write each profile to DIR (a .pprof and its labels as .json)
+    /// instead of sending it.
+    #[arg(long, value_name = "DIR", help_heading = "Where")]
+    pub dry_run: Option<PathBuf>,
+    /// User for HTTP basic auth; the password is read from
+    /// HEAPSPY_PYROSCOPE_PASSWORD.
+    #[arg(long, value_name = "USER", help_heading = "Where")]
+    pub basic_auth_user: Option<String>,
+    /// Tenant, sent as X-Scope-OrgID (multi-tenant Pyroscope).
+    #[arg(long, value_name = "ID", help_heading = "Where")]
+    pub tenant_id: Option<String>,
+
+    /// A process to watch (repeatable).
+    #[arg(long = "pid", value_name = "PID", help_heading = "What")]
+    pub pids: Vec<u32>,
+    /// Watch every CPython process whose command line contains TEXT
+    /// (Windows: whose executable name does), and new ones as they start.
+    #[arg(long, value_name = "TEXT", help_heading = "What")]
+    pub discover: Option<String>,
+    /// service_name of the profiles [default: the script or module name].
+    #[arg(long, value_name = "NAME", help_heading = "What")]
+    pub app_name: Option<String>,
+    /// A label for every profile, KEY=VALUE (repeatable).
+    #[arg(long = "tag", value_name = "KEY=VALUE", value_parser = crate::agent::parse_tag,
+          help_heading = "What")]
+    pub tags: Vec<(String, String)>,
+    /// Collect once from each process, send, and exit.
+    #[arg(long, help_heading = "What")]
+    pub once: bool,
+
+    /// Where the memory is, from counters; never pauses the process. On
+    /// when no other profile is chosen.
+    #[arg(long, help_heading = "Memory profile")]
+    pub memory: bool,
+    #[arg(long, value_name = "DURATION", default_value = "15s", value_parser = parse_duration,
+          help_heading = "Memory profile")]
+    pub memory_every: Duration,
+
+    /// Who holds the memory, from snapshots.
+    #[arg(long, help_heading = "Retained profile")]
+    pub retained: bool,
+    #[arg(long, value_name = "DURATION", default_value = "5m", value_parser = parse_duration,
+          help_heading = "Retained profile")]
+    pub retained_every: Duration,
+    /// Stop the process for each snapshot (exact, but it pauses for the
+    /// walk). Without it snapshots are approximate, and Linux only.
+    #[arg(long, requires = "retained", help_heading = "Retained profile")]
+    pub stop: bool,
+
+    /// What allocated the memory: allocation sampling (eBPF: root or
+    /// CAP_BPF and CAP_PERFMON; Windows: ETW, elevated).
+    #[arg(long, help_heading = "Allocation profile")]
+    pub alloc: bool,
+    #[arg(long, value_name = "DURATION", default_value = "5m", value_parser = parse_duration,
+          help_heading = "Allocation profile")]
+    pub alloc_every: Duration,
+    /// How long each sampling window lasts.
+    #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = parse_duration,
+          help_heading = "Allocation profile")]
+    pub alloc_for: Duration,
+    /// Allocation events to sample: arena, large, pool, native.
+    #[arg(
+        long,
+        value_name = "KINDS",
+        default_value = "arena,large",
+        help_heading = "Allocation profile"
+    )]
+    pub alloc_events: heapspy_alloc::EventKinds,
 }
 
 #[derive(Debug, Args)]
@@ -672,6 +782,34 @@ mod tests {
         assert!(Cli::try_parse_from(["heapspy", "watch", "--pid", "7", "--every", "0s"]).is_err());
         assert!(Cli::try_parse_from(["heapspy", "watch", "--pid", "7", "--rounds", "1"]).is_err());
         assert!(Cli::try_parse_from(["heapspy", "--color", "never", "top", "--pid", "1"]).is_ok());
+    }
+
+    #[test]
+    fn agent_arguments() {
+        let parse = |a: &[&str]| {
+            let mut v = vec!["heapspy", "agent"];
+            v.extend_from_slice(a);
+            Cli::try_parse_from(v)
+        };
+        let Command::Agent(a) = parse(&["--server", "http://p:4040", "--pid", "1", "--pid", "2"])
+            .unwrap()
+            .command
+        else {
+            panic!("not agent");
+        };
+        assert_eq!(a.pids, vec![1, 2]);
+        assert!(!a.memory && !a.retained && !a.alloc && !a.stop);
+        assert_eq!(a.memory_every, Duration::from_secs(15));
+        assert!(parse(&["--server", "http://p", "--discover", "gunicorn"]).is_ok());
+        // A target and a destination are both required.
+        assert!(parse(&["--server", "http://p"]).is_err());
+        assert!(parse(&["--pid", "1"]).is_err());
+        assert!(parse(&["--server", "http://p", "--dry-run", "d", "--pid", "1"]).is_err());
+        // --stop only makes sense for snapshots.
+        assert!(parse(&["--server", "http://p", "--pid", "1", "--stop"]).is_err());
+        assert!(parse(&["--server", "http://p", "--pid", "1", "--retained", "--stop"]).is_ok());
+        assert!(parse(&["--server", "http://p", "--pid", "1", "--tag", "env=prod"]).is_ok());
+        assert!(parse(&["--server", "http://p", "--pid", "1", "--tag", "bad.key=x"]).is_err());
     }
 
     #[test]

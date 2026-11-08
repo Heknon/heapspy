@@ -31,6 +31,7 @@ sudo heapspy top --pid 1234                 # live view; Enter on a row for deta
 sudo heapspy analyze --pid 1234             # one report, right now
 sudo heapspy watch --pid 1234 --every 30s   # what grows, and how steadily
 sudo heapspy watch --pid 1234 --counters    # live counters, never pausing the process
+sudo heapspy agent --server http://pyroscope:4040 --discover myapp   # continuous profiles
 ```
 
 - **`top`** is a live, full-screen view. Its main table lists what the
@@ -47,6 +48,10 @@ sudo heapspy watch --pid 1234 --counters    # live counters, never pausing the p
   a millisecond, so it can sample every second or faster. With `--json` it
   is a stream for your own graphs; `top` draws the same numbers in its
   Graphs tab.
+- **`agent`** runs continuously and sends memory profiles to
+  [Pyroscope](https://grafana.com/oss/pyroscope/) or Grafana Cloud: where
+  the memory is (never pausing the process), and, when asked, who holds it
+  and what allocated it. See [docs/cli.md](docs/cli.md#agent).
 
 Reading another process needs ptrace rights on Linux and an elevated prompt
 on Windows; reading snapshot files needs nothing.

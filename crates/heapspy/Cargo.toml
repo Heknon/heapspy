@@ -25,6 +25,13 @@ serde_json.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
 tempfile.workspace = true
+# HTTP for `agent`. TLS (rustls, with ring) is the `tls` feature, on by
+# default; without it only http:// servers can be used.
+ureq = { version = "2.12", default-features = false }
+
+[features]
+default = ["tls"]
+tls = ["ureq/tls"]
 
 [dev-dependencies]
 tempfile.workspace = true

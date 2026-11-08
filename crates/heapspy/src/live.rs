@@ -220,6 +220,16 @@ pub fn proc_memory(pid: u32) -> Option<ProcMemory> {
     })
 }
 
+/// Whether `pid` still runs. Linux reads `/proc`; elsewhere the OS's
+/// memory numbers stand in (they fail once the process is gone).
+pub fn process_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    } else {
+        heapspy_record::live::windows_memory(pid).is_some()
+    }
+}
+
 /// The process's command line, for headers. Linux only.
 pub fn command_line(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]

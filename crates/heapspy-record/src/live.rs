@@ -73,3 +73,16 @@ pub fn windows_memory(pid: u32) -> Option<(u64, u64)> {
         None
     }
 }
+
+/// Every process on Windows: (pid, executable file name). Empty elsewhere
+/// (Linux callers read `/proc`).
+pub fn windows_processes() -> Vec<(u32, String)> {
+    #[cfg(windows)]
+    {
+        crate::windows::live::processes()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}

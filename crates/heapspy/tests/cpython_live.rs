@@ -559,6 +559,99 @@ fn run_live_commands(minor: u8) {
     assert!(crate_path(&r.top_retainers[0]).ends_with("['CACHE']"));
 }
 
+/// `agent --dry-run --once`: one profile of each kind asked for, written
+/// with its labels, from a --pid and from --discover.
+fn run_agent(minor: u8) {
+    let py = python(minor);
+    let dir = tempfile::tempdir().unwrap();
+    let v = start_victim(&py, dir.path());
+    let pid = v.pid.to_string();
+    let out = dir.path().join("profiles");
+    let o = heapspy(&[
+        "agent",
+        "--dry-run",
+        out.to_str().unwrap(),
+        "--pid",
+        &pid,
+        "--memory",
+        "--retained",
+        "--tag",
+        "env=test",
+        "--once",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("sent 2 profiles"), "{stderr}");
+    let mut names: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            format!("000001-{pid}-memory.json"),
+            format!("000001-{pid}-memory.pprof"),
+            format!("000002-{pid}-retained.json"),
+            format!("000002-{pid}-retained.pprof"),
+        ]
+    );
+    let labels = |n: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(out.join(n)).unwrap()).unwrap()
+    };
+    let m = labels(&names[0]);
+    assert_eq!(m["__name__"], "heapspy_memory");
+    assert_eq!(m["service_name"], "victim");
+    assert_eq!(m["pid"], pid.as_str());
+    assert_eq!(m["env"], "test");
+    let r = labels(&names[2]);
+    assert_eq!(r["__name__"], "memory");
+    assert_eq!(r["heapspy_snapshot"], "approximate");
+    let has = |n: &str, what: &str| {
+        let b = std::fs::read(out.join(n)).unwrap();
+        b.windows(what.len()).any(|w| w == what.as_bytes())
+    };
+    assert!(has(&names[1], "resident") && has(&names[1], "pymalloc free"));
+    assert!(has(&names[3], "inuse_space") && has(&names[3], "['CACHE']"));
+
+    // --discover finds it by its command line.
+    let out2 = dir.path().join("discovered");
+    let o = heapspy(&[
+        "agent",
+        "--dry-run",
+        out2.to_str().unwrap(),
+        "--discover",
+        "victim.py",
+        "--once",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out2.join(format!("000001-{pid}-memory.pprof")).exists());
+
+    // A pid that is not CPython is an error, not a silent no-op.
+    let o = heapspy(&[
+        "agent",
+        "--dry-run",
+        out2.to_str().unwrap(),
+        "--pid",
+        &std::process::id().to_string(),
+        "--once",
+    ]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("cannot watch pid"));
+}
+
+#[test]
+#[ignore = "needs ptrace and /usr/bin/python3.12"]
+fn python312_agent() {
+    run_agent(12);
+}
+
+#[test]
+#[ignore = "needs ptrace and uv's Python 3.14"]
+fn python314_agent() {
+    run_agent(14);
+}
+
 fn crate_path(r: &heapspy_analyzer::report::Retainer) -> String {
     heapspy_analyzer::root_path_string(&r.path)
 }

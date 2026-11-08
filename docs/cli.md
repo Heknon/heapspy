@@ -13,6 +13,7 @@ same information in short form.
 - [watch](#watch): growth over time, as plain lines, or live counters
   ([`--counters`](#live-counters---counters))
 - [analyze](#analyze): one report, from a process or a file
+- [agent](#agent): continuous memory profiles, sent to Pyroscope
 - [dump](#dump), [record](#record): capture
 - [query](#query), [diff](#diff), [flamegraph](#flamegraph): dig into snapshots
 - [Global options, output and exit codes](#global-options-output-and-exit-codes)
@@ -25,6 +26,7 @@ same information in short form.
 | one readable report, right now | `sudo heapspy analyze --pid PID` |
 | know whether it leaks, and what, over minutes or hours, in a log | `sudo heapspy watch --pid PID --every 5m` |
 | graph memory and the GC every second, or feed your own graphs, without ever pausing the process | `top` (tab 6), or `sudo heapspy watch --pid PID --counters --json` |
+| keep memory profiles of production processes over days, in Pyroscope or Grafana | `sudo heapspy agent --server URL --discover NAME` |
 | keep a snapshot to analyze later, elsewhere, or attach to a bug | `sudo heapspy dump --pid PID -o app.hpy` |
 | know which code allocated the memory that stays alive | `top --alloc`, or `record` then `analyze --allocations` |
 | follow one object or type to what holds it | `heapspy query app.hpy --retaining-path-type T` |
@@ -273,6 +275,87 @@ away (`| head`), `watch` stops quietly. `--every` defaults to `1s` here;
 | `--dir DIR` | `watch-PID` | where the first and the latest snapshot are kept |
 | `--top N` | `10` | rows in the summary |
 | `--json` | off | JSON Lines instead of text |
+
+## agent
+
+```sh
+sudo heapspy agent --server http://pyroscope:4040 --pid 1234
+sudo heapspy agent --server http://pyroscope:4040 --discover gunicorn --tag env=prod
+sudo heapspy agent --server http://pyroscope:4040 --pid 1234 --memory --retained --alloc
+```
+
+Runs until Ctrl-C (or until every watched process has exited), collecting
+memory profiles and sending them to [Pyroscope](https://grafana.com/oss/pyroscope/)
+(or Grafana Cloud Profiles). There they are flame graphs you can scrub
+through time, compare between two moments, and filter by label, next to the
+CPU profiles of the same service.
+
+Each kind of profile is opt-in, and none of them stops the process unless
+you ask:
+
+| Flag | Profile in Pyroscope | What it shows | Cost to the process |
+|---|---|---|---|
+| `--memory` (the default when none is chosen) | `heapspy_memory` · `resident` bytes | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
+| `--retained` | `memory` · `inuse_space` bytes | who holds the memory: the [retention flame graph](#flamegraph) of a snapshot, every `--retained-every` (5m). Labelled `heapspy_snapshot=approximate` or `stopped` | not stopped (Linux): the snapshot is approximate. `--stop` takes exact snapshots and pauses the process for each walk |
+| `--alloc` | `memory` · `alloc_space` bytes | what allocated memory: Python stacks of sampled allocations, during a window of `--alloc-for` (30s) every `--alloc-every` (5m) | never stopped: eBPF on Linux (root or `CAP_BPF` and `CAP_PERFMON`), ETW on Windows (elevated). A few percent while a window runs |
+
+**Which processes.** `--pid` (repeatable) watches given processes; a pid
+that is not a CPython heapspy can read is an error. `--discover TEXT`
+reads the process list every 10 seconds and picks up every CPython process
+whose command line contains TEXT, ignoring case (on Windows, whose
+executable name does), including those that start later. A process that
+exits is let go. One agent per host or container is enough.
+
+**Labels.** Every profile has `service_name` (`--app-name`, else the
+script's or module's name: `app/server.py` → `server`, `-m uvicorn` →
+`uvicorn`), `pid`, `hostname`, and each `--tag KEY=VALUE`. Keys use
+letters, digits and `_`, as Pyroscope requires.
+
+**Sending.** Profiles are pprof, pushed to `/push.v1.PusherService/Push`,
+the endpoint Grafana Alloy uses. One thread sends, so collecting never
+waits for the network. When the server cannot be reached (or answers 429
+or 5xx), profiles wait in memory, at most 512, and are tried again with a
+growing delay up to a minute; the agent says so once a minute. A refusal
+(401, 400) drops the profile and says why. On exit the agent prints how
+many it sent and dropped.
+
+**Credentials** come from the environment, so they never show in `ps`:
+
+```sh
+# Grafana Cloud: the stack's Profiles user id and an access policy token
+export HEAPSPY_PYROSCOPE_PASSWORD=glc_...
+sudo -E heapspy agent --server https://profiles-prod-001.grafana.net \
+    --basic-auth-user 123456 --discover myapp
+# A bearer token, for a proxy in front of Pyroscope
+export HEAPSPY_PYROSCOPE_TOKEN=...
+```
+
+`--tenant-id` sets `X-Scope-OrgID` for a multi-tenant Pyroscope.
+
+**Before sending anything,** `--dry-run DIR` writes each profile as
+`DIR/NNNNNN-PID-KIND.pprof` with its labels in a `.json` next to it, and
+`--once` collects one round from each process and exits. The files open
+in `go tool pprof`.
+
+| Option | Default | |
+|---|---|---|
+| `--server URL` | | Pyroscope's base URL (`http://` or `https://`) |
+| `--dry-run DIR` | | write profiles to DIR instead of sending them |
+| `--pid PID` | | a process to watch, repeatable |
+| `--discover TEXT` | | watch CPython processes whose command line contains TEXT |
+| `--app-name NAME` | script or module name | `service_name` |
+| `--tag KEY=VALUE` | | a label for every profile, repeatable |
+| `--memory`, `--memory-every` | on, `15s` | where the memory is |
+| `--retained`, `--retained-every` | off, `5m` | who holds it |
+| `--stop` | off | stop the process for each retained snapshot |
+| `--alloc`, `--alloc-every`, `--alloc-for` | off, `5m`, `30s` | what allocated it |
+| `--alloc-events KINDS` | `arena,large` | as `record --events` |
+| `--basic-auth-user USER` | | basic auth; password from `HEAPSPY_PYROSCOPE_PASSWORD` |
+| `--tenant-id ID` | | `X-Scope-OrgID` |
+| `--once` | off | one round, then exit |
+
+A heapspy built without the `tls` Cargo feature (on by default) sends only
+to `http://` servers.
 
 ## analyze
 

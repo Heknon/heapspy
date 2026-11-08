@@ -13,7 +13,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, K32GetProcessMemoryInfo,
@@ -215,6 +216,31 @@ pub fn process_memory(pid: u32) -> Option<(u64, u64)> {
         )
     };
     (ok != 0).then_some((c.WorkingSetSize as u64, c.PrivateUsage as u64))
+}
+
+/// Every process: (pid, executable file name), from a Toolhelp snapshot.
+pub fn processes() -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    // SAFETY: Toolhelp snapshot iteration with a correctly sized entry.
+    unsafe {
+        let snap = Handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if snap.0 == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap.0, &mut e);
+        while ok != 0 {
+            let n = e
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(e.szExeFile.len());
+            out.push((e.th32ProcessID, String::from_utf16_lossy(&e.szExeFile[..n])));
+            ok = Process32NextW(snap.0, &mut e);
+        }
+    }
+    out
 }
 
 /// Thread ids of `pid`, from a Toolhelp snapshot.

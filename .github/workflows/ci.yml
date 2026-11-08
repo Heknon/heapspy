@@ -49,7 +49,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       # The musl wheel is a release target; libc's signatures differ there.
+      # ring (TLS for `agent`) compiles C for the target: clang can, where
+      # the runner has no musl gcc.
       - name: cargo clippy (musl)
+        env:
+          CC_x86_64_unknown_linux_musl: clang
         run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
       - name: cargo test
         run: cargo test --workspace

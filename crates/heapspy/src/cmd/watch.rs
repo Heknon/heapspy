@@ -247,11 +247,7 @@ pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
 }
 
 pub(super) fn process_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        Path::new(&format!("/proc/{pid}")).exists()
-    } else {
-        true
-    }
+    live::process_alive(pid)
 }
 
 fn round_from(r: &AnalyzeReport, n: u32, elapsed: Duration, pause: Option<Duration>) -> Round {
@@ -380,7 +376,7 @@ pub(super) fn clock(secs: f64) -> String {
     }
 }
 
-pub(super) fn human_duration(d: Duration) -> String {
+pub(crate) fn human_duration(d: Duration) -> String {
     let s = d.as_secs();
     if d.subsec_millis() != 0 || s == 0 {
         format!("{}ms", d.as_millis())
