@@ -172,6 +172,9 @@ fn regs(_tid: i32) -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
+/// Readable mappings, and the brk heap's `start..end`.
+pub(super) type FreshMaps = (Vec<MappedRange>, Option<(u64, u64)>);
+
 fn parse_maps(text: &str) -> Vec<MapEntry> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -526,6 +529,30 @@ impl Inner {
         self.modules.clone()
     }
 
+    /// The mappings as they are now (`maps` is read once, at open), and
+    /// the brk heap among them.
+    pub(super) fn fresh_maps(&self) -> Result<FreshMaps> {
+        let maps = parse_maps(&std::fs::read_to_string(format!(
+            "/proc/{}/maps",
+            self.pid
+        ))?);
+        let ranges = maps
+            .iter()
+            .filter(|m| m.perms.read)
+            .map(|m| MappedRange {
+                start: m.start,
+                size: m.end - m.start,
+                perms: m.perms,
+                file: m.path.clone().filter(|p| p.starts_with('/')),
+            })
+            .collect();
+        let mut heap = maps.iter().filter(|m| m.path.as_deref() == Some("[heap]"));
+        let brk = heap
+            .next()
+            .map(|first| (first.start, heap.fold(first.end, |e, m| e.max(m.end))));
+        Ok((ranges, brk))
+    }
+
     /// The brk heap: the `[heap]` lines of `maps`, first start to last end
     /// (the kernel may list it in pieces).
     pub(super) fn brk_range(&self) -> Option<(u64, u64)> {
@@ -544,6 +571,66 @@ impl Inner {
 
     pub(super) fn memory_summary(&self) -> Option<MemorySummary> {
         self.summary.clone()
+    }
+
+    /// [`MemorySource::read_many`]: through the cache for a stopped target,
+    /// else `process_vm_readv` with up to `IOV_MAX` ranges per call. The
+    /// kernel stops a call at the first range it cannot read and reports
+    /// the bytes before it, so that range is retried on its own (the
+    /// `/proc/<pid>/mem` fallback) and the call resumes after it.
+    ///
+    /// [`MemorySource::read_many`]: crate::source::MemorySource::read_many
+    pub(super) fn read_many(&self, addrs: &[u64], len: usize, out: &mut [u8]) -> Vec<bool> {
+        let mut ok = vec![false; addrs.len()];
+        if len == 0 || out.len() < addrs.len() * len {
+            return ok;
+        }
+        if self.cached {
+            for (i, (&a, buf)) in addrs.iter().zip(out.chunks_exact_mut(len)).enumerate() {
+                ok[i] = self.read(a, buf).is_ok();
+            }
+            return ok;
+        }
+        const IOV_MAX: usize = 1024;
+        let mut i = 0;
+        while i < addrs.len() {
+            let n = (addrs.len() - i).min(IOV_MAX);
+            let local = libc::iovec {
+                iov_base: out[i * len..].as_mut_ptr().cast(),
+                iov_len: n * len,
+            };
+            let remote: Vec<libc::iovec> = addrs[i..i + n]
+                .iter()
+                .map(|&a| libc::iovec {
+                    iov_base: a as *mut libc::c_void,
+                    iov_len: len,
+                })
+                .collect();
+            // SAFETY: `local` covers `n * len` bytes of `out`, checked above;
+            // the remote side is only read by the kernel.
+            let got = unsafe {
+                libc::process_vm_readv(
+                    self.pid as i32,
+                    &local,
+                    1,
+                    remote.as_ptr(),
+                    n as libc::c_ulong,
+                    0,
+                )
+            };
+            let whole = if got > 0 { got as usize / len } else { 0 };
+            for flag in ok.iter_mut().skip(i).take(whole) {
+                *flag = true;
+            }
+            i += whole;
+            if whole < n {
+                // The range the kernel stopped at, on its own.
+                let buf = &mut out[i * len..(i + 1) * len];
+                ok[i] = self.read_direct(addrs[i], buf).is_ok();
+                i += 1;
+            }
+        }
+        ok
     }
 
     /// Read exactly `buf.len()` bytes, uncached.

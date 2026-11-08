@@ -42,6 +42,9 @@ sudo heapspy watch --pid 1234 --every 30s   # what grows, and how steadily
   On Ctrl-C it prints each holder's growth with a verdict: likely leak, keep
   watching, or fine.
 
+To watch memory over days in production, see
+[Continuous profiling](#continuous-profiling-and-live-counters).
+
 Reading another process needs ptrace rights on Linux and an elevated prompt
 on Windows; reading snapshot files needs nothing.
 
@@ -91,6 +94,46 @@ Kept alive by
 [docs/cli.md](docs/cli.md#reading-the-reports) explains every row and
 column, and what to do when each one is large.
 
+## Continuous profiling and live counters
+
+`heapspy agent` runs alongside your services and sends memory profiles to
+[Pyroscope](https://grafana.com/oss/pyroscope/) or Grafana Cloud Profiles,
+where they are flame graphs over time, next to CPU profiles:
+
+```sh
+sudo heapspy agent --server http://pyroscope:4040 --discover gunicorn --tag env=prod
+sudo heapspy agent --server http://pyroscope:4040 --pid 1234 --memory --retained --alloc
+sudo heapspy agent --dry-run profiles/ --pid 1234 --once   # see what would be sent
+```
+
+Each profile is opt-in, and none stops the process unless you add `--stop`:
+
+| | profile | what it shows | cost to the process |
+|---|---|---|---|
+| `--memory` (default) | `heapspy_memory` | where the memory is: Python objects by size, pymalloc's free space, malloc's heaps, the rest of RSS | never stopped; read from counters every 15 s |
+| `--retained` | `memory:inuse_space` | who holds it: a retention flame graph every 5 minutes | not stopped (approximate, Linux); `--stop` for exact snapshots |
+| `--alloc` | `memory:alloc_space` | which code allocated it, sampled in 30-second windows | never stopped (eBPF, ETW) |
+
+`--discover` picks up every CPython process whose command line matches, as
+it starts. Profiles carry `service_name`, `pid`, `hostname` and your
+`--tag`s. Credentials are read from the environment
+(`HEAPSPY_PYROSCOPE_PASSWORD`, `HEAPSPY_PYROSCOPE_TOKEN`), never the command
+line. Details in [docs/cli.md](docs/cli.md#agent).
+
+The counters behind `--memory` can also be read directly:
+
+```sh
+sudo heapspy watch --pid 1234 --counters --every 250ms          # a line per sample
+sudo heapspy watch --pid 1234 --counters --json | your-grapher  # JSON Lines
+```
+
+They are what CPython and glibc keep about their own memory: the GC's
+counts and collections, pymalloc's arenas and blocks in use by size, the
+size of malloc's heaps, and RSS. Reading them follows no object pointers,
+so it is sound while the process runs, and fast: about a millisecond for a
+heap of tens of MiB, 30 ms per GiB. `top` graphs them every second in its
+Graphs tab. They say how memory moves, not who holds it; snapshots say that.
+
 ## Snapshots
 
 A snapshot is a file holding the object graph, the native heap blocks and
@@ -111,7 +154,9 @@ heapspy flamegraph app.hpy -o app.svg          # retention flame graph
 
 Taking a snapshot stops the process for the walk: about 0.1 s for a small
 heap, seconds for millions of objects. The pause is printed. `--no-stop`
-walks it while it runs, for an approximate snapshot (Linux).
+(`dump`, `analyze --pid`, `watch`, `top`; Linux) walks it while it runs,
+for an approximate snapshot: objects can be missed, so `watch` never calls
+a holder a leak from those.
 
 Snapshots record types, sizes and references, not string or bytes contents,
 which often hold tokens and user data. `--capture-contents` records them,
@@ -143,9 +188,11 @@ stacks for pointers, so native memory gets owners too. The analyzer builds
 the dominator tree over all of it: an object's retained size is everything
 only it keeps alive.
 
-`top` and `watch` repeat this on a schedule. `top` also reads memory totals
-from the OS and each thread's Python stack every second, without stopping
-the process.
+`top`, `watch` and `agent --retained` repeat this on a schedule. Without
+stopping the process, `top` also reads memory totals from the OS, each
+thread's Python stack and CPython's own counters every second: the GC's
+state, and pymalloc's arena table and pool headers (one batched read per
+1024 pools). `watch --counters` and `agent --memory` read only those.
 
 ## Supported targets
 
@@ -154,7 +201,8 @@ the process.
 | OS | Linux (x86_64, aarch64), Windows (x86_64) |
 | CPython | 3.12, 3.13, 3.14, 64-bit, default builds. Free-threaded and debug builds are refused. |
 | Native heap walk | glibc malloc 2.15 to 2.43; the Windows heap from minidumps. With other allocators (jemalloc, tcmalloc, mimalloc) native memory is one total. |
-| Linux permissions | `CAP_SYS_PTRACE` or a permissive `kernel.yama.ptrace_scope`; in containers, `SYS_PTRACE` and a shared PID namespace. `record` and `top --alloc` need root or `CAP_BPF` + `CAP_PERFMON`. |
+| Linux permissions | `CAP_SYS_PTRACE` or a permissive `kernel.yama.ptrace_scope`; in containers, `SYS_PTRACE` and a shared PID namespace. `record`, `top --alloc` and `agent --alloc` need root or `CAP_BPF` + `CAP_PERFMON`. |
+| Profiles sent to | Pyroscope 1.x and Grafana Cloud Profiles (the push API Grafana Alloy uses), over HTTP or HTTPS |
 | Windows permissions | an elevated prompt to read another user's process |
 
 ## Limits
@@ -169,16 +217,21 @@ the process.
 - **Native ownership.** A native block's owner is whatever points to it.
   A snapshot cannot say who allocated it; `record` can, for allocations made
   while it runs (native heap events on Windows only for now).
+- **Live counters are approximate.** Each is read on its own while the
+  process runs. malloc's heaps count the brk heap and thread arenas, not
+  allocations of 128 KiB and more, which get their own mappings (they are
+  in RSS). glibc only; on Windows the counters have no malloc part.
 - **Layouts.** CPython's internal layouts change between versions. heapspy
   uses `_Py_DebugOffsets` on 3.13 and later, DWARF or PDB symbols when
   present, and shipped per-version tables otherwise.
 
 ## For tools and agents
 
-Every command except `top` and `flamegraph` takes `--json`. The schema is
-versioned and stable within a version: fields are only added
+Every command except `top`, `flamegraph` and `agent` takes `--json`. The
+schema is versioned and stable within a version: fields are only added
 ([docs/json-schema.md](docs/json-schema.md)). Errors are JSON documents too,
-with codes such as `permission_denied` or `not_python`.
+with codes such as `permission_denied` or `not_python`. `watch --json` is a
+stream of JSON Lines (`watch_round`, `sample`, and a summary at the end).
 
 [heapspy-mcp](python/heapspy-mcp/README.md) (`pip install heapspy-mcp`)
 exposes heapspy to coding agents over the Model Context Protocol: find the
@@ -190,7 +243,7 @@ object graph is never sent to the model.
 
 | | |
 |---|---|
-| [docs/cli.md](docs/cli.md) | every command, its output, and what it costs the process |
+| [docs/cli.md](docs/cli.md) | every command, its output, and what it costs the process; [the agent](docs/cli.md#agent) |
 | [docs/flamegraph.md](docs/flamegraph.md) | reading retention and allocation flame graphs |
 | [docs/allocation-sampling.md](docs/allocation-sampling.md) | how `record` samples allocations from outside |
 | [docs/json-schema.md](docs/json-schema.md) | the `--json` schema, with examples in `docs/examples/` |

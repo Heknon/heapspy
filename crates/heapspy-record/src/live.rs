@@ -57,3 +57,46 @@ pub fn open(pid: u32) -> Result<Box<dyn MemorySource>> {
         )))
     }
 }
+
+/// The OS's memory numbers for `pid` on Windows: the working set and the
+/// private commit (`PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`), in bytes.
+/// Cheap: no reads of the target's memory. `None` on other systems, or
+/// when the process cannot be opened.
+pub fn windows_memory(pid: u32) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        crate::windows::live::process_memory(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Every process on Windows: (pid, executable file name). Empty elsewhere
+/// (Linux callers read `/proc`).
+pub fn windows_processes() -> Vec<(u32, String)> {
+    #[cfg(windows)]
+    {
+        crate::windows::live::processes()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// The command line of `pid` on Windows. `None` elsewhere (Linux callers
+/// read `/proc`), or when it cannot be read.
+pub fn windows_command_line(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        crate::windows::live::command_line(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}

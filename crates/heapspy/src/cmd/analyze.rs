@@ -35,7 +35,17 @@ pub fn run(args: AnalyzeArgs, st: Style) -> anyhow::Result<()> {
                 source_ref: spec.reference(),
                 ..DumpOptions::default()
             };
-            let (stats, _) = super::capture(&spec, &opts, &out, args.json)?;
+            let (stats, _) = if args.no_stop {
+                if !args.json {
+                    eprintln!(
+                        "heapspy: --no-stop: the process keeps running during the walk, so this \
+                         report is approximate"
+                    );
+                }
+                super::dump::capture_unstopped(pid, &opts, &out)?
+            } else {
+                super::capture(&spec, &opts, &out, args.json)?
+            };
             // Read right after the snapshot: what each thread was doing.
             let threads = live::StackReader::open(pid)
                 .map(|mut r| r.read(8))
@@ -46,6 +56,8 @@ pub fn run(args: AnalyzeArgs, st: Style) -> anyhow::Result<()> {
             }
             if let Some(p) = stats.pause {
                 shown.push_str(&format!(" · stopped {} ms", p.as_millis()));
+            } else if args.no_stop {
+                shown.push_str(" · not stopped, approximate");
             }
             live_info = Some((pid, threads));
             (out, shown)

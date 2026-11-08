@@ -159,6 +159,24 @@ impl LiveProcess {
     }
 }
 
+impl LiveProcess {
+    /// What glibc malloc holds from the OS now ([`glibc_heap::heap_totals`]),
+    /// from a fresh read of `/proc/<pid>/maps`. Does not stop the target.
+    ///
+    /// [`glibc_heap::heap_totals`]: super::glibc_heap::heap_totals
+    pub fn heap_totals(&self) -> Option<super::glibc_heap::HeapTotals> {
+        #[cfg(target_os = "linux")]
+        {
+            let (ranges, brk) = self.inner.fresh_maps().ok()?;
+            super::glibc_heap::heap_totals(self, &ranges, brk)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl MemorySource for LiveProcess {
     fn native_blocks(&self) -> Result<Option<Vec<super::NativeBlock>>> {
@@ -180,6 +198,9 @@ impl MemorySource for LiveProcess {
     }
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
         self.inner.read(addr, buf)
+    }
+    fn read_many(&self, addrs: &[u64], len: usize, out: &mut [u8]) -> Vec<bool> {
+        self.inner.read_many(addrs, len, out)
     }
     fn mapped_ranges(&self) -> Result<Vec<MappedRange>> {
         Ok(self.inner.mapped_ranges())
@@ -226,5 +247,33 @@ impl MemorySource for LiveProcess {
     }
     fn memory_summary(&self) -> Option<MemorySummary> {
         None
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_many_batches_and_skips_what_it_cannot_read() {
+        // Our own process: a buffer we know, with an unmapped page among
+        // the addresses, and more addresses than one system call takes.
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let base = data.as_ptr() as u64;
+        let src = LiveProcess::open_running(std::process::id()).unwrap();
+        let mut addrs: Vec<u64> = (0..3000u64).map(|i| base + (i * 7) % 4000).collect();
+        addrs[5] = 8; // the zero page: never mapped
+        addrs[2500] = 16;
+        let mut out = vec![0u8; addrs.len() * 16];
+        let ok = src.read_many(&addrs, 16, &mut out);
+        for (i, (&a, got)) in addrs.iter().zip(out.chunks_exact(16)).enumerate() {
+            if i == 5 || i == 2500 {
+                assert!(!ok[i], "{i}");
+                continue;
+            }
+            assert!(ok[i], "{i}");
+            let o = (a - base) as usize;
+            assert_eq!(got, &data[o..o + 16], "{i}");
+        }
     }
 }

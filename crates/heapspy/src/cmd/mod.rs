@@ -11,6 +11,7 @@ use crate::cli::Command;
 
 mod allocations;
 mod analyze;
+mod counters;
 mod diff;
 mod dump;
 mod flamegraph;
@@ -19,12 +20,14 @@ mod record;
 mod top;
 mod watch;
 
-pub(crate) use dump::capture;
+pub(crate) use dump::{capture, capture_unstopped};
+pub(crate) use watch::human_duration;
 
 pub fn run(command: Command, st: Style) -> anyhow::Result<()> {
     match command {
         Command::Top(a) => top::run(a, st),
         Command::Watch(a) => watch::run(a, st),
+        Command::Agent(a) => crate::agent::run(a),
         Command::Dump(a) => dump::run(a),
         Command::Analyze(a) => analyze::run(a, st),
         Command::Query(a) => query::run(a),

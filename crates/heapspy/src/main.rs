@@ -2,10 +2,12 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+mod agent;
 mod cli;
 mod cmd;
 mod live;
 mod output;
+mod sample;
 
 fn main() -> ExitCode {
     // `heapspy __guardian`, started by the Windows recorder: not a command.

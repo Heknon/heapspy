@@ -10,12 +10,16 @@ use heapspy_analyzer::report::Retainer;
 use heapspy_analyzer::root_path_string;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Frame;
 
 use super::state::{sparkline, AllocState, App, Sort, Tab};
 use crate::live::thread_label;
+use crate::sample::Sample;
 
 pub const LEAKED_SITE: &str = "(leaked native blocks)";
 /// Pseudo-holder for the interpreter's own holders, folded into one row.
@@ -116,6 +120,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Tab::Native => draw_native(f, app, body),
         Tab::Threads => draw_threads(f, app, body),
         Tab::Allocated => draw_allocated(f, app, body),
+        Tab::Graphs => draw_graphs(f, app, body),
     }
     draw_footer(f, app, footer);
     if app.detail.is_some() {
@@ -303,8 +308,15 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         }
         spans.push(Span::raw(" "));
     }
-    let sort = app.sort[app.tab.index()];
-    spans.push(Span::styled(format!("   sort: {} ▼", sort.label()), dim()));
+    if app.tab == Tab::Graphs {
+        spans.push(Span::styled(
+            format!("   window: {} ▼", window_label(app.graph_window)),
+            dim(),
+        ));
+    } else {
+        let sort = app.sort[app.tab.index()];
+        spans.push(Span::styled(format!("   sort: {} ▼", sort.label()), dim()));
+    }
     if let AllocState::Running { until, .. } = &app.alloc {
         let left = until
             .saturating_duration_since(std::time::Instant::now())
@@ -954,10 +966,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     };
     let mut spans = vec![Span::raw(" ")];
+    let s_does = if app.tab == Tab::Graphs {
+        "window"
+    } else {
+        "sort"
+    };
     for (k, what) in [
         ("enter", "details"),
-        ("1-5", "tabs"),
-        ("s", "sort"),
+        ("1-6", "tabs"),
+        ("s", s_does),
         ("d", "snapshot now"),
         ("a", "allocations"),
         ("w", "save snapshot"),
@@ -1022,7 +1039,7 @@ fn styled_detail_line(l: &str) -> Line<'static> {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = popup(area, 78, 24);
+    let r = popup(area, 78, 25);
     f.render_widget(Clear, r);
     let lines = vec![
         Line::from(Span::styled("Top lines", bold())),
@@ -1037,10 +1054,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::raw("  3 Native     who holds native memory, malloc arenas and free space"),
         Line::raw("  4 Threads    what each thread runs now, and its most frequent lines"),
         Line::raw("  5 Allocated  with allocation sampling: who allocated what is alive"),
+        Line::raw("  6 Graphs     RSS, pymalloc, malloc and GC counters, every second"),
         Line::raw(""),
         Line::from(Span::styled("Keys", bold())),
         Line::raw("  ↑↓ jk PgUp PgDn  move     enter  details     esc  close"),
-        Line::raw("  s  sort      d  snapshot now     w  save the latest snapshot"),
+        Line::raw("  s  sort (Graphs: window)  d  snapshot now  w  save the latest snapshot"),
         Line::raw("  i  show interpreter internals type by type (folded by default)"),
         Line::raw("  a  start/stop allocation sampling   space  pause   q  quit"),
         Line::raw(""),
@@ -1053,4 +1071,295 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" help ")),
         r,
     );
+}
+
+/// `5m`, `30m`, `1m`.
+fn window_label(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match (s / 60, s % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m{s}s"),
+    }
+}
+
+/// Labels for a bytes axis from 0 to `max`.
+fn byte_labels(max: f64) -> Vec<Span<'static>> {
+    [0.0, max / 2.0, max]
+        .iter()
+        .map(|&v| Span::styled(compact(v as u64), dim()))
+        .collect()
+}
+
+/// The x axis of the graphs: the window, ending now.
+fn time_axis(window: std::time::Duration) -> Axis<'static> {
+    let w = window.as_secs_f64();
+    Axis::default()
+        .bounds([-w, 0.0])
+        .labels(vec![
+            Span::styled(format!("-{}", window_label(window)), dim()),
+            Span::styled(format!("-{}", window_label(window / 2)), dim()),
+            Span::styled("now", dim()),
+        ])
+        .style(dim())
+}
+
+/// A line of the memory graph: its name, color and value.
+type MemorySeries = (&'static str, Color, fn(&Sample) -> Option<u64>);
+/// (seconds before now, value) points of a graph.
+type Points = Vec<(f64, f64)>;
+
+const MEMORY_SERIES: [MemorySeries; 4] = [
+    ("RSS", Color::Blue, Sample::rss),
+    ("pymalloc arenas", Color::Green, Sample::arena_bytes),
+    ("Python objects", Color::Cyan, Sample::python_bytes),
+    ("malloc heaps", Color::Magenta, Sample::malloc_bytes),
+];
+
+/// The Graphs tab: counter samples ([`crate::sample`]) taken every second
+/// without stopping the process.
+fn draw_graphs(f: &mut Frame, app: &App, area: Rect) {
+    if app.live.is_empty() {
+        let text = match &app.live_note {
+            Some(e) => format!(" no counters: {e}"),
+            None => " waiting for the first sample…".to_string(),
+        };
+        f.render_widget(Paragraph::new(Span::styled(text, dim())), area);
+        return;
+    }
+    let [top, bottom] =
+        Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(area);
+    let [gc_area, info] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(bottom);
+
+    // Memory: four byte series on one chart.
+    let series = &MEMORY_SERIES;
+    let points: Vec<(&MemorySeries, Points)> = series
+        .iter()
+        .map(|m| (m, app.live_series(m.2)))
+        .filter(|(_, p)| !p.is_empty())
+        .collect();
+    let max = points
+        .iter()
+        .flat_map(|(_, p)| p.iter().map(|x| x.1))
+        .fold(1.0f64, f64::max)
+        * 1.1;
+    let datasets: Vec<Dataset> = points
+        .iter()
+        .map(|((n, c, _), p)| {
+            Dataset::default()
+                .name(*n)
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(*c))
+                .data(p)
+        })
+        .collect();
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" memory, every second, the process not stopped "),
+        )
+        .x_axis(time_axis(app.graph_window))
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, max])
+                .labels(byte_labels(max))
+                .style(dim()),
+        )
+        .legend_position(Some(ratatui::widgets::LegendPosition::TopLeft))
+        .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)));
+    f.render_widget(chart, top);
+
+    // GC: generation 0's count against its threshold. It climbs as tracked
+    // objects are allocated and drops to 0 at each collection.
+    let gen0 = app.live_series(|s| Some(s.gc()?.generations[0].count.max(0) as u64));
+    let threshold = app
+        .live
+        .back()
+        .and_then(|(_, s)| s.gc())
+        .map_or(0, |g| g.generations[0].threshold);
+    let ends = app.live_ends();
+    let collections = ends
+        .and_then(|(a, b)| Some(b.collections()?.saturating_sub(a.collections()?)))
+        .unwrap_or(0);
+    let gc_max = gen0
+        .iter()
+        .map(|p| p.1)
+        .fold(threshold as f64, f64::max)
+        .max(1.0)
+        * 1.1;
+    let line = [
+        (-app.graph_window.as_secs_f64(), threshold as f64),
+        (0.0, threshold as f64),
+    ];
+    let gc_chart = Chart::new(vec![
+        Dataset::default()
+            .name("threshold")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(dim())
+            .data(&line),
+        Dataset::default()
+            .name("gen0 count")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Yellow))
+            .data(&gen0),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " GC · {collections} collection{} in the window ",
+        if collections == 1 { "" } else { "s" }
+    )))
+    .x_axis(time_axis(app.graph_window))
+    .y_axis(
+        Axis::default()
+            .bounds([0.0, gc_max])
+            .labels(vec![
+                Span::styled("0", dim()),
+                Span::styled(format!("{:.0}", gc_max), dim()),
+            ])
+            .style(dim()),
+    )
+    .legend_position(Some(ratatui::widgets::LegendPosition::TopLeft))
+    .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)));
+    f.render_widget(gc_chart, gc_area);
+
+    // Numbers: now, and change per minute over the window.
+    let Some((_, last)) = app.live.back() else {
+        return;
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (name, c, v) in series {
+        let Some(now) = v(last) else { continue };
+        let r = app.live_rate(v);
+        lines.push(Line::from(vec![
+            Span::styled("■ ", Style::default().fg(*c)),
+            Span::raw(format!("{:<16}", name)),
+            Span::styled(format!("{:>10}", format_bytes(now)), bold()),
+            Span::raw("  "),
+            rate_span(r, now),
+            Span::styled("/min", dim()),
+        ]));
+    }
+    if let Some(a) = last.python.as_ref().and_then(|p| p.allocator.as_ref()) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} arenas (most {}), {} free inside them",
+                a.arenas,
+                a.arenas_highwater,
+                format_bytes(a.free_bytes)
+            ),
+            dim(),
+        )));
+        // The size classes that hold the most bytes.
+        let mut classes = a.size_classes.clone();
+        classes.sort_by_key(|c| std::cmp::Reverse(c.blocks * u64::from(c.size)));
+        let top: Vec<String> = classes
+            .iter()
+            .take(3)
+            .map(|c| format!("{} B × {}", c.size, c.blocks))
+            .collect();
+        if !top.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  most bytes in blocks of {}", top.join(", ")),
+                dim(),
+            )));
+        }
+    }
+    if let Some(g) = last.gc() {
+        let gens: Vec<String> = g
+            .generations
+            .iter()
+            .map(|x| format!("{}/{}", x.count.max(0), x.threshold))
+            .collect();
+        let mut t = format!("  GC counts {} ", gens.join("  "));
+        if !g.enabled {
+            t.push_str("· disabled ");
+        }
+        if let Some((a, b)) = ends {
+            let freed = |s: &Sample| {
+                s.gc().map_or(0, |g| {
+                    g.generations.iter().map(|x| x.collected).sum::<u64>()
+                })
+            };
+            t.push_str(&format!("· {} freed", freed(b).saturating_sub(freed(a))));
+        }
+        lines.push(Line::from(Span::styled(t, dim())));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  each sample read in {:.1} ms, approximate", last.took_ms),
+        dim(),
+    )));
+    if let Some(e) = &app.live_note {
+        lines.push(Line::from(Span::styled(
+            format!("  no Python counters: {}", shorten(e, 60)),
+            dim(),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" now · per minute "),
+            )
+            .wrap(Wrap { trim: false }),
+        info,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::*;
+    use crate::cmd::top::state::Tab;
+
+    fn screen(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn graphs_tab_draws_the_counters() {
+        let mut app = App::new(1, Duration::from_secs(10), false);
+        app.tab = Tab::Graphs;
+        assert!(screen(&app, 120, 30).contains("waiting for the first sample"));
+        let t0 = Instant::now();
+        for i in 0..120u64 {
+            let s =
+                crate::sample::fake(i + 1, i as f64, (100 + i) << 20, (20 + i / 2) << 20, i / 10);
+            app.on_vitals(t0 + Duration::from_secs(i), None, Vec::new(), Some(s));
+        }
+        let text = screen(&app, 120, 32);
+        for want in [
+            "6 Graphs",
+            "window: 5m",
+            "memory, every second",
+            "RSS",
+            "Python objects",
+            "GC · 19 collections in the window",
+            "219.0 MiB",
+            "approximate",
+        ] {
+            assert!(text.contains(want), "{want:?} missing in:\n{text}");
+        }
+        assert!(text.contains("-2m30s"), "{text}");
+        app.next_graph_window();
+        assert!(screen(&app, 120, 32).contains("window: 15m"));
+    }
 }

@@ -8,16 +8,18 @@ CI on GitHub does not run on every push. Run these before you push:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo check --workspace --target x86_64-pc-windows-gnu
-cargo check --workspace --target x86_64-unknown-linux-musl
+cargo check --workspace --target x86_64-pc-windows-gnu --no-default-features
+CC_x86_64_unknown_linux_musl=clang cargo check --workspace --target x86_64-unknown-linux-musl
 ```
 
 The last two commands type-check the code for the other release targets.
 The Windows one checks the Windows `cfg` code from a Linux or macOS machine;
 the musl one catches libc signatures that differ from glibc's. Add the
 targets once with `rustup target add x86_64-pc-windows-gnu
-x86_64-unknown-linux-musl`. Neither links anything, so no MinGW or musl
-toolchain is needed.
+x86_64-unknown-linux-musl`. Neither links anything. The one C dependency is
+`ring`, behind the `tls` feature (HTTPS for `heapspy agent`, on by default):
+it needs a C compiler for the target, which clang is for musl; the Windows
+check leaves the feature out, so no MinGW is needed.
 
 ## Running CI on GitHub
 
@@ -64,6 +66,14 @@ ptrace permission:
 ```sh
 HEAPSPY_PY="$(uv python find 3.13)" \
     cargo test -p heapspy-reader --test native_heap_live -- --ignored --test-threads 1
+```
+
+The e2e job also checks the live counters (`watch --counters`, `top`'s
+Graphs tab) against what a real CPython's `gc` and `sys` report, read
+without stopping it (`crates/heapspy-reader/tests/counters_live.rs`):
+
+```sh
+cargo test -p heapspy-reader --test counters_live -- --ignored --test-threads 1
 ```
 
 The same test runs against older and other glibc releases in

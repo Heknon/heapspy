@@ -5,6 +5,11 @@
 //! latest). Each new snapshot is written to `.next.hpy`, compared with
 //! `last.hpy`, then renamed over it, so `first.hpy` and `last.hpy` are always
 //! complete snapshots that `heapspy diff` can read.
+//!
+//! With `--no-stop` the snapshots are taken while the process runs
+//! ([`super::dump::capture_unstopped`]): approximate, so no holder is
+//! called a likely leak. With `--counters` no snapshot is taken at all; see
+//! [`super::counters`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +35,11 @@ const LEAKED: &str = "(leaked native blocks: nothing points to them)";
 /// One round's numbers.
 #[derive(Clone, Debug, Default, Serialize)]
 struct Round {
+    /// Always `watch_round`.
+    kind: &'static str,
     round: u32,
+    /// The snapshot was taken without stopping the process (`--no-stop`).
+    approximate: bool,
     /// Seconds since the first snapshot.
     elapsed_s: f64,
     rss_bytes: Option<u64>,
@@ -67,6 +76,8 @@ struct Verdict {
 struct Summary {
     kind: &'static str,
     pid: u32,
+    /// The snapshots were taken without stopping the process.
+    approximate: bool,
     rounds: u32,
     elapsed_s: f64,
     first: String,
@@ -75,6 +86,9 @@ struct Summary {
 }
 
 pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
+    if args.counters {
+        return super::counters::run(&args, &st);
+    }
     let pid = args.pid;
     let dir = args
         .dir
@@ -90,9 +104,12 @@ pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
     if !args.json {
         let mut head = format!(
             "watching pid {pid} · a snapshot every {} · first and latest kept in {}",
-            human_duration(args.every),
+            human_duration(args.interval()),
             dir.display()
         );
+        if args.no_stop {
+            head.push_str(" · not stopped: approximate");
+        }
         if let Some(cmd) = live::command_line(pid) {
             head = format!("{} · {head}", shorten(&cmd, 40));
         }
@@ -123,7 +140,7 @@ pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
 
     let started = Instant::now();
     let mut rounds: Vec<Round> = Vec::new();
-    let mut every = args.every;
+    let mut every = args.interval();
     let mut warned_pause = false;
     loop {
         let n = rounds.len() as u32 + 1;
@@ -134,7 +151,12 @@ pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
             source_ref: spec.reference(),
             ..DumpOptions::default()
         };
-        let stats = match super::capture(&spec, &opts, target, true) {
+        let captured = if args.no_stop {
+            super::dump::capture_unstopped(pid, &opts, target)
+        } else {
+            super::capture(&spec, &opts, target, true)
+        };
+        let stats = match captured {
             Ok((s, _)) => s,
             Err(e) if n > 1 && !process_alive(pid) => {
                 if !args.json {
@@ -150,6 +172,7 @@ pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
         let report =
             heapspy_analyzer::analyze(&snap, &format!("pid {pid}"), &AnalyzeOptions { top: 1 })?;
         let mut round = round_from(&report, n, elapsed, stats.pause);
+        round.approximate = args.no_stop;
         if n == 1 {
             std::fs::copy(&first, &last).context("cannot copy the first snapshot")?;
         } else {
@@ -223,12 +246,8 @@ pub fn run(args: WatchArgs, st: Style) -> anyhow::Result<()> {
     summary(&args, &st, &rounds, &first, &last)
 }
 
-fn process_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        Path::new(&format!("/proc/{pid}")).exists()
-    } else {
-        true
-    }
+pub(super) fn process_alive(pid: u32) -> bool {
+    live::process_alive(pid)
 }
 
 fn round_from(r: &AnalyzeReport, n: u32, elapsed: Duration, pause: Option<Duration>) -> Round {
@@ -240,6 +259,7 @@ fn round_from(r: &AnalyzeReport, n: u32, elapsed: Duration, pause: Option<Durati
         get("python")
     };
     Round {
+        kind: "watch_round",
         round: n,
         elapsed_s: elapsed.as_secs_f64(),
         rss_bytes: r.memory.rss_bytes,
@@ -293,7 +313,7 @@ fn apply_diff(round: &mut Round, d: &DiffReport, prev: Option<&Round>) {
     }
 }
 
-fn delta_cell(d: i64, st: &Style) -> String {
+pub(super) fn delta_cell(d: i64, st: &Style) -> String {
     let s = format_delta_bytes(d);
     if d > 0 {
         st.paint(Paint::Bad, s)
@@ -347,7 +367,7 @@ fn round_line(r: &Round, prev: Option<&Round>, st: &Style) -> String {
 }
 
 /// `m:ss` or `h:mm:ss` since the start.
-fn clock(secs: f64) -> String {
+pub(super) fn clock(secs: f64) -> String {
     let s = secs.round() as u64;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -356,7 +376,7 @@ fn clock(secs: f64) -> String {
     }
 }
 
-fn human_duration(d: Duration) -> String {
+pub(crate) fn human_duration(d: Duration) -> String {
     let s = d.as_secs();
     if d.subsec_millis() != 0 || s == 0 {
         format!("{}ms", d.as_millis())
@@ -402,8 +422,10 @@ fn outermost(sorted: Vec<Verdict>) -> Vec<(Verdict, Option<Verdict>)> {
     kept
 }
 
-/// Classify a site's per-round deltas.
-fn verdict(deltas: &[i64], total: i64) -> &'static str {
+/// Classify a site's per-round deltas. Snapshots of a process that kept
+/// running (`approximate`) can miss or double-count objects, so growth in
+/// them is never called a likely leak.
+fn verdict(deltas: &[i64], total: i64, approximate: bool) -> &'static str {
     let grown = deltas.iter().filter(|&&d| d > 0).count();
     let n = deltas.len().max(1);
     if total <= 0 {
@@ -412,7 +434,7 @@ fn verdict(deltas: &[i64], total: i64) -> &'static str {
         } else {
             "flat"
         }
-    } else if grown * 5 >= n * 4 && n >= 2 {
+    } else if grown * 5 >= n * 4 && n >= 2 && !approximate {
         "likely_leak"
     } else if grown > 0 {
         "growing_in_steps"
@@ -451,7 +473,7 @@ fn summary(
                 bytes_per_min: s.delta_retained_bytes as f64 / minutes,
                 rounds_grown: ds.iter().filter(|&&x| x > 0).count() as u32,
                 rounds_compared: ds.len() as u32,
-                verdict: verdict(&ds, s.delta_retained_bytes),
+                verdict: verdict(&ds, s.delta_retained_bytes, args.no_stop),
             });
         }
         let leaked: i64 =
@@ -466,7 +488,7 @@ fn summary(
                 bytes_per_min: leaked as f64 / minutes,
                 rounds_grown: ds.iter().filter(|&&x| x > 0).count() as u32,
                 rounds_compared: ds.len() as u32,
-                verdict: verdict(&ds, leaked),
+                verdict: verdict(&ds, leaked, args.no_stop),
             });
         }
         holders.sort_by_key(|y| std::cmp::Reverse(y.delta_retained_bytes));
@@ -482,11 +504,12 @@ fn summary(
         d >= 4096 && d * 100 >= biggest
     });
     let mut holders = outermost(holders);
-    holders.truncate(args.top);
+    holders.truncate(args.top_rows());
     if args.json {
         let s = Summary {
             kind: "watch_summary",
             pid: args.pid,
+            approximate: args.no_stop,
             rounds: rounds.len() as u32,
             elapsed_s: elapsed,
             first: first.display().to_string(),
@@ -524,6 +547,15 @@ fn summary(
         pad_left(&st.paint(Paint::Dim, "per minute"), 16),
         st.paint(Paint::Dim, "verdict")
     );
+    if args.no_stop {
+        println!(
+            "  {}",
+            st.paint(
+                Paint::Dim,
+                "approximate: the process was not stopped, so no growth is called a leak"
+            )
+        );
+    }
     if holders.is_empty() {
         println!("  {}", st.paint(Paint::Dim, "no holder changed"));
     }
@@ -596,11 +628,12 @@ mod tests {
 
     #[test]
     fn verdicts() {
-        assert_eq!(verdict(&[5, 6, 7, 5], 23), "likely_leak");
-        assert_eq!(verdict(&[5, 0, 0, 5], 10), "growing_in_steps");
-        assert_eq!(verdict(&[0, 0], 0), "flat");
-        assert_eq!(verdict(&[-5, 1], -4), "shrinking");
-        assert_eq!(verdict(&[5], 5), "growing_in_steps");
+        assert_eq!(verdict(&[5, 6, 7, 5], 23, false), "likely_leak");
+        assert_eq!(verdict(&[5, 6, 7, 5], 23, true), "growing_in_steps");
+        assert_eq!(verdict(&[5, 0, 0, 5], 10, false), "growing_in_steps");
+        assert_eq!(verdict(&[0, 0], 0, false), "flat");
+        assert_eq!(verdict(&[-5, 1], -4, false), "shrinking");
+        assert_eq!(verdict(&[5], 5, false), "growing_in_steps");
     }
 
     fn v(site: &str, d: i64) -> Verdict {

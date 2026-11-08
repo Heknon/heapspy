@@ -15,6 +15,7 @@ use heapspy_record::{MechanismChoice, RecordOptions};
 use tempfile::TempPath;
 
 use crate::live::{self, ProcMemory, PyThread, StackReader};
+use crate::sample::{Sample, Sampler};
 
 /// One snapshot, analysed.
 pub struct Snap {
@@ -35,6 +36,8 @@ pub enum Msg {
         at: Instant,
         mem: Option<ProcMemory>,
         threads: Vec<PyThread>,
+        /// Counters ([`crate::sample`]), when the sampler could be opened.
+        sample: Option<Box<Sample>>,
     },
     ProcessGone,
     SnapshotStarted,
@@ -56,31 +59,31 @@ pub enum Msg {
     },
 }
 
-/// Every second: the OS's memory numbers and each thread's Python stack.
-pub fn vitals(pid: u32, mut reader: StackReader, tx: Sender<Msg>, quit: Arc<AtomicBool>) {
+/// Every second: the OS's memory numbers, each thread's Python stack and,
+/// with a sampler, CPython's and malloc's counters. Nothing here stops the
+/// target.
+pub fn vitals(
+    pid: u32,
+    mut reader: StackReader,
+    mut sampler: Option<Sampler>,
+    tx: Sender<Msg>,
+    quit: Arc<AtomicBool>,
+) {
     while !quit.load(Ordering::Relaxed) {
         let t0 = Instant::now();
-        let Some(mem) = live::proc_memory(pid) else {
-            if cfg!(target_os = "linux") {
-                let _ = tx.send(Msg::ProcessGone);
-                return;
-            }
-            // Other systems have no cheap memory numbers yet.
-            let threads = reader.read(32);
-            let _ = tx.send(Msg::Vitals {
-                at: t0,
-                mem: None,
-                threads,
-            });
-            sleep_until(t0 + Duration::from_secs(1), &quit);
-            continue;
-        };
+        let mem = live::proc_memory(pid);
+        if mem.is_none() && cfg!(target_os = "linux") {
+            let _ = tx.send(Msg::ProcessGone);
+            return;
+        }
         let threads = reader.read(32);
+        let sample = sampler.as_mut().and_then(Sampler::sample).map(Box::new);
         if tx
             .send(Msg::Vitals {
                 at: t0,
-                mem: Some(mem),
+                mem,
                 threads,
+                sample,
             })
             .is_err()
         {

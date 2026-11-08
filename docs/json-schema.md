@@ -774,6 +774,93 @@ Growth in `CACHE` also shows as growth in the module and the module's
 `__dict__`; only `CACHE` is listed. A child site that sums many objects does
 not hide its parent.
 
+## `watch` (JSON Lines)
+
+`heapspy watch --pid PID --json` prints a stream, one JSON object per line,
+flushed as each is ready. These objects carry a `kind` but no
+`schema_version`: they are a stream, not a report. The other rules above
+still hold (fields are only added; nullable fields are present as `null`).
+Added in 0.4.0: `watch_round` and `watch_summary` gained `kind` (rounds) and
+`approximate`; `sample` and `watch_counters_summary` are new.
+
+### `watch_round`
+
+One per snapshot round.
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | `"watch_round"` | |
+| `round` | integer | 1, 2, ... |
+| `approximate` | bool | the snapshot was taken without stopping the process (`--no-stop`) |
+| `elapsed_s` | float | seconds since the first snapshot started |
+| `rss_bytes` | integer, nullable | resident memory |
+| `python_bytes`, `native_bytes`, `leaked_bytes` | integer | as in the memory bar |
+| `pause_ms` | float, nullable | how long the process was stopped; `null` with `--no-stop` |
+| `top_site`, `top_site_type` | string, nullable | the site that grew most since the last round |
+| `top_site_delta_bytes`, `top_site_delta_objects` | integer | its growth |
+
+### `watch_summary`
+
+Last, after the rounds.
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | `"watch_summary"` | |
+| `pid` | integer | |
+| `approximate` | bool | the snapshots were taken without stopping the process; no holder is then `likely_leak` |
+| `rounds` | integer | |
+| `elapsed_s` | float | |
+| `first`, `last` | string | the snapshot files kept |
+| `holders[]` | array | `site`, `type`, `delta_retained_bytes`, `delta_retained_objects`, `bytes_per_min`, `rounds_grown`, `rounds_compared`, `verdict` (`likely_leak`, `growing_in_steps`, `flat`, `shrinking`) |
+
+### `sample`
+
+One per round of `watch --counters`: counters read while the process runs
+(see [cli.md](cli.md#live-counters---counters)). A part that could not be
+read is `null`; the others are still there.
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | `"sample"` | |
+| `pid` | integer | |
+| `seq` | integer | 1, 2, ... |
+| `elapsed_s` | float | seconds since sampling started |
+| `unix_time` | float | when it was taken, seconds since the Unix epoch |
+| `took_ms` | float | how long the reads took |
+| `approximate` | bool | always `true`: the process was not stopped |
+| `os` | object, nullable | `rss_bytes` (Windows: working set); `anon_bytes`, `file_bytes` (Linux, nullable); `private_bytes` (Windows private commit, nullable); `threads` (nullable) |
+| `python` | object, nullable | `null` when the process is not a supported CPython |
+| `python.interpreters` | integer | |
+| `python.threads` | integer | Python thread states |
+| `python.gc` | object, nullable | the main interpreter's GC |
+| `python.gc.enabled`, `python.gc.collecting` | bool | `gc.isenabled()`; a collection was running |
+| `python.gc.generations[]` | array of 3 | per generation: `count`, `threshold` (as `gc.get_count()`, `gc.get_threshold()`), `collections`, `collected`, `uncollectable` (as `gc.get_stats()`) |
+| `python.gc.long_lived_total`, `python.gc.long_lived_pending` | integer | objects in the oldest generation after the last full collection, and survivors since |
+| `python.allocator` | object, nullable | pymalloc, over every distinct allocator state; `null` when pymalloc is not in use (`PYTHONMALLOC=malloc`) or could not be read |
+| `python.allocator.arenas`, `arenas_highwater`, `arenas_allocated_total` | integer | arenas now, most at once, allocated since start |
+| `python.allocator.arena_bytes` | integer | `arenas` × 1 MiB: what pymalloc holds from the OS |
+| `python.allocator.pools` | integer | pools with a block in use |
+| `python.allocator.blocks`, `block_bytes` | integer | blocks in use (as `sys.getallocatedblocks()`) and their bytes |
+| `python.allocator.free_bytes` | integer | `arena_bytes - block_bytes` |
+| `python.allocator.size_classes[]` | array | `size` (16 to 512), `pools`, `blocks`; only classes in use, by size |
+| `python.allocator.skipped_pools` | integer | pool headers that changed during the read and were left out |
+| `native` | object, nullable | glibc malloc (Linux); `null` with another allocator, or on Windows |
+| `native.heap_bytes` | integer | `brk_bytes + thread_heap_bytes`; chunks of 128 KiB and more have their own mappings and are not counted |
+| `native.brk_bytes` | integer | the main arena's heap |
+| `native.thread_arenas`, `native.thread_heap_bytes` | integer | thread arenas, and the bytes their heaps have grown to |
+
+### `watch_counters_summary`
+
+Last, after the samples. Each series is `null` when no sample had it.
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | `"watch_counters_summary"` | |
+| `pid`, `samples` | integer | |
+| `elapsed_s` | float | from the first sample to the last |
+| `rss_bytes`, `python_bytes`, `arena_bytes`, `malloc_heap_bytes` | object, nullable | `first`, `last`, `min`, `max` (integers), `delta` (signed), `per_minute` (float) |
+| `gc` | object, nullable | `collections` (per generation, during the run), `collected`, `uncollectable` |
+
 ## `error`
 
 Printed on stdout by any `--json` command that fails, followed by exit

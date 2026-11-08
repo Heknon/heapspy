@@ -208,12 +208,30 @@ pub fn proc_memory(pid: u32) -> Option<ProcMemory> {
     })
 }
 
+/// The working set and private commit on Windows; no file/anon split.
 #[cfg(not(target_os = "linux"))]
-pub fn proc_memory(_pid: u32) -> Option<ProcMemory> {
-    None
+pub fn proc_memory(pid: u32) -> Option<ProcMemory> {
+    let (ws, private) = heapspy_record::live::windows_memory(pid)?;
+    Some(ProcMemory {
+        rss: ws,
+        anon: private,
+        file: 0,
+        threads: 0,
+    })
 }
 
-/// The process's command line, for headers. Linux only.
+/// Whether `pid` still runs. Linux reads `/proc`; elsewhere the OS's
+/// memory numbers stand in (they fail once the process is gone).
+pub fn process_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    } else {
+        heapspy_record::live::windows_memory(pid).is_some()
+    }
+}
+
+/// The process's command line, for headers and service names: from
+/// `/proc` on Linux, from the process itself on Windows.
 pub fn command_line(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -227,8 +245,7 @@ pub fn command_line(pid: u32) -> Option<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
-        None
+        heapspy_record::live::windows_command_line(pid).filter(|s| !s.trim().is_empty())
     }
 }
 

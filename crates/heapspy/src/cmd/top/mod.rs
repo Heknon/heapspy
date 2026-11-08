@@ -39,6 +39,15 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
         format!("cannot read pid {} (is it a CPython 3.12-3.14 process, and do you have ptrace rights?)", args.pid)
     })?;
 
+    // Counters for the Graphs tab; without them the tab says why.
+    let (sampler, live_note) = match crate::sample::Sampler::open(args.pid) {
+        Ok(s) => {
+            let note = s.counters_error.clone();
+            (Some(s), note)
+        }
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
+
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Msg>();
     let (snap_tx, snap_rx) = mpsc::channel::<SnapRequest>();
@@ -49,7 +58,7 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
         let (tx, quit) = (tx.clone(), quit.clone());
         let pid = args.pid;
         handles.push(std::thread::spawn(move || {
-            workers::vitals(pid, reader, tx, quit)
+            workers::vitals(pid, reader, sampler, tx, quit)
         }));
     }
     {
@@ -68,6 +77,7 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
     }
 
     let mut app = App::new(args.pid, args.every, args.no_stop);
+    app.live_note = live_note;
     app.max_pause = args.max_pause;
     app.alloc_for = args.alloc_for;
     let mut alloc_stop: Option<Arc<AtomicBool>> = None;
@@ -113,7 +123,7 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
             match k.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,
-                KeyCode::Char(c @ '1'..='5') => app.tab = Tab::ALL[(c as u8 - b'1') as usize],
+                KeyCode::Char(c @ '1'..='6') => app.tab = Tab::ALL[(c as u8 - b'1') as usize],
                 KeyCode::Tab => app.tab = Tab::ALL[(ti + 1) % Tab::ALL.len()],
                 KeyCode::BackTab => app.tab = Tab::ALL[(ti + Tab::ALL.len() - 1) % Tab::ALL.len()],
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -127,6 +137,7 @@ pub fn run(args: TopArgs, _st: Style) -> anyhow::Result<()> {
                 }
                 KeyCode::PageUp => app.selected[ti] = app.selected[ti].saturating_sub(10),
                 KeyCode::Home | KeyCode::Char('g') => app.selected[ti] = 0,
+                KeyCode::Char('s') if app.tab == Tab::Graphs => app.next_graph_window(),
                 KeyCode::Char('s') => {
                     app.sort[ti] = match (app.tab, app.sort[ti]) {
                         (Tab::Objects, Sort::Size) => Sort::Growth,
@@ -209,7 +220,12 @@ fn on_msg(
     snap_tx: &Sender<SnapRequest>,
 ) {
     match m {
-        Msg::Vitals { at, mem, threads } => app.on_vitals(at, mem, threads),
+        Msg::Vitals {
+            at,
+            mem,
+            threads,
+            sample,
+        } => app.on_vitals(at, mem, threads, sample.map(|s| *s)),
         Msg::ProcessGone => {
             app.gone = true;
             app.set_status(format!("process {} exited; q quits", app.pid));
@@ -270,6 +286,7 @@ fn rows(app: &App) -> usize {
             .as_ref()
             .and_then(|s| s.report.allocations.as_ref())
             .map_or(0, |a| a.top_stacks.len()),
+        Tab::Graphs => 0,
     }
 }
 
@@ -396,6 +413,7 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
             }
             (live::thread_label(t), Some(Ok(v)))
         }
+        Tab::Graphs => return,
         Tab::Allocated => {
             let Some(a) = app
                 .latest
