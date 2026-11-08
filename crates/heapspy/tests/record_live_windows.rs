@@ -737,7 +737,27 @@ fn killed(mechanism: &str) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(2500));
+    // Kill it once it is set up: its ETW session started, or its debugger
+    // attached. How long that takes depends on the runner (finding the
+    // runtime, starting the guardian), so wait for it rather than a fixed
+    // time: a session that showed up after a fixed 2.5 s once failed this.
+    let set_up = || {
+        if mechanism != "debugger" {
+            kernel_logger_running()
+        } else {
+            debugger_attached(v.pid)
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !set_up() && std::time::Instant::now() < deadline {
+        assert!(
+            rec.try_wait().unwrap().is_none(),
+            "the recorder exited before it was killed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A little into the run, so it is mid-recording when killed.
+    std::thread::sleep(Duration::from_millis(500));
     assert!(
         rec.try_wait().unwrap().is_none(),
         "the recorder exited before it was killed"
@@ -745,12 +765,12 @@ fn killed(mechanism: &str) {
     if mechanism != "debugger" {
         assert!(
             kernel_logger_running(),
-            "the recorder started no ETW session"
+            "the recorder started no ETW session within 20 s"
         );
     } else {
         assert!(
             debugger_attached(v.pid),
-            "the recorder attached no debugger"
+            "the recorder attached no debugger within 20 s"
         );
     }
     rec.kill().unwrap();
