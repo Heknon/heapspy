@@ -252,6 +252,11 @@ pub struct AnalyzeReport {
     pub top_retainers: Vec<Retainer>,
     /// Types by retained bytes, largest first. At most `--top`.
     pub type_histogram: Vec<TypeRow>,
+    /// Types by their own (shallow) bytes, largest first, unreachable
+    /// instances included: what the memory is made of. At most `--top`.
+    /// Added in 0.3; empty in older documents.
+    #[serde(default)]
+    pub types_by_size: Vec<TypeRow>,
     pub notes: Vec<Note>,
     /// What an allocation profile (`--allocations`) says about where the
     /// memory came from. `null` without `--allocations`.
@@ -338,6 +343,39 @@ pub struct MemoryTotals {
     /// (`"committed"`). Committed memory can be larger than RSS.
     #[serde(default)]
     pub breakdown_basis: Option<String>,
+    /// Native heap blocks nothing points to (leaked), grouped by block size,
+    /// most bytes first. At most `--top`. Empty without a heap walk.
+    #[serde(default)]
+    pub native_lost_by_size: Vec<SizeGroup>,
+    /// What the heap walk found about the native allocator's free memory.
+    /// `null` when the heaps were not walked or the walker does not read
+    /// free lists (Windows).
+    #[serde(default)]
+    pub native_allocator: Option<NativeAllocator>,
+}
+
+/// One entry of `memory.native_lost_by_size`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeGroup {
+    /// Block size in bytes, allocator header included.
+    pub size: u64,
+    pub blocks: u64,
+    pub bytes: u64,
+}
+
+/// `memory.native_allocator`: memory the native allocator holds but has not
+/// handed out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeAllocator {
+    /// Heaps or arenas found (glibc: the main arena and one per thread arena).
+    pub arenas: u64,
+    /// Free chunks in the heaps (bins, tcache, fastbins).
+    pub free_chunks: u64,
+    /// Their bytes, as the chunk headers say (may include pages that are
+    /// not resident).
+    pub free_bytes: u64,
+    /// Bytes of the heaps' top chunks: the unused tail each heap grows into.
+    pub top_bytes: u64,
 }
 
 /// One line of `memory.breakdown`.
@@ -369,6 +407,11 @@ pub struct Retainer {
     pub retained_pct: f64,
     /// Shortest retaining path from a root to this object.
     pub path: RetainingPath,
+    /// The part of `retained_bytes` that is native heap blocks (memory C
+    /// code allocated) rather than Python objects. `null` in reports
+    /// written before this field existed.
+    #[serde(default)]
+    pub native_retained_bytes: Option<u64>,
     /// Allocation stacks of the sampled objects this entry retains. `null`
     /// without `--allocations`.
     #[serde(default)]
@@ -397,6 +440,23 @@ pub struct TypeRow {
     /// Why `type_location` is `null`.
     #[serde(default)]
     pub type_location_reason: Option<String>,
+    /// Instances nothing reaches, and their shallow bytes. For native heap
+    /// blocks (`native.*`) these are leaked: nothing points to them. Added
+    /// in 0.3; `null` in older documents.
+    #[serde(default)]
+    pub unreachable_count: Option<u64>,
+    #[serde(default)]
+    pub unreachable_bytes: Option<u64>,
+    /// The entry of `top_retainers` (by its root path) whose dominator
+    /// subtree holds the most of this type's shallow bytes, and those bytes.
+    /// `null` when no listed retainer holds any instance. Added in 0.3.
+    #[serde(default)]
+    pub held_by: Option<String>,
+    /// `rank` of that entry in `top_retainers`.
+    #[serde(default)]
+    pub held_by_rank: Option<u32>,
+    #[serde(default)]
+    pub held_by_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------- allocations
@@ -576,7 +636,51 @@ pub struct TypeQueryReport {
     /// Who holds the instances: direct referrers grouped by referrer type and
     /// edge label, by count, largest first.
     pub holders: Vec<Holder>,
+    /// The instances grouped by what keeps them alive: the holder whose
+    /// dominator subtree they are in, and the path from it to them. Most
+    /// bytes first, at most `--top`. Added in 0.3; empty in older documents.
+    #[serde(default)]
+    pub kept_by: Vec<KeptBy>,
+    /// The instances grouped by shallow size, most bytes first, at most
+    /// `--top`. Added in 0.3.
+    #[serde(default)]
+    pub by_size: Vec<SizeGroup>,
     pub notes: Vec<Note>,
+}
+
+/// One entry of `kept_by`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptBy {
+    /// `"holder"`: in the dominator subtree of `holder`, one of the largest
+    /// disjoint holders of the heap (as `top_retainers` lists them).
+    /// `"other"`: reachable, but under none of those (held by many small
+    /// holders, or holders with less than 1% of the type's bytes).
+    /// `"interpreter"`: held by the interpreter itself (libpython's C
+    /// globals, interpreter state, code objects). `"unreachable"`: nothing
+    /// reaches them (for native blocks: leaked; for Python objects: garbage
+    /// awaiting collection).
+    pub kind: String,
+    /// Root path of the holder; `null` unless `kind` is `"holder"`.
+    pub holder: Option<String>,
+    /// The holder as a reader names it: `app.cache.CACHE`, `libfoo.so:
+    /// g_cache → C memory`, `….fileobj _io.BufferedReader → C field +104`.
+    /// Added in 0.3.
+    #[serde(default)]
+    pub holder_name: Option<String>,
+    pub holder_address: Option<Address>,
+    /// The most common path from the holder to the instances, with keys
+    /// and indices generalised and the type reached after each hop, e.g.
+    /// `"[<key>] app.session.Session → .payload"`. For `"other"`, the most
+    /// common path from a root. `null` for `"unreachable"`.
+    pub through: Option<String>,
+    /// Share of the sampled instances that `through` describes, in whole
+    /// percent.
+    pub through_pct: Option<u32>,
+    pub instances: u64,
+    /// Their shallow bytes.
+    pub bytes: u64,
+    /// Their sizes, most bytes first, at most 3.
+    pub sizes: Vec<SizeGroup>,
 }
 
 /// One entry of `top_instances`.

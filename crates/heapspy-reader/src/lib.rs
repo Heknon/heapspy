@@ -15,8 +15,8 @@ pub mod symbols;
 pub use dump::{dump, DumpOptions, DumpStats, DEFAULT_MAX_STR};
 pub use error::{Error, Result};
 pub use source::{
-    MappedRange, MemorySource, MemorySourceExt, MemorySummary, Module, Perms, SourceSpec,
-    TargetInfo, ThreadInfo,
+    MappedRange, MemorySource, MemorySourceExt, MemorySummary, Module, NativeHeapStats, Perms,
+    SourceSpec, TargetInfo, ThreadInfo,
 };
 
 #[cfg(test)]

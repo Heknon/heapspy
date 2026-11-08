@@ -20,23 +20,15 @@ pub fn run(args: DumpArgs) -> anyhow::Result<()> {
         source_kind: spec.kind(),
         source_ref: spec.reference(),
     };
-    let context = |text: String| DumpSource {
-        kind: spec.kind(),
-        text,
-    };
-    let mut attempt = 1;
-    let stats = loop {
-        let stats = dump_once(&spec, &opts, &args.output, &context)?;
-        if !should_recapture(&spec, &stats, attempt) {
-            break stats;
+    let (stats, attempt) = match (args.no_stop, args.pid) {
+        (true, Some(pid)) => {
+            eprintln!(
+                "heapspy: --no-stop: the process keeps running during the walk, so this \
+                 snapshot is approximate"
+            );
+            capture_unstopped(pid, &opts, &args.output)?
         }
-        eprintln!(
-            "heapspy: this capture caught the target's GC lists mid-update, so the walk could \
-             not follow them; capturing again (attempt {} of {LIVE_ATTEMPTS})",
-            attempt + 1
-        );
-        attempt += 1;
-        std::thread::sleep(RECAPTURE_DELAY);
+        _ => capture(&spec, &opts, &args.output, false)?,
     };
     if stats.image_missing_bytes > 0 {
         eprintln!(
@@ -64,6 +56,69 @@ pub fn run(args: DumpArgs) -> anyhow::Result<()> {
         ))?;
     }
     Ok(())
+}
+
+/// Capture `spec` into `out`, capturing a live target again when the walk
+/// caught its GC lists mid-update (see [`LIVE_ATTEMPTS`]). Returns the stats
+/// and the number of attempts. With `quiet`, the retry message is not
+/// printed.
+pub(crate) fn capture(
+    spec: &SourceSpec,
+    opts: &DumpOptions,
+    out: &Path,
+    quiet: bool,
+) -> anyhow::Result<(DumpStats, u32)> {
+    let context = |text: String| DumpSource {
+        kind: spec.kind(),
+        text,
+    };
+    let mut attempt = 1;
+    loop {
+        let stats = dump_once(spec, opts, out, &context)?;
+        if !should_recapture(spec, &stats, attempt) {
+            return Ok((stats, attempt));
+        }
+        if !quiet {
+            eprintln!(
+                "heapspy: this capture caught the target's GC lists mid-update, so the walk \
+                 could not follow them; capturing again (attempt {} of {LIVE_ATTEMPTS})",
+                attempt + 1
+            );
+        }
+        attempt += 1;
+        std::thread::sleep(RECAPTURE_DELAY);
+    }
+}
+
+/// Snapshot `pid` without stopping it (`--no-stop`). The walk races with
+/// the target, so the snapshot is approximate; a walk that comes back
+/// truncated is tried again like a stopped one.
+pub(crate) fn capture_unstopped(
+    pid: u32,
+    opts: &DumpOptions,
+    out: &Path,
+) -> anyhow::Result<(DumpStats, u32)> {
+    let mut attempt = 1;
+    loop {
+        let src =
+            heapspy_reader::source::linux_live::LiveProcess::open_unstopped(pid).map_err(|e| {
+                anyhow::Error::from(e).context(DumpSource {
+                    kind: heapspy_snapshot::SourceKind::Pid,
+                    text: format!("cannot read pid {pid}"),
+                })
+            })?;
+        let stats = heapspy_reader::dump(&src, opts, out).map_err(|e| {
+            anyhow::Error::from(e).context(DumpSource {
+                kind: heapspy_snapshot::SourceKind::Pid,
+                text: format!("snapshot of pid {pid} without stopping it failed"),
+            })
+        })?;
+        if !stats.truncated || attempt >= LIVE_ATTEMPTS {
+            return Ok((stats, attempt));
+        }
+        attempt += 1;
+        std::thread::sleep(RECAPTURE_DELAY);
+    }
 }
 
 /// How many times `dump --pid` captures a target whose walk came back

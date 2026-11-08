@@ -313,11 +313,16 @@ impl<'s> Analysis<'s> {
         let mut count = vec![0u64; groups];
         let mut shallow = vec![0u64; groups];
         let mut retained = vec![0u64; groups];
+        let mut lost = vec![(0u64, 0u64); groups];
         for i in 0..self.g.n {
             let o = self.snap.object(i);
             let g = self.types.group(o.type_id) as usize;
             count[g] += 1;
             shallow[g] += o.shallow_size;
+            if !self.reachable(i) {
+                lost[g].0 += 1;
+                lost[g].1 += o.shallow_size;
+            }
         }
         let mut end = vec![0u32; groups];
         for v in self.by_tin().into_iter().skip(1) {
@@ -338,6 +343,11 @@ impl<'s> Analysis<'s> {
                 // Filled in by the report builder for the rows it keeps.
                 type_location: None,
                 type_location_reason: None,
+                unreachable_count: Some(lost[g].0),
+                unreachable_bytes: Some(lost[g].1),
+                held_by: None,
+                held_by_rank: None,
+                held_by_bytes: None,
             })
             .collect()
     }

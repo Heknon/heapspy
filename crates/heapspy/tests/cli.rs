@@ -63,11 +63,11 @@ fn analyze_text_and_json() {
     let ps = p.to_str().unwrap();
 
     let text = ok_stdout(&["analyze", ps]);
-    assert!(text.contains("Top retainers by retained size"), "{text}");
-    assert!(
-        text.contains("builtins.dict  sys.modules['app'].__dict__['CACHE']"),
-        "{text}"
-    );
+    assert!(text.contains("Who holds it"), "{text}");
+    // Holders read like code: sys.modules['app'].__dict__['CACHE'] is app.CACHE.
+    assert!(text.contains("app.CACHE"), "{text}");
+    assert!(text.contains("What the memory is"), "{text}");
+    assert!(text.contains("dict · "), "{text}");
 
     let json = ok_stdout(&["analyze", ps, "--json", "--top=1"]);
     let r: AnalyzeReport = serde_json::from_str(&json).unwrap();
@@ -95,8 +95,19 @@ fn query_modes() {
     let r: TypeQueryReport = serde_json::from_str(&json).unwrap();
     assert_eq!(r.instances, 10);
     assert_eq!(r.top_instances.len(), 2);
+    // All ten payloads are kept by the cache, through one generalised path.
+    let k = &r.kept_by[0];
+    assert_eq!((k.kind.as_str(), k.instances), ("holder", 10));
+    assert_eq!(
+        k.holder.as_deref(),
+        Some("sys.modules['app'].__dict__['CACHE']")
+    );
+    assert_eq!(k.through_pct, Some(100));
+    assert_eq!(r.by_size.iter().map(|g| g.blocks).sum::<u64>(), 10);
     let text = ok_stdout(&["query", ps, "--type", "builtins.bytes"]);
-    assert!(text.contains("Held by"), "{text}");
+    assert!(text.contains("Kept alive by"), "{text}");
+    assert!(text.contains("app.CACHE"), "{text}");
+    assert!(text.contains("Referenced by"), "{text}");
 
     let json = ok_stdout(&["query", ps, "--retaining-path=0x100000", "--json"]);
     let r: RetainingPathReport = serde_json::from_str(&json).unwrap();

@@ -4,6 +4,7 @@ use clap::Parser;
 
 mod cli;
 mod cmd;
+mod live;
 mod output;
 
 fn main() -> ExitCode {
@@ -13,7 +14,8 @@ fn main() -> ExitCode {
     }
     let cli = cli::Cli::parse();
     let json = cli.command.json();
-    match cmd::run(cli.command) {
+    let style = output::style(cli.color);
+    match cmd::run(cli.command, style) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => output::report_error(&err, json),
     }

@@ -91,6 +91,24 @@
       "count": 400000
     }
   ],
+  "kept_by": [
+    {
+      "kind": "holder",
+      "holder": "sys.modules['app.cache'].__dict__['CACHE']",
+      "holder_name": "app.cache.CACHE",
+      "holder_address": "0x7f3a2c41b0d0",
+      "through": "[<key>]",
+      "through_pct": 100,
+      "instances": 400000,
+      "bytes": 22400000,
+      "sizes": [
+        { "size": 56, "blocks": 400000, "bytes": 22400000 }
+      ]
+    }
+  ],
+  "by_size": [
+    { "size": 56, "blocks": 400000, "bytes": 22400000 }
+  ],
   "notes": [
     {
       "code": "keys_redacted",

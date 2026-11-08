@@ -306,6 +306,7 @@ window early: the profile is written and `truncated` is `true`.
 | `memory` | object | below |
 | `top_retainers` | array of Retainer | objects with the largest `retained_bytes` |
 | `type_histogram` | array of TypeRow | types by `retained_bytes` |
+| `types_by_size` | array of TypeRow | types by `shallow_bytes`, unreachable instances included: what the memory is made of. Added in 0.3; empty in older documents |
 | `notes` | array of Note | |
 | `allocations` | Allocations, nullable | added in M7: the `--allocations` profile joined with the snapshot, see [Allocations](#allocations); `null` without `--allocations` |
 
@@ -349,6 +350,8 @@ address in it: label `<address>`), another block, or a `native` root.
 | `outside_graph_pct` | float, nullable | `outside_graph_bytes / rss_bytes * 100` |
 | `breakdown` | array | what the process's memory is, by kind: `{part, bytes}` (below). Empty without a memory map |
 | `breakdown_basis` | string, nullable | `resident`, or `committed` where the source does not record residency (Windows minidumps); committed can exceed RSS |
+| `native_lost_by_size` | array | leaked native blocks (nothing points to them) grouped by block size, most bytes first, at most `--top`: `{size, blocks, bytes}`, `size` including the allocator's header. Empty without a heap walk or leaks. Added in 0.3 |
+| `native_allocator` | object, nullable | what the heap walk found about memory the native allocator keeps: `{arenas, free_chunks, free_bytes, top_bytes}` (free chunks in bins, tcache and fastbins, and the heaps' top chunks, sized from their headers). `null` without a glibc heap walk. Added in 0.3 |
 
 `breakdown[].part`:
 
@@ -362,7 +365,8 @@ address in it: label `<address>`), another block, or a `native` root.
 | `python_large_objects` | Python objects too big for pymalloc, which come from `malloc` |
 | `native_heap` | native heap blocks something points to (with a heap walk) |
 | `native_lost` | native heap blocks nothing points to: leaked (with a heap walk) |
-| `native_other` | private memory outside any heap block: allocator overhead and free space, memory C code mapped itself (with a heap walk) |
+| `native_free` | free and top chunks the native allocator keeps and has not returned to the OS (with a glibc heap walk; added in 0.3). Sized from chunk headers and capped at what is left of private memory, since free pages may not be resident |
+| `native_other` | private memory outside any heap block: allocator overhead, memory C code mapped itself, and (without `native_free`) the allocator's free space (with a heap walk) |
 | `native_unknown` | all private memory C code allocated, when the heaps were not walked |
 
 Retainer (`top_retainers[]`):
@@ -377,6 +381,7 @@ Retainer (`top_retainers[]`):
 | `retained_objects` | integer | number of objects it dominates, itself included |
 | `retained_pct` | float | `retained_bytes / totals.reachable_bytes * 100` |
 | `path` | array of PathHop | one shortest path from a root |
+| `native_retained_bytes` | integer, nullable | the part of `retained_bytes` that is native heap blocks (memory C code allocated, such as a numpy array's buffer) rather than Python objects. Added in 0.3; `null` in older documents |
 | `allocated_at` | AllocatedAt, nullable | added in M7: allocation stacks of the sampled objects this entry retains, see [AllocatedAt](#allocatedat); `null` without `--allocations` |
 | `type_location` | SourceLocation, nullable | where the object's type is defined ([Source locations](#source-locations)) |
 | `type_location_reason` | string, nullable | why `type_location` is `null` |
@@ -400,7 +405,7 @@ Which objects are listed:
    dominated by an entry already listed is skipped. The entries are therefore
    disjoint: their retained sets do not overlap.
 
-TypeRow (`type_histogram[]`):
+TypeRow (`type_histogram[]`, `types_by_size[]`):
 
 | field | type | meaning |
 |---|---|---|
@@ -410,6 +415,10 @@ TypeRow (`type_histogram[]`):
 | `retained_bytes` | integer | retained size of the set of instances: sum of `retained_bytes` over instances not dominated by another instance of the same type |
 | `type_location` | SourceLocation, nullable | where the type is defined; when several type objects share the name, the first one with a location |
 | `type_location_reason` | string, nullable | why `type_location` is `null` |
+| `unreachable_count`, `unreachable_bytes` | integer, nullable | instances nothing reaches and their shallow bytes; for `native.*` types these are leaked blocks. Added in 0.3 |
+| `held_by` | string, nullable | root path of the `top_retainers` entry whose dominator subtree holds the most of this type's shallow bytes; `null` when no listed retainer holds any. Added in 0.3 |
+| `held_by_rank` | integer, nullable | that entry's `rank` |
+| `held_by_bytes` | integer, nullable | the shallow bytes of this type it holds |
 
 The `retained_bytes` rule means nested instances are not counted twice: for
 a dict of dicts, only the outer dict's retained size counts, since it already
@@ -438,7 +447,23 @@ name, so two type objects with the same `module.qualname` are one row.
 | `retained_bytes` | integer | retained size of the set, as for TypeRow |
 | `top_instances` | array of Instance | largest by `retained_bytes` |
 | `holders` | array of Holder | direct referrers, grouped, by `count` |
+| `kept_by` | array of KeptBy | the instances grouped by what keeps them alive, most bytes first, at most `--top` (below). Added in 0.3 |
+| `by_size` | array | the instances grouped by shallow size, `{size, blocks, bytes}` (`blocks` counts instances), most bytes first, at most `--top`. Added in 0.3 |
 | `notes` | array of Note | |
+
+KeptBy (`kept_by[]`):
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | string | `holder`: in the dominator subtree of `holder`, one of the heap's 64 largest disjoint holders (as `top_retainers` picks them); `interpreter`: held by the interpreter itself (libpython's C globals, interpreter state, code objects), all such holders together; `other`: reachable but under none of those, or under a holder with less than 1% of the type's bytes; `unreachable`: nothing reaches them (leaked for `native.*`, garbage awaiting collection for Python objects) |
+| `holder` | string, nullable | the holder's root path; `null` unless `kind` is `holder` |
+| `holder_name` | string, nullable | the holder as a reader names it: `app.cache.CACHE`, `libfoo.so: g_cache → C memory`, `app.F → C field +104 → C memory` (a pointer in a Python object's own C struct is `C field +offset`). Text, may change between versions |
+| `holder_address` | string, nullable | the holder's address |
+| `through` | string, nullable | the most common path from the holder to the instances, keys and indices generalised, the type reached after each hop: `"[<key>] app.session.Session → .payload"`. A pointer in a Python object's own C struct is `C field +offset` (`C data` for memory the object points to but does not lay out), and a run of raw pointers through native blocks after it is one `C memory` step; an int used as a pointer is `its value as an address`. `null` for `unreachable`, `interpreter` and `other` |
+| `through_pct` | integer, nullable | percent of sampled instances (up to 256 per group) that `through` describes |
+| `instances` | integer | instances in the group |
+| `bytes` | integer | their shallow bytes |
+| `sizes` | array | their sizes, `{size, blocks, bytes}`, most bytes first, at most 3 |
 
 Instance:
 

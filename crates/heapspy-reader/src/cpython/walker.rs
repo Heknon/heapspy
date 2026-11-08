@@ -1,5 +1,6 @@
 //! The object-graph walk itself. See the module docs of [`super`].
 
+use crate::symbols::elf::DataSymbols;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -14,6 +15,10 @@ use super::WalkStats;
 use crate::dump::DumpOptions;
 use crate::error::Result;
 use crate::source::{MemorySource, MemorySourceExt, NativeBlock, NativeBlockKind};
+
+/// A range of native memory scanned for roots: start, end, label, and the
+/// module's data symbols with its base, to name the global a pointer is in.
+type NativeArea = (u64, u64, String, Option<(std::sync::Arc<DataSymbols>, u64)>);
 
 /// Hard caps that keep garbage from causing huge allocations or long loops.
 const MAX_ITEMS: u64 = 1 << 28;
@@ -2112,6 +2117,15 @@ impl<'a> Walker<'a> {
             self.out
                 .add_meta("pymalloc.arena_bytes", &p.arena_bytes().to_string())?;
         }
+        if let Some(h) = self.src.native_heap_stats() {
+            self.out.add_meta("native.arenas", &h.arenas.to_string())?;
+            self.out
+                .add_meta("native.free_chunks", &h.free_chunks.to_string())?;
+            self.out
+                .add_meta("native.free_bytes", &h.free_bytes.to_string())?;
+            self.out
+                .add_meta("native.top_bytes", &h.top_bytes.to_string())?;
+        }
         Ok(self.stats)
     }
 
@@ -2243,13 +2257,26 @@ impl<'a> Walker<'a> {
     fn native_roots(&mut self) -> Result<()> {
         let ranges = self.src.mapped_ranges().unwrap_or_default();
         let modules = self.src.modules().unwrap_or_default();
-        let mut areas: Vec<(u64, u64, String)> = Vec::new();
+        // (start, end, label, the module's data symbols and base).
+        let mut areas: Vec<NativeArea> = Vec::new();
         for m in &modules {
             let m_end = m.base.saturating_add(m.size);
+            let mut syms = None;
             for r in &ranges {
                 let (s, e) = (r.start.max(m.base), (r.start + r.size).min(m_end));
                 if r.perms.write && s < e {
-                    areas.push((s, e, format!("{} globals", m.name)));
+                    // Name the global a pointer is found in, when the
+                    // module's file is here and has a symbol table.
+                    if syms.is_none() {
+                        syms = Some(
+                            crate::symbols::elf::data_symbols(std::path::Path::new(&m.path))
+                                .ok()
+                                .filter(|d| !d.symbols.is_empty())
+                                .map(std::sync::Arc::new),
+                        );
+                    }
+                    let named = syms.clone().flatten().map(|d| (d, m.base));
+                    areas.push((s, e, format!("{} globals", m.name), named));
                 }
             }
         }
@@ -2259,10 +2286,16 @@ impl<'a> Walker<'a> {
                 .iter()
                 .find(|r| r.start <= sp && sp < r.start + r.size)
             {
-                areas.push((sp & !7, r.start + r.size, format!("thread {} stack", t.tid)));
+                areas.push((
+                    sp & !7,
+                    r.start + r.size,
+                    format!("thread {} stack", t.tid),
+                    None,
+                ));
             }
         }
-        for (start, end, label) in areas {
+        let mut labels: HashMap<String, StrId> = HashMap::new();
+        for (start, end, label, syms) in areas {
             let l = self.out.intern(&label)?;
             let mut done = HashSet::new();
             let mut a = start;
@@ -2271,7 +2304,7 @@ impl<'a> Walker<'a> {
                 let Ok(words) = self.src.read_ptrs(a, n as usize) else {
                     break;
                 };
-                for &w in &words {
+                for (i, &w) in words.iter().enumerate() {
                     if w == 0 || w & 7 != 0 {
                         continue;
                     }
@@ -2285,6 +2318,23 @@ impl<'a> Walker<'a> {
                     if !done.insert(target) {
                         continue;
                     }
+                    // `libfoo.so: g_cache` when the word is inside a named
+                    // global, else `libfoo.so globals`.
+                    let at = a + i as u64 * 8;
+                    let l = match syms.as_ref().and_then(|(d, base)| d.lookup(*base, at)) {
+                        Some((name, _)) => {
+                            let text = format!("{}: {name}", label.trim_end_matches(" globals"));
+                            match labels.get(&text) {
+                                Some(&id) => id,
+                                None => {
+                                    let id = self.out.intern(&text)?;
+                                    labels.insert(text, id);
+                                    id
+                                }
+                            }
+                        }
+                        None => l,
+                    };
                     self.out.add_root(target, RootKind::Native, l)?;
                     self.stats.roots += 1;
                     if python && !self.is_tracked(target) && self.untracked.insert(target) {

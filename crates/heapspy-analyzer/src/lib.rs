@@ -33,8 +33,9 @@ pub use flame::{
     MinWidth,
 };
 use report::{
-    Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryPart, MemoryTotals, Retainer,
-    RetainingPathReport, SchemaVersion, SnapshotSummary, SourceRef, Totals, TypeQueryReport,
+    Address, AnalyzeKind, AnalyzeReport, DiffReport, MemoryPart, MemoryTotals, NativeAllocator,
+    Retainer, RetainingPathReport, SchemaVersion, SizeGroup, SnapshotSummary, SourceRef, Totals,
+    TypeQueryReport,
 };
 
 /// Errors from analysis.
@@ -162,6 +163,22 @@ pub fn root_path_string(path: &[report::PathHop]) -> String {
     s
 }
 
+/// Whether a holder's root path belongs to the interpreter itself rather
+/// than the program: libpython's C globals (`python3.13: _PyRuntime`,
+/// `libpython3.12.so.1.0 globals`), interpreter state (`interp sys[...]`),
+/// and code objects (`….__code__`, `.co_consts`).
+pub fn is_interpreter_holder(path: &str) -> bool {
+    let lib = path.strip_prefix("lib").unwrap_or(path);
+    let python_lib = lib
+        .strip_prefix("python")
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        && (lib.contains(": ") || lib.contains(" globals"));
+    python_lib
+        || path.starts_with("interp ")
+        || path.contains(".__code__")
+        || path.contains(".co_consts")
+}
+
 /// `part / whole * 100`, rounded to two decimals; 0 when `whole` is 0.
 fn pct(part: u64, whole: u64) -> f64 {
     if whole == 0 {
@@ -220,7 +237,9 @@ fn native_counts(a: &Analysis) -> NativeCounts {
 fn memory_totals(snap: &Snapshot, graph_bytes: u64, native: &NativeCounts) -> Result<MemoryTotals> {
     let rss = rss_bytes(snap)?;
     let outside = rss.map(|r| r.saturating_sub(graph_bytes));
-    let (breakdown, breakdown_basis) = memory_breakdown(snap, graph_bytes, native)?;
+    let native_allocator = native_allocator(snap)?;
+    let (breakdown, breakdown_basis) =
+        memory_breakdown(snap, graph_bytes, native, native_allocator.as_ref())?;
     Ok(MemoryTotals {
         rss_bytes: rss,
         graph_bytes,
@@ -228,7 +247,113 @@ fn memory_totals(snap: &Snapshot, graph_bytes: u64, native: &NativeCounts) -> Re
         outside_graph_pct: rss.zip(outside).map(|(r, o)| pct(o, r)),
         breakdown,
         breakdown_basis,
+        native_lost_by_size: Vec::new(),
+        native_allocator,
     })
+}
+
+/// `memory.native_allocator`, from the `native.*` meta the heap walk wrote.
+fn native_allocator(snap: &Snapshot) -> Result<Option<NativeAllocator>> {
+    let Some(free_bytes) = meta_u64(snap, "native.free_bytes")? else {
+        return Ok(None);
+    };
+    Ok(Some(NativeAllocator {
+        arenas: meta_u64(snap, "native.arenas")?.unwrap_or(0),
+        free_chunks: meta_u64(snap, "native.free_chunks")?.unwrap_or(0),
+        free_bytes,
+        top_bytes: meta_u64(snap, "native.top_bytes")?.unwrap_or(0),
+    }))
+}
+
+/// Leaked native blocks grouped by size, most bytes first, at most `top`.
+fn lost_by_size(a: &Analysis, top: usize) -> Vec<SizeGroup> {
+    let mut by: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+    for i in 0..a.snap.object_count() as u32 {
+        let o = a.snap.object(i);
+        if o.flags.contains(ObjectFlags::NATIVE) && !a.reachable(i) {
+            let e = by.entry(o.shallow_size).or_default();
+            e.0 += 1;
+            e.1 += o.shallow_size;
+        }
+    }
+    let mut v: Vec<SizeGroup> = by
+        .into_iter()
+        .map(|(size, (blocks, bytes))| SizeGroup {
+            size,
+            blocks,
+            bytes,
+        })
+        .collect();
+    v.sort_by(|x, y| y.bytes.cmp(&x.bytes).then(x.size.cmp(&y.size)));
+    v.truncate(top);
+    v
+}
+
+/// Fill `held_by` of each type row: the listed retainer whose dominator
+/// subtree holds the most of the type's shallow bytes. One pass over the
+/// dominator tree in preorder gives every node its listed ancestor.
+fn held_by(a: &Analysis, nodes: &[u32], retainers: &[Retainer], rows: &mut [report::TypeRow]) {
+    if nodes.is_empty() || rows.is_empty() {
+        return;
+    }
+    let n = a.root() as usize;
+    let mut holder = vec![u32::MAX; n + 1];
+    for (k, &v) in nodes.iter().enumerate() {
+        holder[v as usize] = k as u32;
+    }
+    for &v in &a.order[1..] {
+        if holder[v as usize] == u32::MAX {
+            let p = a.idom[v as usize];
+            if p != dominators::NONE {
+                holder[v as usize] = holder[p as usize];
+            }
+        }
+    }
+    let groups: std::collections::HashMap<u32, usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| a.types.find(&r.type_name).map(|g| (g, i)))
+        .collect();
+    let mut bytes = vec![vec![0u64; nodes.len()]; rows.len()];
+    for v in 0..n as u32 {
+        let h = holder[v as usize];
+        if h == u32::MAX {
+            continue;
+        }
+        if let Some(&i) = groups.get(&a.group(v)) {
+            bytes[i][h as usize] += a.snap.object(v).shallow_size;
+        }
+    }
+    for (row, b) in rows.iter_mut().zip(bytes) {
+        if let Some((k, &best)) = b.iter().enumerate().max_by_key(|(_, &x)| x) {
+            if best > 0 {
+                row.held_by = Some(root_path_string(&retainers[k].path));
+                row.held_by_rank = Some(retainers[k].rank);
+                row.held_by_bytes = Some(best);
+            }
+        }
+    }
+}
+
+/// Per node, the bytes of native heap blocks in its dominator subtree.
+pub(crate) fn native_retained(a: &Analysis) -> Vec<u64> {
+    let n = a.root() as usize;
+    let mut acc = vec![0u64; n + 1];
+    for i in 0..n as u32 {
+        let o = a.snap.object(i);
+        if o.flags.contains(ObjectFlags::NATIVE) {
+            acc[i as usize] = o.shallow_size;
+        }
+    }
+    // Children come after their idom in `order`, so a reverse sweep adds
+    // every subtree into its parent before the parent is added upward.
+    for &v in a.order.iter().rev() {
+        let p = a.idom[v as usize];
+        if p != dominators::NONE && (v as usize) < acc.len() {
+            acc[p as usize] += acc[v as usize];
+        }
+    }
+    acc
 }
 
 fn meta_u64(snap: &Snapshot, key: &str) -> Result<Option<u64>> {
@@ -258,6 +383,7 @@ fn memory_breakdown(
     snap: &Snapshot,
     graph_bytes: u64,
     native_blocks: &NativeCounts,
+    allocator: Option<&NativeAllocator>,
 ) -> Result<(Vec<MemoryPart>, Option<String>)> {
     let Some(regions) = snap.memory_summary() else {
         return Ok((Vec::new(), None));
@@ -308,10 +434,14 @@ fn memory_breakdown(
         let held = native_blocks.bytes - lost;
         parts.push(part("native_heap", held));
         parts.push(part("native_lost", lost));
-        parts.push(part(
-            "native_other",
-            native.saturating_sub(native_blocks.bytes),
-        ));
+        let other = native.saturating_sub(native_blocks.bytes);
+        // Free chunks and top chunks are counted from headers, which can
+        // include pages that are not resident: never more than what is left.
+        let free = allocator.map_or(0, |f| (f.free_bytes + f.top_bytes).min(other));
+        if allocator.is_some() {
+            parts.push(part("native_free", free));
+        }
+        parts.push(part("native_other", other - free));
     } else {
         parts.push(part("native_unknown", native));
     }
@@ -361,10 +491,18 @@ pub(crate) fn analyze_with(
         native_lost_blocks: native.lost_blocks,
         native_lost_bytes: native.lost_bytes,
     };
-    let memory = memory_totals(snap, a.shallow_total - native.bytes, &native)?;
+    let mut memory = memory_totals(snap, a.shallow_total - native.bytes, &native)?;
+    if native.lost_blocks > 0 {
+        memory.native_lost_by_size = lost_by_size(a, opts.top);
+    }
 
     let mut top_retainers = Vec::new();
     let nodes = a.top_retainers(opts.top)?;
+    let native_ret = if native.blocks > 0 {
+        native_retained(a)
+    } else {
+        Vec::new()
+    };
     for (i, &v) in nodes.iter().enumerate() {
         let o = snap.object(v);
         let bytes = a.retained[v as usize];
@@ -378,26 +516,39 @@ pub(crate) fn analyze_with(
             retained_objects: a.retained_count[v as usize] as u64,
             retained_pct: pct(bytes, reachable_bytes),
             path: a.path(v)?.unwrap_or_default(),
+            native_retained_bytes: Some(native_ret.get(v as usize).copied().unwrap_or(0)),
             allocated_at: None,
             type_location,
             type_location_reason,
         });
     }
 
-    let mut type_histogram = a.type_rows();
+    let all_types = a.type_rows();
+    let mut type_histogram = all_types.clone();
     type_histogram.sort_by(|x, y| {
         (y.retained_bytes, y.shallow_bytes)
             .cmp(&(x.retained_bytes, x.shallow_bytes))
             .then_with(|| x.type_name.cmp(&y.type_name))
     });
     type_histogram.truncate(opts.top);
-    for row in &mut type_histogram {
+    // What the memory is: types by their own bytes, unreachable ones (leaked
+    // native blocks) included.
+    let mut types_by_size = all_types;
+    types_by_size.sort_by(|x, y| {
+        y.shallow_bytes
+            .cmp(&x.shallow_bytes)
+            .then_with(|| x.type_name.cmp(&y.type_name))
+    });
+    types_by_size.truncate(opts.top);
+    for row in type_histogram.iter_mut().chain(types_by_size.iter_mut()) {
         let g = a
             .types
             .find(&row.type_name)
             .expect("row from the type table");
         (row.type_location, row.type_location_reason) = a.group_location(g)?;
     }
+    held_by(a, &nodes, &top_retainers, &mut type_histogram);
+    held_by(a, &nodes, &top_retainers, &mut types_by_size);
 
     let mut notes = vec![notes::untracked_objects()];
     if let (Some(rss), Some(out)) = (memory.rss_bytes, memory.outside_graph_bytes) {
@@ -427,6 +578,7 @@ pub(crate) fn analyze_with(
         memory,
         top_retainers,
         type_histogram,
+        types_by_size,
         notes,
         allocations: None,
     };
@@ -485,6 +637,27 @@ pub fn diff(
 mod tests {
     use super::*;
     use heapspy_snapshot::SnapshotBuilder;
+
+    #[test]
+    fn interpreter_holders() {
+        for p in [
+            "python3.13: _PyRuntime",
+            "libpython3.12.so.1.0 globals",
+            "python312.dll: x",
+            "interp sys['path_importer_cache']",
+            "sys.modules['os'].__dict__['walk'].__code__",
+        ] {
+            assert!(is_interpreter_holder(p), "{p}");
+        }
+        for p in [
+            "sys.modules['app.cache'].__dict__['CACHE']",
+            "libfoo.so: g_cache",
+            "python_helpers globals",
+            "thread 12 stack",
+        ] {
+            assert!(!is_interpreter_holder(p), "{p}");
+        }
+    }
 
     #[test]
     fn summary_from_snapshot() {

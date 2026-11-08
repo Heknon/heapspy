@@ -5,6 +5,11 @@
 
 use std::fmt::Write as _;
 
+pub mod style;
+pub mod summary;
+
+pub use style::{Paint, Style};
+
 use crate::report::{
     AllocatedAt, Allocations, AnalyzeReport, DiffReport, LocateReport, Note, PathHop,
     RetainingPathReport, StackFrame, TypeQueryReport,
@@ -273,167 +278,14 @@ fn format_delta(d: i64) -> String {
     }
 }
 
-/// `heapspy analyze` text output.
+/// `heapspy analyze` text output, without color.
 pub fn analyze(r: &AnalyzeReport) -> Result<String> {
-    let mut out = String::new();
-    let t = &r.totals;
-    let _ = writeln!(
-        out,
-        "{}: {} objects ({}), {} references, {} roots, CPython {}",
-        r.snapshot.path,
-        t.objects,
-        format_bytes(t.shallow_bytes),
-        t.edges,
-        t.roots,
-        r.snapshot.python_version
-    );
-    if t.refcounts_checked {
-        let _ = writeln!(
-            out,
-            "reachable: {} objects ({}); held outside the Python graph: {} objects ({}); \
-             garbage awaiting collection: {} objects ({})",
-            t.reachable_objects,
-            format_bytes(t.reachable_bytes),
-            t.external_objects,
-            format_bytes(t.external_bytes),
-            t.unreachable_objects,
-            format_bytes(t.unreachable_bytes)
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "reachable: {} objects ({}); unreachable: {} objects ({})",
-            t.reachable_objects,
-            format_bytes(t.reachable_bytes),
-            t.unreachable_objects,
-            format_bytes(t.unreachable_bytes)
-        );
-    }
-    if t.native_blocks > 0 {
-        let _ = writeln!(
-            out,
-            "native heap: {} blocks ({}); nothing points to {} of them ({}): leaked",
-            t.native_blocks,
-            format_bytes(t.native_bytes),
-            t.native_lost_blocks,
-            format_bytes(t.native_lost_bytes)
-        );
-    }
+    summary::analyze(r, &Style::plain())
+}
 
-    out.push_str("\nTop retainers by retained size\n\n");
-    if r.top_retainers.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        let rows: Vec<Vec<String>> = r
-            .top_retainers
-            .iter()
-            .map(|x| {
-                vec![
-                    format_bytes(x.retained_bytes),
-                    format!("{:.1}%", x.retained_pct),
-                    format_bytes(x.shallow_bytes),
-                    x.type_name.clone(),
-                    root_path_string(&x.path),
-                ]
-            })
-            .collect();
-        let extra: Vec<String> = r
-            .top_retainers
-            .iter()
-            .map(|x| {
-                x.allocated_at
-                    .as_ref()
-                    .map(|at| allocated_at_lines(at, "      "))
-                    .unwrap_or_default()
-            })
-            .collect();
-        table_with_extra(
-            &mut out,
-            &["retained", "%", "shallow", "type", "root path"],
-            &rows,
-            &[0, 1, 2],
-            &extra,
-        );
-    }
-
-    if let Some(a) = &r.allocations {
-        allocations_section(&mut out, a);
-    }
-
-    out.push_str("\nTypes by retained size\n\n");
-    if r.type_histogram.is_empty() {
-        out.push_str("  (none)\n");
-    } else {
-        let rows: Vec<Vec<String>> = r
-            .type_histogram
-            .iter()
-            .map(|x| {
-                vec![
-                    format_bytes(x.retained_bytes),
-                    format_bytes(x.shallow_bytes),
-                    x.count.to_string(),
-                    x.type_name.clone(),
-                ]
-            })
-            .collect();
-        table(
-            &mut out,
-            &["retained", "shallow", "count", "type"],
-            &rows,
-            &[0, 1, 2],
-        );
-    }
-
-    let m = &r.memory;
-    out.push('\n');
-    match m.rss_bytes {
-        Some(rss) => {
-            let _ = writeln!(
-                out,
-                "Python graph accounts for {} of {} RSS ({} outside the graph).",
-                format_bytes(m.graph_bytes),
-                format_bytes(rss),
-                format_bytes(m.outside_graph_bytes.unwrap_or(0))
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "Python graph holds {}. Process RSS was not recorded.",
-                format_bytes(m.graph_bytes)
-            );
-        }
-    }
-    if !m.breakdown.is_empty() {
-        let basis = m.breakdown_basis.as_deref().unwrap_or("committed");
-        let total: u64 = m.breakdown.iter().map(|p| p.bytes).sum();
-        let _ = writeln!(
-            out,
-            "\nWhat the process's memory is ({basis}, {})\n",
-            format_bytes(total)
-        );
-        let rows: Vec<Vec<String>> = m
-            .breakdown
-            .iter()
-            .map(|p| {
-                vec![
-                    format_bytes(p.bytes),
-                    format!("{:.1}%", pct_of(p.bytes, total)),
-                    memory_part_text(&p.part).to_string(),
-                ]
-            })
-            .collect();
-        table(&mut out, &["bytes", "%", "what"], &rows, &[0, 1]);
-    }
-    let rest: Vec<Note> = r
-        .notes
-        .iter()
-        // The allocation caveat is part of the "Allocated by" section.
-        .filter(|n| n.code != "outside_graph" && n.code != "allocations_sampled")
-        .cloned()
-        .collect();
-    notes(&mut out, &rest);
-    Ok(out)
+/// `heapspy analyze` text output, styled.
+pub fn analyze_styled(r: &AnalyzeReport, st: &Style) -> Result<String> {
+    summary::analyze(r, st)
 }
 
 /// A path root first, one labelled hop per line.
@@ -487,6 +339,7 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
         format_bytes(r.shallow_bytes),
         format_bytes(r.retained_bytes)
     );
+    kept_by_section(&mut out, r);
     out.push_str("\nLargest instances\n\n");
     // Instances that are functions, classes, modules or code objects get a
     // column with their own location.
@@ -532,7 +385,7 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
         })
         .collect();
     table_with_extra(&mut out, &header, &rows, &[0, 1, 2], &extra);
-    out.push_str("\nHeld by\n\n");
+    out.push_str("\nReferenced by\n\n");
     if r.holders.is_empty() {
         out.push_str("  (no references from other objects)\n");
     } else {
@@ -545,6 +398,88 @@ pub fn type_query(r: &TypeQueryReport) -> Result<String> {
     }
     notes(&mut out, &r.notes);
     Ok(out)
+}
+
+/// "Kept alive by": the instances grouped by the holder that keeps them,
+/// with the path from it and their sizes; then the sizes of all of them.
+fn kept_by_section(out: &mut String, r: &TypeQueryReport) {
+    if r.kept_by.is_empty() {
+        return;
+    }
+    out.push_str("\nKept alive by\n\n");
+    let rows: Vec<Vec<String>> = r
+        .kept_by
+        .iter()
+        .map(|k| {
+            let who = match (k.kind.as_str(), &k.holder) {
+                ("holder", Some(h)) => k
+                    .holder_name
+                    .clone()
+                    .unwrap_or_else(|| summary::holder_name(h)),
+                ("unreachable", _) if r.matched_types.iter().all(|t| t.starts_with("native.")) => {
+                    "nothing: leaked (no pointer to them anywhere)".to_string()
+                }
+                ("unreachable", _) => "nothing: garbage awaiting collection".to_string(),
+                ("interpreter", _) => "the interpreter itself".to_string(),
+                _ => "smaller holders".to_string(),
+            };
+            vec![
+                format!(
+                    "{:.0}%",
+                    k.bytes as f64 * 100.0 / r.shallow_bytes.max(1) as f64
+                ),
+                who,
+                k.instances.to_string(),
+                format_bytes(k.bytes),
+                k.sizes
+                    .iter()
+                    .take(2)
+                    .map(|g| format!("{} B ×{}", g.size, g.blocks))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ]
+        })
+        .collect();
+    let extra: Vec<String> = r
+        .kept_by
+        .iter()
+        .map(|k| match (&k.through, k.through_pct) {
+            (Some(t), Some(p)) if p >= 99 => {
+                format!(
+                    "        through {}\n",
+                    style::shorten(&summary::holder_name(t), 90)
+                )
+            }
+            (Some(t), Some(p)) => format!(
+                "        through {}  ({p}% of them)\n",
+                style::shorten(&summary::holder_name(t), 90)
+            ),
+            _ => String::new(),
+        })
+        .collect();
+    table_with_extra(
+        out,
+        &["share", "kept by", "instances", "bytes", "sizes"],
+        &rows,
+        &[0, 2, 3],
+        &extra,
+    );
+    if r.by_size.len() > 1 {
+        out.push_str("\nSizes\n\n");
+        let rows: Vec<Vec<String>> = r
+            .by_size
+            .iter()
+            .take(8)
+            .map(|g| {
+                vec![
+                    format!("{} B", g.size),
+                    g.blocks.to_string(),
+                    format_bytes(g.bytes),
+                ]
+            })
+            .collect();
+        table(out, &["size", "instances", "bytes"], &rows, &[0, 1, 2]);
+    }
 }
 
 /// `heapspy query --retaining-path` text output.
@@ -669,32 +604,6 @@ pub fn diff(r: &DiffReport) -> Result<String> {
     }
     notes(&mut out, &r.notes);
     Ok(out)
-}
-
-/// Binary-unit size with one decimal: `412.6 MiB`, `1.1 KiB`, `512 B`.
-fn pct_of(part: u64, whole: u64) -> f64 {
-    if whole == 0 {
-        0.0
-    } else {
-        part as f64 / whole as f64 * 100.0
-    }
-}
-
-/// What a `memory.breakdown` part is, in a few words.
-fn memory_part_text(part: &str) -> &str {
-    match part {
-        "images" => "code and data of loaded modules (python, DLLs, extensions)",
-        "mapped_files" => "memory-mapped files",
-        "stacks" => "thread stacks",
-        "python_small_objects" => "Python objects in pymalloc (small objects)",
-        "pymalloc_free" => "pymalloc free space: held by Python's allocator, not in use",
-        "python_large_objects" => "Python objects from malloc (larger than 512 bytes)",
-        "native_heap" => "native heap blocks something points to",
-        "native_lost" => "native heap blocks nothing points to (leaked)",
-        "native_other" => "other private memory (allocator overhead and free space, C mappings)",
-        "native_unknown" => "native heap and other private memory C code allocated",
-        other => other,
-    }
 }
 
 pub fn format_bytes(n: u64) -> String {
