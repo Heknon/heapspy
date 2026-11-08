@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "heapspy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "heapspy-alloc"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "heapspy-snapshot",
  "memmap2",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "heapspy-analyzer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "heapspy-alloc",
  "heapspy-snapshot",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "heapspy-reader"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "heapspy-snapshot",
  "libc",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "heapspy-record"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "heapspy-alloc",
  "heapspy-reader",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "heapspy-snapshot"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "memmap2",
  "tempfile",

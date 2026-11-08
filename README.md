@@ -110,15 +110,33 @@ Each profile is opt-in, and none stops the process unless you add `--stop`:
 
 | | profile | what it shows | cost to the process |
 |---|---|---|---|
-| `--memory` (default) | `heapspy_memory` | where the memory is: Python objects by size, pymalloc's free space, malloc's heaps, the rest of RSS | never stopped; read from counters every 15 s |
-| `--retained` | `memory:inuse_space` | who holds it: a retention flame graph every 5 minutes | not stopped (approximate, Linux); `--stop` for exact snapshots |
-| `--alloc` | `memory:alloc_space` | which code allocated it, sampled in 30-second windows | never stopped (eBPF, ETW) |
+| `--memory` (default) | `memory:inuse_space`, `heapspy_profile=memory` | where the memory is: Python objects by size, pymalloc's free space, malloc's heaps, the rest of RSS | never stopped; read from counters every 15 s |
+| `--retained` | `memory:inuse_space`, `heapspy_profile=retained` | who holds it: a retention flame graph every 5 minutes | not stopped (approximate, Linux); `--stop` for exact snapshots |
+| `--alloc` | `memory:alloc_space`, `heapspy_profile=allocations` | which code allocated it, sampled in 30-second windows | never stopped (eBPF, ETW) |
 
 `--discover` picks up every CPython process whose command line matches, as
 it starts. Profiles carry `service_name`, `pid`, `hostname` and your
 `--tag`s. Credentials are read from the environment
 (`HEAPSPY_PYROSCOPE_PASSWORD`, `HEAPSPY_PYROSCOPE_TOKEN`), never the command
 line. Details in [docs/cli.md](docs/cli.md#agent).
+
+Or from inside the application, with the interface of Pyroscope's Python
+client (`pip install heapspy`; the agent still reads the process from
+outside):
+
+```python
+import heapspy
+
+heapspy.configure(
+    application_name="checkout",
+    server_address="http://pyroscope:4040",
+    tags={"env": "prod"},
+    retained=True,  # opt-in, as on the command line
+)
+```
+
+See [docs/cli.md](docs/cli.md#from-python-heapspyconfigure) and
+[examples/pyroscope_configure.py](examples/pyroscope_configure.py).
 
 The counters behind `--memory` can also be read directly:
 

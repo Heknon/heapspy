@@ -293,11 +293,11 @@ CPU profiles of the same service.
 Each kind of profile is opt-in, and none of them stops the process unless
 you ask:
 
-| Flag | Profile in Pyroscope | What it shows | Cost to the process |
+| Flag | Profile in Pyroscope (`heapspy_profile`) | What it shows | Cost to the process |
 |---|---|---|---|
-| `--memory` (the default when none is chosen) | `heapspy_memory` · `resident` bytes | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
-| `--retained` | `memory` · `inuse_space` bytes | who holds the memory: the [retention flame graph](#flamegraph) of a snapshot, every `--retained-every` (5m). Labelled `heapspy_snapshot=approximate` or `stopped` | not stopped (Linux): the snapshot is approximate. `--stop` takes exact snapshots and pauses the process for each walk |
-| `--alloc` | `memory` · `alloc_space` bytes | what allocated memory: Python stacks of sampled allocations, during a window of `--alloc-for` (30s) every `--alloc-every` (5m) | never stopped: eBPF on Linux (root or `CAP_BPF` and `CAP_PERFMON`), ETW on Windows (elevated). A few percent while a window runs |
+| `--memory` (the default when none is chosen) | `memory` · `inuse_space` bytes (`memory`) | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
+| `--retained` | `memory` · `inuse_space` bytes (`retained`) | who holds the memory: the [retention flame graph](#flamegraph) of a snapshot, every `--retained-every` (5m). Labelled `heapspy_snapshot=approximate` or `stopped` | not stopped (Linux): the snapshot is approximate. `--stop` takes exact snapshots and pauses the process for each walk |
+| `--alloc` | `memory` · `alloc_space` bytes (`allocations`) | what allocated memory: Python stacks of sampled allocations, during a window of `--alloc-for` (30s) every `--alloc-every` (5m) | never stopped: eBPF on Linux (root or `CAP_BPF` and `CAP_PERFMON`), ETW on Windows (elevated). A few percent while a window runs |
 
 **Which processes.** `--pid` (repeatable) watches given processes; a pid
 that is not a CPython heapspy can read is an error. `--discover TEXT`
@@ -331,6 +331,34 @@ export HEAPSPY_PYROSCOPE_TOKEN=...
 ```
 
 `--tenant-id` sets `X-Scope-OrgID` for a multi-tenant Pyroscope.
+`HEAPSPY_PYROSCOPE_HEADERS`, a JSON object (`{"X-Name": "value"}`), adds
+headers to every request.
+
+`--memory` and `--retained` share one profile type, so that Grafana
+graphs both in bytes (it graphs any type it does not know as bytes per
+second). Filter on `heapspy_profile` to see one of them: a query of
+`memory:inuse_space` with both on and no such filter adds them up.
+
+**In Grafana**, add Pyroscope as a data source and query the profile types
+above, filtered on `service_name` and `heapspy_profile`, e.g.
+`{service_name="shop", heapspy_profile="memory"}`. All three are gauges
+or windows, not counters, and Pyroscope adds up every profile that falls
+in a time step or in a flame graph's range. So:
+
+- in a time series panel, each point should be one reading: set the
+  query's min interval to the agent's interval for that profile
+  (`--memory-every`, `--retained-every`). Grafana never steps below the
+  data source's **Minimal step** (15s by default, as is `--memory-every`):
+  for a shorter `--memory-every`, lower it to match. A longer range forces
+  wider steps, and each point is then the sum of several readings;
+- a flame graph over a range is the sum of the profiles in it: read its
+  proportions, or narrow the range (a panel's relative time) for one
+  reading's bytes. A profile is stamped when its reading starts, and a
+  snapshot or an allocation window arrives when it ends, so give those a
+  relative time of about twice their interval.
+
+A profile that takes longer than its interval skips the readings it
+missed, so profiles stay one interval apart.
 
 **Before sending anything,** `--dry-run DIR` writes each profile as
 `DIR/NNNNNN-PID-KIND.pprof` with its labels in a `.json` next to it, and
@@ -356,6 +384,57 @@ in `go tool pprof`.
 
 A heapspy built without the `tls` Cargo feature (on by default) sends only
 to `http://` servers.
+
+### From Python: `heapspy.configure()`
+
+The `heapspy` package also has a Python module with the interface of
+Pyroscope's Python client (`pyroscope-io`): the application starts the
+agent for itself, with the same call it would make to `pyroscope.configure`.
+
+```python
+import heapspy
+
+heapspy.configure(
+    application_name="checkout",            # service_name
+    server_address="http://pyroscope:4040",
+    tags={"env": "prod", "region": "eu-west-1"},
+    # Grafana Cloud: basic_auth_username="123456", basic_auth_password="glc_...",
+    # tenant_id="team-a", http_headers={"X-Name": "value"},
+    # heapspy's own profiles, keyword only; memory is on, the rest opt-in:
+    retained=True, retained_interval=300,   # who holds it (approximate)
+    # stop=True,                            # exact snapshots, pausing the process
+    # alloc=True, alloc_interval=300, alloc_duration=30,  # needs eBPF / ETW
+)
+...
+heapspy.shutdown()                          # also runs at exit
+```
+
+`configure()` starts `heapspy agent --pid <this process>` as a child
+process, with the arguments translated: `upload_interval` (seconds, 15) is
+`--memory-every`, `tags` are `--tag`s, and the password and `http_headers`
+go through the environment (`HEAPSPY_PYROSCOPE_PASSWORD`,
+`HEAPSPY_PYROSCOPE_HEADERS`), not the command line. Nothing runs inside the
+interpreter. The agent's messages go to the `heapspy` logger with
+`enable_logging=True`. Calling `configure()` again replaces the agent;
+`shutdown()` stops it after it sends what it collected, and the agent also
+exits when the process does. `is_running()` says whether it is running.
+
+`pyroscope.configure`'s CPU options (`sample_rate`, `oncpu`, `gil_only`,
+`report_thread_id`, ...) are accepted and ignored, so `import heapspy as
+pyroscope` runs unchanged; every profile has a `pid` label, as with
+`report_pid`. The two can run side by side: Pyroscope for CPU, heapspy for
+memory, under the same `application_name`.
+
+The agent reads this process from outside, so it needs the same permission
+as `heapspy agent --pid` run by the same user. Under Yama's
+`ptrace_scope` 1 (Ubuntu's default), a process may only read its
+descendants; `configure()` names the agent as the process allowed to read
+this one (`prctl(PR_SET_PTRACER)`). Scope 2 needs `CAP_SYS_PTRACE`.
+
+A process started by `fork()` (a gunicorn or multiprocessing worker) is
+not the one the agent watches: call `configure()` in each worker, e.g.
+from gunicorn's `post_fork` hook. The binary is found next to the module
+(the package's script), on `PATH`, or at `$HEAPSPY_BIN`.
 
 ## analyze
 

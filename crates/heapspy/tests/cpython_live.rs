@@ -600,18 +600,20 @@ fn run_agent(minor: u8) {
         serde_json::from_str(&std::fs::read_to_string(out.join(n)).unwrap()).unwrap()
     };
     let m = labels(&names[0]);
-    assert_eq!(m["__name__"], "heapspy_memory");
+    assert_eq!(m["__name__"], "memory");
+    assert_eq!(m["heapspy_profile"], "memory");
     assert_eq!(m["service_name"], "victim");
     assert_eq!(m["pid"], pid.as_str());
     assert_eq!(m["env"], "test");
     let r = labels(&names[2]);
     assert_eq!(r["__name__"], "memory");
+    assert_eq!(r["heapspy_profile"], "retained");
     assert_eq!(r["heapspy_snapshot"], "approximate");
     let has = |n: &str, what: &str| {
         let b = std::fs::read(out.join(n)).unwrap();
         b.windows(what.len()).any(|w| w == what.as_bytes())
     };
-    assert!(has(&names[1], "resident") && has(&names[1], "pymalloc free"));
+    assert!(has(&names[1], "inuse_space") && has(&names[1], "pymalloc free"));
     assert!(has(&names[3], "inuse_space") && has(&names[3], "['CACHE']"));
 
     // --discover finds it by its command line.
