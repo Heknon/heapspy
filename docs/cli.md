@@ -343,13 +343,20 @@ above, filtered on `service_name` and `heapspy_profile`, e.g.
 or windows, not counters, and Pyroscope adds up every profile that falls
 in a time step or in a flame graph's range. So:
 
-- in a time series panel, set the query's min interval to the agent's
-  interval for that profile (`--memory-every`, `--retained-every`), so each
-  point is one reading. A longer range forces wider steps, and each point
-  is then the sum of several readings;
+- in a time series panel, each point should be one reading: set the
+  query's min interval to the agent's interval for that profile
+  (`--memory-every`, `--retained-every`). Grafana never steps below the
+  data source's **Minimal step** (15s by default, as is `--memory-every`):
+  for a shorter `--memory-every`, lower it to match. A longer range forces
+  wider steps, and each point is then the sum of several readings;
 - a flame graph over a range is the sum of the profiles in it: read its
-  proportions, or narrow the range (a panel's relative time, e.g. the last
-  `--retained-every`) for one reading's bytes.
+  proportions, or narrow the range (a panel's relative time) for one
+  reading's bytes. A profile is stamped when its reading starts, and a
+  snapshot or an allocation window arrives when it ends, so give those a
+  relative time of about twice their interval.
+
+A profile that takes longer than its interval skips the readings it
+missed, so profiles stay one interval apart.
 
 **Before sending anything,** `--dry-run DIR` writes each profile as
 `DIR/NNNNNN-PID-KIND.pprof` with its labels in a `.json` next to it, and

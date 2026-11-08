@@ -321,6 +321,20 @@ impl Target {
     }
 }
 
+/// The first slot after `last` on its grid of `every` that is not past.
+///
+/// A profile that took longer than `every` skips the slots it missed
+/// rather than running the next ones back to back: profiles stay `every`
+/// apart, so a graph step of `every` holds one of them, not two added up.
+fn next_slot(last: Instant, every: Duration, now: Instant) -> Instant {
+    let next = last + every;
+    if next >= now || every.is_zero() {
+        return next;
+    }
+    let behind = (now - next).as_nanos() / every.as_nanos();
+    next + every * (behind as u32 + 1)
+}
+
 fn now_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -341,8 +355,8 @@ fn memory_loop(t: &Target, mut sampler: Sampler, every: Duration) {
         if t.once {
             return;
         }
-        next += every;
-        if !t.wait(next.max(Instant::now())) {
+        next = next_slot(next, every, Instant::now());
+        if !t.wait(next) {
             return;
         }
     }
@@ -411,8 +425,8 @@ fn retained_loop(t: &Target, every: Duration, stop_it: bool) {
         if t.once {
             return;
         }
-        next += every;
-        if !t.wait(next.max(Instant::now())) {
+        next = next_slot(next, every, Instant::now());
+        if !t.wait(next) {
             return;
         }
     }
@@ -483,8 +497,8 @@ fn alloc_loop(t: &Target, every: Duration, window: Duration, events: heapspy_all
         if t.once {
             return;
         }
-        next += every.max(window);
-        if !t.wait(next.max(Instant::now())) {
+        next = next_slot(next, every.max(window), Instant::now());
+        if !t.wait(next) {
             return;
         }
     }
@@ -683,6 +697,19 @@ pub fn parse_tag(s: &str) -> Result<(String, String), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_late_profile_skips_the_slots_it_missed() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let every = 30 * s;
+        assert_eq!(next_slot(t0, every, t0 + 10 * s), t0 + every);
+        assert_eq!(next_slot(t0, every, t0 + every), t0 + every);
+        assert_eq!(next_slot(t0, every, t0 + 55 * s), t0 + 60 * s);
+        assert_eq!(next_slot(t0, every, t0 + 60 * s), t0 + 90 * s);
+        assert_eq!(next_slot(t0, every, t0 + 95 * s), t0 + 120 * s);
+    }
+
     use super::*;
 
     #[test]
