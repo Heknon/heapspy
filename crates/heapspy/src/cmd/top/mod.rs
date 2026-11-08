@@ -320,9 +320,7 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
                     }) {
                         v.push(format!(
                             "  {:<60} {:>10}",
-                            heapspy_analyzer::render::summary::holder_name(
-                                &heapspy_analyzer::root_path_string(&r.path)
-                            ),
+                            heapspy_analyzer::render::summary::readable_path(&r.path),
                             format_bytes(r.retained_bytes)
                         ));
                     }
@@ -335,10 +333,9 @@ fn open_detail(app: &mut App, tx: &Sender<Msg>) {
                 });
                 return;
             }
-            let title = if r.is_some() {
-                heapspy_analyzer::render::summary::holder_name(site)
-            } else {
-                site.clone()
+            let title = match r {
+                Some(r) => heapspy_analyzer::render::summary::readable_path(&r.path),
+                None => site.clone(),
             };
             (title, Some(Ok(holder_detail(app, site, *r))))
         }

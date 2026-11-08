@@ -150,6 +150,51 @@ pub fn holder_name(path: &str) -> String {
     collapse_c_hops(&s)
 }
 
+/// A retaining path as a reader names it: [`holder_name`] of its root path,
+/// with raw pointers out of a Python object's own C struct named `C field
+/// +N` (the hop's source type is known here, unlike in a path string), and
+/// runs of native blocks after it one `C memory` step.
+pub fn readable_path(path: &[crate::report::PathHop]) -> String {
+    let mut s = String::new();
+    // 0: not in native memory, 1: after a `C field`, 2: after `C memory`.
+    let mut in_c = 0u8;
+    for (i, hop) in path.iter().enumerate() {
+        if let Some(r) = &hop.root_label {
+            s.push_str(r);
+        }
+        let Some(e) = &hop.edge else { continue };
+        let native = hop.type_name.starts_with("native.");
+        let raw = native && (e == "<contents>" || is_offset(e));
+        if !raw {
+            crate::push_edge(&mut s, e);
+            in_c = 0;
+            continue;
+        }
+        let from_python = i > 0 && !path[i - 1].type_name.starts_with("native.");
+        match in_c {
+            2 => {}
+            1 => {
+                s.push_str(" → C memory");
+                in_c = 2;
+            }
+            _ => {
+                let step = crate::query::c_step(e, from_python);
+                in_c = if step == "C memory" { 2 } else { 1 };
+                s.push_str(" → ");
+                s.push_str(&step);
+            }
+        }
+    }
+    holder_name(&s)
+}
+
+/// `<+16>`: a raw word at an offset.
+fn is_offset(e: &str) -> bool {
+    e.strip_prefix("<+")
+        .and_then(|r| r.strip_suffix('>'))
+        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// A run of raw native hops (` <+16>`, ` <contents>`) is one ` → C memory`.
 fn collapse_c_hops(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -256,10 +301,13 @@ pub fn what_rows(r: &AnalyzeReport) -> Vec<WhatRow> {
                 retained: t.retained_bytes,
                 held_by: t.held_by.as_deref().map(|h| {
                     if crate::is_interpreter_holder(h) {
-                        "the interpreter".to_string()
-                    } else {
-                        holder_name(h)
+                        return "the interpreter".to_string();
                     }
+                    // The retainer's hops name C fields; the string cannot.
+                    r.top_retainers
+                        .iter()
+                        .find(|x| Some(x.rank) == t.held_by_rank)
+                        .map_or_else(|| holder_name(h), |x| readable_path(&x.path))
                 }),
                 held_by_rank: t.held_by_rank,
                 held_pct: t
@@ -583,7 +631,7 @@ fn holders_section(out: &mut String, r: &AnalyzeReport, st: &Style, w: usize) {
         .iter()
         .partition(|x| crate::is_interpreter_holder(&root_path_string(&x.path)));
     for (i, x) in program.into_iter().take(10).enumerate() {
-        let path = shorten(&holder_name(&root_path_string(&x.path)), path_w);
+        let path = shorten(&readable_path(&x.path), path_w);
         let rank = format!("{:>2}", i + 1);
         let rank = if i < 3 {
             st.paint(Paint::Warn, rank)
@@ -799,6 +847,45 @@ mod tests {
         );
         assert_eq!(holder_name("m.X <+3x>"), "m.X <+3x>");
         assert_eq!(holder_name("x.__dict__['a b']"), "x.__dict__['a b']");
+    }
+
+    fn hop(t: &str, edge: Option<&str>, root: Option<&str>) -> crate::report::PathHop {
+        crate::report::PathHop {
+            address: crate::report::Address(0),
+            type_name: t.into(),
+            shallow_bytes: 0,
+            edge: edge.map(String::from),
+            root_label: root.map(String::from),
+            root_kind: None,
+            source_loc: None,
+            source_loc_reason: None,
+        }
+    }
+
+    #[test]
+    fn readable_paths_name_c_fields_and_c_memory() {
+        // A Python object's own C struct points at a block, which points on.
+        let p = [
+            hop("builtins.module", None, Some("sys.modules['app']")),
+            hop("builtins.dict", Some(".__dict__"), None),
+            hop("_io.BufferedReader", Some("['F']"), None),
+            hop("native.heap_block", Some("<+104>"), None),
+            hop("native.heap_block", Some("<+16>"), None),
+            hop("native.heap_block", Some("<contents>"), None),
+        ];
+        assert_eq!(readable_path(&p), "app.F → C field +104 → C memory");
+        // A C global's block chain is C memory from the start.
+        let p = [
+            hop("native.heap_block", None, Some("libfoo.so: g_cache")),
+            hop("native.heap_block", Some("<+8>"), None),
+        ];
+        assert_eq!(readable_path(&p), "libfoo.so: g_cache → C memory");
+        // Memory a Python object points to but does not lay out.
+        let p = [
+            hop("collections.deque", None, Some("sys.modules['m']")),
+            hop("native.heap_block", Some("<contents>"), None),
+        ];
+        assert_eq!(readable_path(&p), "m → C data");
     }
 
     fn row(t: &str, bytes: u64) -> WhatRow {

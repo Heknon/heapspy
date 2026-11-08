@@ -3,7 +3,7 @@
 use heapspy_analyzer::render::format_bytes;
 use heapspy_analyzer::render::style::shorten;
 use heapspy_analyzer::render::summary::{
-    fold_internals, holder_name, what_rows, WhatRow, INTERNALS,
+    fold_internals, holder_name, readable_path, what_rows, WhatRow, INTERNALS,
 };
 use heapspy_analyzer::render::Paint;
 use heapspy_analyzer::report::Retainer;
@@ -423,7 +423,7 @@ fn draw_holders(f: &mut Frame, app: &App, area: Rect) {
             } else if r.is_none() {
                 Span::styled(site.clone(), Style::default().fg(Color::LightRed))
             } else {
-                Span::raw(holder_name(site))
+                Span::raw(r.map_or_else(|| holder_name(site), |r| readable_path(&r.path)))
             };
             let holds = match r {
                 Some(r) => what
@@ -699,7 +699,10 @@ fn draw_native(f: &mut Frame, app: &App, area: Rect) {
             let rate = holder_rate(app, &site);
             let series = app.series(12, holder_value(&site));
             Row::new(vec![
-                Line::from(shorten(&holder_name(&site), 70)),
+                Line::from(shorten(
+                    &r.map_or_else(|| holder_name(&site), |r| readable_path(&r.path)),
+                    70,
+                )),
                 Line::from(Span::styled(
                     format_bytes(nat),
                     Style::default().fg(Color::Magenta),

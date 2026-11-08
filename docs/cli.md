@@ -81,8 +81,10 @@ holder that keeps most of them alive, and how much of them.
 
 Holders are named the way code names them. A pointer in a library's C
 globals is named by the global when the library has a symbol table
-(`libfoo.so: g_cache`, `python3.13: _PyRuntime`), and a chain of raw
-pointers through native memory reads as `→ C memory`. The interpreter's own
+(`libfoo.so: g_cache`, `python3.13: _PyRuntime`). A pointer in a Python
+object's own C struct reads as `C field +offset` after the object's type
+(`[<index>] ctypes.c_char_Array_32768 → C field +16`), and a chain of raw
+pointers through native blocks as `→ C memory`. The interpreter's own
 holders (libpython's C globals, interpreter state, code objects) are one
 `the interpreter itself` entry; holders with less than 1% of a type's bytes
 are `smaller holders`.

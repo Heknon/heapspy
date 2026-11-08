@@ -662,6 +662,11 @@ pub struct KeptBy {
     pub kind: String,
     /// Root path of the holder; `null` unless `kind` is `"holder"`.
     pub holder: Option<String>,
+    /// The holder as a reader names it: `app.cache.CACHE`, `libfoo.so:
+    /// g_cache → C memory`, `….fileobj _io.BufferedReader → C field +104`.
+    /// Added in 0.3.
+    #[serde(default)]
+    pub holder_name: Option<String>,
     pub holder_address: Option<Address>,
     /// The most common path from the holder to the instances, with keys
     /// and indices generalised and the type reached after each hop, e.g.

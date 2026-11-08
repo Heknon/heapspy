@@ -95,6 +95,7 @@
     {
       "kind": "holder",
       "holder": "sys.modules['app.cache'].__dict__['CACHE']",
+      "holder_name": "app.cache.CACHE",
       "holder_address": "0x7f3a2c41b0d0",
       "through": "[<key>]",
       "through_pct": 100,

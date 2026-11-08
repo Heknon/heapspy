@@ -412,7 +412,10 @@ fn kept_by_section(out: &mut String, r: &TypeQueryReport) {
         .iter()
         .map(|k| {
             let who = match (k.kind.as_str(), &k.holder) {
-                ("holder", Some(h)) => summary::holder_name(h),
+                ("holder", Some(h)) => k
+                    .holder_name
+                    .clone()
+                    .unwrap_or_else(|| summary::holder_name(h)),
                 ("unreachable", _) if r.matched_types.iter().all(|t| t.starts_with("native.")) => {
                     "nothing: leaked (no pointer to them anywhere)".to_string()
                 }

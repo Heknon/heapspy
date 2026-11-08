@@ -263,16 +263,21 @@ fn kept_by(a: &Analysis, inst: &[u32], top: usize) -> Result<(Vec<KeptBy>, Vec<S
                 None => (None, None),
             }
         };
-        let (holder_path, holder_address) = match keeper {
-            Some(k) => (
-                a.path(k)?.map(|p| crate::root_path_string(&p)),
-                Some(Address(snap.object(k).addr)),
-            ),
-            None => (None, None),
+        let (holder_path, holder_name, holder_address) = match keeper {
+            Some(k) => {
+                let p = a.path(k)?;
+                (
+                    p.as_ref().map(|p| crate::root_path_string(p)),
+                    p.as_ref().map(|p| crate::render::summary::readable_path(p)),
+                    Some(Address(snap.object(k).addr)),
+                )
+            }
+            None => (None, None, None),
         };
         out.push(KeptBy {
             kind: kind.to_string(),
             holder: holder_path,
+            holder_name,
             holder_address,
             through,
             through_pct,
@@ -302,6 +307,7 @@ fn fold_kept_by(groups: Vec<KeptBy>) -> Vec<KeptBy> {
         let t = into.get_or_insert_with(|| KeptBy {
             kind: kind.to_string(),
             holder: None,
+            holder_name: None,
             holder_address: None,
             through: None,
             through_pct: None,
@@ -340,6 +346,20 @@ fn fold_kept_by(groups: Vec<KeptBy>) -> Vec<KeptBy> {
     out
 }
 
+/// How a raw pointer into native memory reads in a path: a field of the
+/// Python object it is in (`C field +104`, or `C data` for memory the
+/// object points to but does not lay out), else part of a run of native
+/// blocks (`C memory`).
+pub(crate) fn c_step(label: &str, from_python: bool) -> String {
+    if !from_python {
+        return "C memory".to_string();
+    }
+    match label.strip_prefix("<+").and_then(|r| r.strip_suffix('>')) {
+        Some(off) => format!("C field +{off}"),
+        None => "C data".to_string(),
+    }
+}
+
 /// The path from `keeper` to `v`, generalised: `[<key>] app.Session → .payload`.
 /// Taken from `v`'s shortest path, from just after `keeper`; if that path
 /// does not pass through `keeper` (or there is no keeper), the whole path
@@ -351,8 +371,10 @@ fn through_path(a: &Analysis, keeper: Option<u32>, v: u32) -> Result<String> {
         .map_or(0, |i| i + 1);
     let mut out = String::new();
     // Hops into native memory through raw words (`<+16>`, `<contents>`)
-    // say nothing to a reader: a run of them is one `C memory` step.
-    let mut in_c = false;
+    // say nothing to a reader: a run of them is one `C memory` step, after
+    // a `C field +N` when the run starts in a Python object's own struct.
+    // 0: not in native memory, 1: after a `C field`, 2: after `C memory`.
+    let mut in_c = 0u8;
     for (i, &(x, e)) in chain.iter().enumerate().skip(start) {
         let native = a
             .snap
@@ -363,18 +385,33 @@ fn through_path(a: &Analysis, keeper: Option<u32>, v: u32) -> Result<String> {
             Some(l) => {
                 let label = generalised_label(a.snap, l)?;
                 let raw = native && (label.starts_with("<+") || label == "<contents>");
-                if raw && in_c {
+                // The pointer's owner: the previous hop, or the keeper.
+                let from = if i > 0 { Some(chain[i - 1].0) } else { keeper };
+                let from_python = from.is_some_and(|f| {
+                    !a.snap
+                        .object(f)
+                        .flags
+                        .contains(heapspy_snapshot::ObjectFlags::NATIVE)
+                });
+                if raw && in_c == 2 {
                     continue;
                 }
                 if !out.is_empty() {
                     out.push_str(" → ");
                 }
                 if raw {
-                    out.push_str("C memory");
-                    in_c = true;
+                    // Out of a Python object's own C struct: name the field
+                    // by its offset; the object's type is the hop before.
+                    let step = if in_c == 1 {
+                        "C memory".to_string()
+                    } else {
+                        c_step(&label, from_python)
+                    };
+                    in_c = if step == "C memory" { 2 } else { 1 };
+                    out.push_str(&step);
                     continue;
                 }
-                in_c = false;
+                in_c = 0;
                 out.push_str(match label.as_str() {
                     "<address>" => "its value as an address",
                     l => l,
@@ -384,7 +421,7 @@ fn through_path(a: &Analysis, keeper: Option<u32>, v: u32) -> Result<String> {
                 if let Some((label, _)) = a.g.root_label(a.snap, e)? {
                     out.push_str(&label);
                 }
-                in_c = false;
+                in_c = 0;
             }
         }
         // Name the type reached after each hop but the last (that is the
@@ -542,6 +579,7 @@ mod tests {
         KeptBy {
             kind: kind.into(),
             holder: holder.map(String::from),
+            holder_name: None,
             holder_address: None,
             through: None,
             through_pct: None,
