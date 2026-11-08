@@ -84,6 +84,13 @@ jobs:
           py="$(uv python find --python-preference only-managed "$PY_VERSION")"
           HEAPSPY_PY="$py" cargo test --release --locked -p heapspy-reader \
               --test native_heap_live -- --ignored --test-threads 1 --nocapture
+      - name: Live counters (GC, pymalloc, glibc heaps) on a real CPython
+        # Read without stopping the victim, checked against what its own
+        # gc and sys modules report.
+        run: |
+          py="$(uv python find --python-preference only-managed "$PY_VERSION")"
+          HEAPSPY_PY="$py" cargo test --release --locked -p heapspy-reader \
+              --test counters_live counters_heapspy_py -- --ignored --test-threads 1 --nocapture
       - name: Check out heapspy-mcp
         if: inputs.mcp_ref != ''
         uses: actions/checkout@v4

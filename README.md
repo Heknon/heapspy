@@ -30,6 +30,7 @@ cargo install --git https://github.com/Heknon/heapspy heapspy
 sudo heapspy top --pid 1234                 # live view; Enter on a row for details
 sudo heapspy analyze --pid 1234             # one report, right now
 sudo heapspy watch --pid 1234 --every 30s   # what grows, and how steadily
+sudo heapspy watch --pid 1234 --counters    # live counters, never pausing the process
 ```
 
 - **`top`** is a live, full-screen view. Its main table lists what the
@@ -41,6 +42,11 @@ sudo heapspy watch --pid 1234 --every 30s   # what grows, and how steadily
 - **`watch`** takes a snapshot every interval and prints one line per round.
   On Ctrl-C it prints each holder's growth with a verdict: likely leak, keep
   watching, or fine.
+- **`watch --counters`** takes no snapshot: it reads CPython's GC and
+  allocator counters and glibc's heap sizes while the process runs, in about
+  a millisecond, so it can sample every second or faster. With `--json` it
+  is a stream for your own graphs; `top` draws the same numbers in its
+  Graphs tab.
 
 Reading another process needs ptrace rights on Linux and an elevated prompt
 on Windows; reading snapshot files needs nothing.

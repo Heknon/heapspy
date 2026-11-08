@@ -16,7 +16,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::ProcessStatus::{
-    EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, LIST_MODULES_ALL, MODULEINFO,
+    EnumProcessModulesEx, GetModuleFileNameExW, GetModuleInformation, K32GetProcessMemoryInfo,
+    LIST_MODULES_ALL, MODULEINFO, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -192,6 +193,28 @@ impl MemorySource for RunningProcess {
             .ok()
             .map(|d| d.as_secs())
     }
+}
+
+/// Working set and private commit of `pid`, in bytes.
+pub fn process_memory(pid: u32) -> Option<(u64, u64)> {
+    // SAFETY: plain OpenProcess; the handle is owned by `Handle`.
+    let h = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
+    if h.0.is_null() {
+        return None;
+    }
+    // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS_EX is valid.
+    let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // SAFETY: `c` is as large as `cb` says; the EX struct starts with the
+    // plain one, which is what the signature names.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            h.0,
+            (&mut c as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            c.cb,
+        )
+    };
+    (ok != 0).then_some((c.WorkingSetSize as u64, c.PrivateUsage as u64))
 }
 
 /// Thread ids of `pid`, from a Toolhelp snapshot.

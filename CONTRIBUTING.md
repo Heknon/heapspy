@@ -66,6 +66,14 @@ HEAPSPY_PY="$(uv python find 3.13)" \
     cargo test -p heapspy-reader --test native_heap_live -- --ignored --test-threads 1
 ```
 
+The e2e job also checks the live counters (`watch --counters`, `top`'s
+Graphs tab) against what a real CPython's `gc` and `sys` report, read
+without stopping it (`crates/heapspy-reader/tests/counters_live.rs`):
+
+```sh
+cargo test -p heapspy-reader --test counters_live -- --ignored --test-threads 1
+```
+
 The same test runs against older and other glibc releases in
 `.github/workflows/glibc.yml`: one distro image per malloc layout, from
 Ubuntu 12.04 (glibc 2.15) to Ubuntu 24.04 (2.39). CPython does not run on

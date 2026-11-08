@@ -10,7 +10,8 @@ same information in short form.
 - [What the process pays](#what-the-process-pays)
 - [Reading the reports](#reading-the-reports)
 - [top](#top): live view
-- [watch](#watch): growth over time, as plain lines
+- [watch](#watch): growth over time, as plain lines, or live counters
+  ([`--counters`](#live-counters---counters))
 - [analyze](#analyze): one report, from a process or a file
 - [dump](#dump), [record](#record): capture
 - [query](#query), [diff](#diff), [flamegraph](#flamegraph): dig into snapshots
@@ -23,6 +24,7 @@ same information in short form.
 | see what a process's memory is and what is growing, live | `sudo heapspy top --pid PID` |
 | one readable report, right now | `sudo heapspy analyze --pid PID` |
 | know whether it leaks, and what, over minutes or hours, in a log | `sudo heapspy watch --pid PID --every 5m` |
+| graph memory and the GC every second, or feed your own graphs, without ever pausing the process | `top` (tab 6), or `sudo heapspy watch --pid PID --counters --json` |
 | keep a snapshot to analyze later, elsewhere, or attach to a bug | `sudo heapspy dump --pid PID -o app.hpy` |
 | know which code allocated the memory that stays alive | `top --alloc`, or `record` then `analyze --allocations` |
 | follow one object or type to what holds it | `heapspy query app.hpy --retaining-path-type T` |
@@ -33,8 +35,9 @@ same information in short form.
 |---|---|---|
 | memory totals (`/proc`) | no | nothing measurable |
 | thread stacks (`top` every second, `analyze --pid` once) | no | a few small reads per thread |
+| counters (`top` every second, `watch --counters`) | no | a 48-byte read per pymalloc pool (64 per MiB of arenas), batched: about a millisecond for tens of MiB, ~30 ms per GiB |
 | a snapshot (`dump`, `analyze --pid`, every `watch` round, every `top --every`) | **yes**, for the whole walk | from ~100 ms on a small heap to seconds on a heap of millions of objects; the pause is printed |
-| a snapshot with `--no-stop` (`dump`, `top`) | no | none, but the result is approximate and a walk can fail |
+| a snapshot with `--no-stop` (`dump`, `analyze --pid`, `top`, `watch`; Linux) | no | none, but the result is approximate and a walk can fail |
 | allocation sampling, arenas | no | a few percent |
 | allocation sampling, large objects | no | ~0.5 µs per `malloc` above 512 bytes; 30–50% on an allocation-heavy benchmark |
 
@@ -124,7 +127,7 @@ A full-screen view that keeps refreshing:
 - **Memory line**: RSS with its growth per minute, refreshed every second,
   and how old the last snapshot is and how long it stopped the process.
   Under it, one bar of the kinds of memory, each with its growth (`▲`).
-- **Tabs** (`1`–`5`, Tab):
+- **Tabs** (`1`–`6`, Tab):
   1. **Objects** (the default): what the memory is, one row per type and
      native blocks in use and leaked, with count, size, growth per minute,
      a trend, and the holder that keeps most of them. `s` sorts by size,
@@ -138,6 +141,14 @@ A full-screen view that keeps refreshing:
      over the last 10 minutes.
   5. **Allocated**: with allocation sampling, the Python stacks that
      allocated the most and how much of it is still alive.
+  6. **Graphs**: [counters](#live-counters---counters) read every second
+     without stopping the process. One chart of RSS, pymalloc's arenas,
+     the Python objects in them and glibc malloc's heaps; one of the GC's
+     generation 0 count against its threshold (it climbs with allocations
+     and drops at each collection), titled with the collections in the
+     window; and the numbers now, with their change per minute, the
+     arenas, the busiest size classes and the GC counts. `s` cycles the
+     window: 1, 5, 15 or 30 minutes.
 - **Enter** opens details. On an object row: what keeps those objects
   alive, grouped by holder, with the path from each holder to them and
   their sizes (`92% app.cache.CACHE 2081 B ×660, through [<key>]
@@ -147,7 +158,8 @@ A full-screen view that keeps refreshing:
   a holder's path from its root, a thread's whole stack, an allocation
   stack.
 
-Keys: `↑↓`/`jk` move, `PgUp`/`PgDn`, `Enter` details, `Esc` close, `s` sort,
+Keys: `↑↓`/`jk` move, `PgUp`/`PgDn`, `Enter` details, `Esc` close, `s` sort
+(on Graphs: the window),
 `d` snapshot now, `w` save the latest snapshot to
 `heapspy-PID-TIME.hpy`, `a` start or stop allocation sampling, `i` list
 interpreter internals type by type, `space`
@@ -155,7 +167,7 @@ pause, `?` help, `q` quit.
 
 | Option | Default | |
 |---|---|---|
-| `--every DURATION` | `10s` | time between snapshots; memory totals and stacks refresh every second regardless |
+| `--every DURATION` | `10s` | time between snapshots; memory totals, stacks and counters refresh every second regardless |
 | `--no-stop` | off | never stop the process; snapshots are approximate |
 | `--max-pause DURATION` | none | stop scheduled snapshots while the last one paused the process longer (`d` still works) |
 | `--alloc` | off | start allocation sampling at once |
@@ -198,8 +210,69 @@ whole run with a verdict:
 
 The first and the latest snapshot stay in `--dir` (default `watch-PID`),
 ready for `heapspy diff`. With `--max-pause`, the interval doubles whenever
-a snapshot pauses the process longer. `--json` prints one JSON object per
-round and a final `watch_summary` object (JSON Lines).
+a snapshot pauses the process longer. `--json` prints one `watch_round`
+object per round and a final `watch_summary` object (JSON Lines; see
+[json-schema.md](json-schema.md#watch-json-lines)).
+
+`--no-stop` (Linux) takes the snapshots while the process runs, so it is
+never paused. The walk races with the program, so a round can miss objects
+or count some twice, and a growth in every round can be noise: no holder is
+then called a likely leak (the best is `keep watching`), the summary says
+so, and every JSON object has `"approximate": true`.
+
+### Live counters (`--counters`)
+
+```sh
+sudo heapspy watch --pid 1234 --counters                 # a line a second
+sudo heapspy watch --pid 1234 --counters --every 250ms
+sudo heapspy watch --pid 1234 --counters --json | your-grapher
+```
+
+No snapshot is taken. Each round reads counters that CPython and glibc keep
+about their own memory, while the process runs: about a millisecond for a
+heap of tens of MiB, ~30 ms per GiB of pymalloc arenas (`took_ms` in the
+JSON):
+
+```
+time            RSS      Δ RSS     python   pymalloc     malloc  gc
+0.0s       12.4 MiB   baseline    3.6 MiB    4.0 MiB  896.0 KiB  gen0 121/700
+0.5s       14.2 MiB   +1.7 MiB    4.9 MiB    6.0 MiB    1.0 MiB  gen0 126/700
+1.0s       15.9 MiB   +1.8 MiB    6.3 MiB    7.0 MiB    1.0 MiB  gen0 131/700 · 1 collection
+```
+
+| Column | What it is |
+|---|---|
+| RSS | resident memory, from the OS (Windows: the working set) |
+| python | bytes of the blocks pymalloc has handed out: Python objects of 512 bytes or less (most of them), and small buffers. Larger objects come from malloc |
+| pymalloc | pymalloc's arenas (1 MiB each): what it holds from the OS. The difference from `python` is free space inside them |
+| malloc | glibc malloc's heaps (the brk heap and thread arenas), by their headers. Allocations of 128 KiB and more get their own mapping and are not in it (Linux only) |
+| gc | generation 0's count and threshold: tracked objects allocated minus freed since the last collection; a collection runs when the count passes the threshold. Then the collections since the last line |
+
+Nothing here follows a pointer from one object to another, which is what
+makes a snapshot of a running process approximate: each counter is a word
+read on its own, and a value that changes during the read is dropped.
+Counters are still read a few microseconds apart, so samples say
+`"approximate": true`. They say how memory moves, not who holds it: there
+are no holders and no verdicts. On Ctrl-C (or after `--rounds`) the summary
+gives each series' value now, change, change per minute, low and high, and
+the GC's collections and freed objects over the run.
+
+`--json` prints one `sample` object per round, flushed as it is taken, and
+a `watch_counters_summary` at the end (see
+[json-schema.md](json-schema.md#watch-json-lines)). When the reader goes
+away (`| head`), `watch` stops quietly. `--every` defaults to `1s` here;
+`--dir`, `--max-pause`, `--top` and `--no-stop` do not apply.
+
+| Option | Default | |
+|---|---|---|
+| `--every DURATION` | `30s`, or `1s` with `--counters` | time between rounds |
+| `--rounds N` | until Ctrl-C | stop after N rounds |
+| `--counters` | off | sample counters instead of taking snapshots |
+| `--no-stop` | off | take snapshots without stopping the process (Linux) |
+| `--max-pause DURATION` | none | double the interval when a snapshot pauses the process longer |
+| `--dir DIR` | `watch-PID` | where the first and the latest snapshot are kept |
+| `--top N` | `10` | rows in the summary |
+| `--json` | off | JSON Lines instead of text |
 
 ## analyze
 
@@ -224,6 +297,9 @@ The report has these sections (see [Reading the reports](#reading-the-reports)):
 
 `--json` prints the same as a stable document (see
 [json-schema.md](json-schema.md)); `--top N` sets the length of the lists.
+`--no-stop` (with `--pid`, Linux) takes the snapshot without stopping the
+process: the report is approximate, and its header says `not stopped,
+approximate`.
 
 ## dump
 

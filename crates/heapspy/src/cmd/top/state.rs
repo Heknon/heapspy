@@ -11,6 +11,7 @@ use heapspy_analyzer::root_path_string;
 
 use super::workers::Snap;
 use crate::live::{ProcMemory, PyThread};
+use crate::sample::Sample;
 
 /// How far back growth rates and sparklines look.
 pub const WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -18,6 +19,13 @@ pub const WINDOW: Duration = Duration::from_secs(10 * 60);
 const MAX_SNAPS: usize = 120;
 /// Most per-second samples kept (30 minutes).
 const MAX_SECONDS: usize = 1800;
+/// Windows the Graphs tab cycles through (`s`).
+pub const GRAPH_WINDOWS: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(30 * 60),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -26,15 +34,17 @@ pub enum Tab {
     Native,
     Threads,
     Allocated,
+    Graphs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Objects,
         Tab::Holders,
         Tab::Native,
         Tab::Threads,
         Tab::Allocated,
+        Tab::Graphs,
     ];
     pub fn index(self) -> usize {
         Tab::ALL.iter().position(|&t| t == self).unwrap_or(0)
@@ -46,6 +56,7 @@ impl Tab {
             Tab::Native => "Native",
             Tab::Threads => "Threads",
             Tab::Allocated => "Allocated",
+            Tab::Graphs => "Graphs",
         }
     }
 }
@@ -118,8 +129,8 @@ pub struct App {
     pub no_stop: bool,
     pub started: Instant,
     pub tab: Tab,
-    pub selected: [usize; 5],
-    pub sort: [Sort; 5],
+    pub selected: [usize; 6],
+    pub sort: [Sort; 6],
     pub paused: bool,
     /// Show interpreter internals type by type instead of as one row.
     pub show_internals: bool,
@@ -133,6 +144,13 @@ pub struct App {
     pub rss: VecDeque<(Instant, u64)>,
     pub threads: Vec<PyThread>,
     samples: VecDeque<StackSample>,
+    /// Counter samples, one per second ([`crate::sample`]), for the Graphs
+    /// tab.
+    pub live: VecDeque<(Instant, Sample)>,
+    /// Why there are no Python counters, when there are none.
+    pub live_note: Option<String>,
+    /// How far back the Graphs tab looks.
+    pub graph_window: Duration,
 
     pub latest: Option<Snap>,
     pub history: VecDeque<SnapPoint>,
@@ -154,8 +172,8 @@ impl App {
             no_stop,
             started: Instant::now(),
             tab: Tab::Objects,
-            selected: [0; 5],
-            sort: [Sort::Size; 5],
+            selected: [0; 6],
+            sort: [Sort::Size; 6],
             paused: false,
             show_internals: false,
             show_help: false,
@@ -166,6 +184,9 @@ impl App {
             rss: VecDeque::new(),
             threads: Vec::new(),
             samples: VecDeque::new(),
+            live: VecDeque::new(),
+            live_note: None,
+            graph_window: GRAPH_WINDOWS[1],
             latest: None,
             history: VecDeque::new(),
             snapshot_running: false,
@@ -181,7 +202,19 @@ impl App {
         self.status = Some((Instant::now(), s.into()));
     }
 
-    pub fn on_vitals(&mut self, at: Instant, mem: Option<ProcMemory>, threads: Vec<PyThread>) {
+    pub fn on_vitals(
+        &mut self,
+        at: Instant,
+        mem: Option<ProcMemory>,
+        threads: Vec<PyThread>,
+        sample: Option<Sample>,
+    ) {
+        if let Some(s) = sample {
+            self.live.push_back((at, s));
+            while self.live.len() > MAX_SECONDS {
+                self.live.pop_front();
+            }
+        }
         if let Some(m) = mem {
             self.rss.push_back((at, m.rss));
             while self.rss.len() > MAX_SECONDS {
@@ -330,6 +363,46 @@ impl App {
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(n);
         (v, pool.len() as u32)
+    }
+
+    /// The next Graphs window after the current one.
+    pub fn next_graph_window(&mut self) {
+        let i = GRAPH_WINDOWS
+            .iter()
+            .position(|&w| w == self.graph_window)
+            .map_or(0, |i| (i + 1) % GRAPH_WINDOWS.len());
+        self.graph_window = GRAPH_WINDOWS[i];
+    }
+
+    /// A counter series over the Graphs window, as (seconds before the
+    /// latest sample, as a negative number; value) points.
+    pub fn live_series(&self, value: impl Fn(&Sample) -> Option<u64>) -> Vec<(f64, f64)> {
+        let Some(&(t1, _)) = self.live.back() else {
+            return Vec::new();
+        };
+        self.live
+            .iter()
+            .filter(|(t, _)| t1.duration_since(*t) <= self.graph_window)
+            .filter_map(|(t, s)| Some((-t1.duration_since(*t).as_secs_f64(), value(s)? as f64)))
+            .collect()
+    }
+
+    /// Change per minute of a counter series over the Graphs window.
+    pub fn live_rate(&self, value: impl Fn(&Sample) -> Option<u64>) -> Option<f64> {
+        let v = self.live_series(value);
+        let (&(t0, v0), &(t1, v1)) = (v.first()?, v.last()?);
+        let minutes = (t1 - t0) / 60.0;
+        (minutes >= 10.0 / 60.0).then(|| (v1 - v0) / minutes)
+    }
+
+    /// The first and the latest sample in the Graphs window.
+    pub fn live_ends(&self) -> Option<(&Sample, &Sample)> {
+        let &(t1, ref last) = self.live.back()?;
+        let first = self
+            .live
+            .iter()
+            .find(|(t, _)| t1.duration_since(*t) <= self.graph_window)?;
+        Some((&first.1, last))
     }
 
     pub fn last_snapshot_age(&self) -> Option<Duration> {

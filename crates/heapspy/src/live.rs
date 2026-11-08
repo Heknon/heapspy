@@ -208,9 +208,16 @@ pub fn proc_memory(pid: u32) -> Option<ProcMemory> {
     })
 }
 
+/// The working set and private commit on Windows; no file/anon split.
 #[cfg(not(target_os = "linux"))]
-pub fn proc_memory(_pid: u32) -> Option<ProcMemory> {
-    None
+pub fn proc_memory(pid: u32) -> Option<ProcMemory> {
+    let (ws, private) = heapspy_record::live::windows_memory(pid)?;
+    Some(ProcMemory {
+        rss: ws,
+        anon: private,
+        file: 0,
+        threads: 0,
+    })
 }
 
 /// The process's command line, for headers. Linux only.

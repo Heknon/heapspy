@@ -91,11 +91,12 @@ pub enum Command {
             The main view is what is in memory: one row per kind of object (Python types, and \
             native malloc blocks in use and leaked) with count, size, growth per minute and the \
             holder that keeps most of them alive. Other tabs list the holders, native memory, \
-            threads and allocation stacks. Where the memory sits (Python, native, leaked, \
+            threads, allocation stacks and live graphs. Where the memory sits (Python, native, leaked, \
             code/files) is one bar at the top.\n\n\
             How it reads the process:\n  \
-            - Every second: memory totals from the OS and each thread's Python stack. These \
-            reads do not stop the process.\n  \
+            - Every second: memory totals from the OS, each thread's Python stack, and \
+            CPython's and malloc's own counters (the Graphs tab: RSS, pymalloc's arenas and \
+            blocks, glibc's heaps, the GC). These reads do not stop the process.\n  \
             - Every --every seconds: a full snapshot (the same walk as `heapspy dump`). By \
             default the process is stopped for the walk, as `dump` does, and the pause is \
             shown in the header. With --no-stop it keeps running and the numbers are \
@@ -103,9 +104,9 @@ pub enum Command {
             - With --alloc: allocation sampling (`heapspy record`) for a bounded window, so the \
             Allocated tab can say which code allocated what is still alive.",
         after_long_help = "\x1b[1;4mKeys\x1b[0m\n  \
-            1-5 / Tab   switch tab: Objects, Holders, Native, Threads, Allocated\n  \
+            1-6 / Tab   switch tab: Objects, Holders, Native, Threads, Allocated, Graphs\n  \
             ↑ ↓ / j k   move the selection        Enter   details of the selected row\n  \
-            s           change the sort column    Esc     close details\n  \
+            s           change the sort column (Graphs: the time window)   Esc   close details\n  \
             d           take a snapshot now       w       save the latest snapshot to a file\n  \
             a           start/stop allocation sampling (needs eBPF on Linux)\n  \
             i           list interpreter internals (code, classes, descriptors) by type\n  \
@@ -118,9 +119,10 @@ pub enum Command {
             sudo heapspy top --pid 1234 --alloc --alloc-for 2m"
     )]
     Top(TopArgs),
-    /// Snapshot a process every N seconds and print what grew.
+    /// Snapshot a process every N seconds and print what grew, or sample its counters live.
     #[command(
-        long_about = "Snapshot a process every N seconds and print what grew.\n\n\
+        long_about = "Snapshot a process every N seconds and print what grew, or sample its \
+            counters live.\n\n\
             One line per snapshot: RSS, the Python graph, native memory, how long the process \
             was stopped, and the holder that grew most since the last round. Plain lines, so \
             it works over SSH, in a log file or in CI. Stop it with Ctrl-C (or --rounds): it \
@@ -128,11 +130,22 @@ pub enum Command {
             grows every round  → likely a leak\n  \
             grows in steps     → keep watching (a cache filling, batches)\n  \
             flat or shrinking  → fine\n\n\
-            The first and the latest snapshot are kept in --dir, ready for `heapspy diff`.",
+            The first and the latest snapshot are kept in --dir, ready for `heapspy diff`. \
+            With --no-stop the process is never paused; the snapshots are then approximate, \
+            and a holder that grew every round is reported as `keep watching`, not as a leak.\n\n\
+            With --counters no snapshot is taken. Each line is instead a sample of counters \
+            read while the process runs, in about a millisecond: RSS, the bytes of Python \
+            objects in pymalloc's blocks and the arenas holding them, glibc malloc's heaps, \
+            and the GC's counts and collections. Fast enough for --every 100ms; with --json \
+            it is a stream for live graphs (one `sample` object per line). It says how memory \
+            moves, not who holds it.",
         after_long_help = "\x1b[1;4mExamples\x1b[0m\n  \
             sudo heapspy watch --pid 1234\n  \
             sudo heapspy watch --pid 1234 --every 5m --rounds 12 > growth.log\n  \
             sudo heapspy watch --pid 1234 --max-pause 300ms   # back off when pauses get long\n  \
+            sudo heapspy watch --pid 1234 --no-stop           # never pause the process\n  \
+            sudo heapspy watch --pid 1234 --counters --every 250ms\n  \
+            sudo heapspy watch --pid 1234 --counters --json | jq -c '.python.allocator.block_bytes'\n  \
             heapspy diff watch-1234/first.hpy watch-1234/last.hpy"
     )]
     Watch(WatchArgs),
@@ -285,6 +298,10 @@ pub struct AnalyzeArgs {
     /// stopped while the snapshot is taken, as with `heapspy dump`.
     #[arg(long, value_name = "PID")]
     pub pid: Option<u32>,
+    /// With --pid: do not stop the process (Linux). The report is then
+    /// approximate: objects can be missed and the walk can fail.
+    #[arg(long, conflicts_with = "snapshot")]
+    pub no_stop: bool,
     /// With --pid: keep the snapshot at this path (otherwise it is deleted).
     #[arg(long, value_name = "OUT", conflicts_with = "snapshot")]
     pub keep: Option<PathBuf>,
@@ -350,12 +367,21 @@ pub struct WatchArgs {
     /// Process to watch.
     #[arg(long, value_name = "PID")]
     pub pid: u32,
-    /// Time between snapshots: 30s, 5m, 1h, ...
-    #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = parse_duration)]
-    pub every: Duration,
-    /// Stop after this many snapshots (default: until Ctrl-C).
+    /// Time between rounds: 30s, 5m, 1h, 250ms, ... [default: 30s, or 1s
+    /// with --counters]
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub every: Option<Duration>,
+    /// Stop after this many rounds (default: until Ctrl-C).
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(2..))]
     pub rounds: Option<u32>,
+    /// Sample counters instead of taking snapshots: never stops the
+    /// process, a millisecond or so per round. See the description above.
+    #[arg(long, conflicts_with_all = ["no_stop", "max_pause", "dir", "top"])]
+    pub counters: bool,
+    /// Do not stop the process for snapshots (Linux). They are then
+    /// approximate: objects can be missed and a walk can fail.
+    #[arg(long)]
+    pub no_stop: bool,
     /// When a snapshot stops the process for longer than this, double the
     /// time between snapshots (printed when it happens).
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -365,12 +391,27 @@ pub struct WatchArgs {
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// Rows in the summary printed at the end.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    pub top: usize,
+    #[arg(long, value_name = "N")]
+    pub top: Option<usize>,
     /// Print one JSON document per round (JSON Lines) instead of text, and a
     /// final summary document.
     #[arg(long)]
     pub json: bool,
+}
+
+impl WatchArgs {
+    /// Time between rounds, with the default of the mode.
+    pub fn interval(&self) -> Duration {
+        self.every.unwrap_or(if self.counters {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(30)
+        })
+    }
+    /// Rows in the summary.
+    pub fn top_rows(&self) -> usize {
+        self.top.unwrap_or(10)
+    }
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -594,7 +635,40 @@ mod tests {
         else {
             panic!("not watch");
         };
-        assert_eq!(w.every, Duration::from_secs(300));
+        assert_eq!(w.interval(), Duration::from_secs(300));
+        assert!(!w.counters && !w.no_stop);
+        let Command::Watch(w) =
+            Cli::try_parse_from(["heapspy", "watch", "--pid", "7", "--counters"])
+                .unwrap()
+                .command
+        else {
+            panic!("not watch");
+        };
+        assert_eq!(w.interval(), Duration::from_secs(1));
+        let Command::Watch(w) = Cli::try_parse_from(["heapspy", "watch", "--pid", "7"])
+            .unwrap()
+            .command
+        else {
+            panic!("not watch");
+        };
+        assert_eq!(w.interval(), Duration::from_secs(30));
+        assert_eq!(w.top_rows(), 10);
+        // Counters take no snapshots, so the snapshot options do not apply.
+        for extra in [
+            ["--no-stop", ""],
+            ["--dir", "d"],
+            ["--max-pause", "1s"],
+            ["--top", "3"],
+        ] {
+            let mut a = vec!["heapspy", "watch", "--pid", "7", "--counters", extra[0]];
+            if !extra[1].is_empty() {
+                a.push(extra[1]);
+            }
+            assert!(Cli::try_parse_from(a).is_err(), "{extra:?}");
+        }
+        assert!(Cli::try_parse_from(["heapspy", "watch", "--pid", "7", "--no-stop"]).is_ok());
+        assert!(Cli::try_parse_from(["heapspy", "analyze", "--pid", "7", "--no-stop"]).is_ok());
+        assert!(Cli::try_parse_from(["heapspy", "analyze", "a.hpy", "--no-stop"]).is_err());
         assert!(Cli::try_parse_from(["heapspy", "watch", "--pid", "7", "--every", "0s"]).is_err());
         assert!(Cli::try_parse_from(["heapspy", "watch", "--pid", "7", "--rounds", "1"]).is_err());
         assert!(Cli::try_parse_from(["heapspy", "--color", "never", "top", "--pid", "1"]).is_ok());

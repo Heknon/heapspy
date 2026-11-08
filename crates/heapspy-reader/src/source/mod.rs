@@ -217,6 +217,19 @@ pub trait MemorySource: Send + Sync {
     /// the image. A zero-length read succeeds.
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()>;
 
+    /// Read many ranges of the same length `len`, starting at each of
+    /// `addrs`, into `out` (`addrs.len() * len` bytes, in order). Returns
+    /// which reads succeeded; a failed one leaves its part of `out` as it
+    /// was. The default reads them one by one; a live source batches them
+    /// into a few system calls.
+    fn read_many(&self, addrs: &[u64], len: usize, out: &mut [u8]) -> Vec<bool> {
+        addrs
+            .iter()
+            .zip(out.chunks_exact_mut(len.max(1)))
+            .map(|(&a, buf)| self.read(a, buf).is_ok())
+            .collect()
+    }
+
     /// Bytes of memory that the image's own headers say it contains but that
     /// are missing from it, for example the tail of a core file that was cut
     /// short. Reads of those bytes fail like reads of unmapped memory, so the

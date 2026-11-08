@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::source::{MemorySource, MemorySourceExt, Module};
 use crate::symbols;
 
+pub mod counters;
 pub mod frames;
 pub mod offsets;
 mod pagecache;

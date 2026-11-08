@@ -57,3 +57,19 @@ pub fn open(pid: u32) -> Result<Box<dyn MemorySource>> {
         )))
     }
 }
+
+/// The OS's memory numbers for `pid` on Windows: the working set and the
+/// private commit (`PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`), in bytes.
+/// Cheap: no reads of the target's memory. `None` on other systems, or
+/// when the process cannot be opened.
+pub fn windows_memory(pid: u32) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        crate::windows::live::process_memory(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}

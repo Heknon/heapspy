@@ -103,6 +103,78 @@ Static objects (static types, small ints, `None`) are not on any list and are
 only recorded when something references them; static type objects are never
 recorded (they belong to the interpreter image, not the heap).
 
+## Counters
+
+`watch --counters` and `top`'s Graphs tab read these from a running
+process without stopping it (`heapspy_reader::cpython::counters`). Measured
+with `offsetof` against the internal headers of 3.12.3, 3.13.18 and 3.14.6
+(x86_64 Linux, default build).
+
+The GC state, after the list heads above:
+
+```c
+struct gc_generation_stats { Py_ssize_t collections, collected, uncollectable; };  /* 24 bytes */
+struct gc_generation_stats generation_stats[3];
+int collecting;
+PyObject *garbage, *callbacks;
+/* 3.14: Py_ssize_t heap_size; Py_ssize_t dummy1; int dummy2, dummy3; */
+Py_ssize_t long_lived_total, long_lived_pending;
+```
+
+| field of `struct _gc_runtime_state` | 3.12 | 3.13 | 3.14 |
+|---|---:|---:|---:|
+| `enabled` | 12 | 12 | 12 |
+| `generations[i].threshold`, `.count` | 24i + 40, 24i + 44 | same | same |
+| `generation_stats[0]` | 128 | 128 | 120 |
+| `collecting` | 200 | 200 | 192 |
+| `long_lived_total`, `long_lived_pending` | 224, 232 | 224, 232 | 240, 248 |
+
+pymalloc's state (`struct _obmalloc_state`) is per interpreter:
+
+| | 3.12 | 3.13 | 3.14 |
+|---|---:|---:|---:|
+| `PyInterpreterState.obmalloc` | 3960, the struct itself | 10800, a pointer | 10904, a pointer |
+| the same, from `PyInterpreterState.gc` | +3848 | +3400 | +3496 |
+
+The reader takes it relative to `gc`, which `_Py_DebugOffsets` gives on
+3.13+. The main interpreter's pointer leads to `obmalloc_state_main` in
+libpython; subinterpreters that share it are counted once.
+
+```c
+struct _obmalloc_state { struct _obmalloc_pools pools; /* 512 bytes */ struct _obmalloc_mgmt mgmt; ... };
+struct _obmalloc_mgmt {
+    struct arena_object *arenas;           /* +0 */
+    uint maxarenas;                        /* +8 */
+    ...                                    /* unused_arena_objects, usable_arenas, nfp2lasta[65] */
+    size_t narenas_currently_allocated;    /* +552 */
+    size_t ntimes_arena_allocated;         /* +560 */
+    size_t narenas_highwater;              /* +568 */
+};
+struct arena_object {                      /* 48 bytes */
+    uintptr_t address; block *pool_address; uint nfreepools; uint ntotalpools;
+    struct pool_header *freepools; struct arena_object *nextarena, *prevarena;
+};
+struct pool_header {                       /* 48 bytes, at the start of each 16 KiB pool */
+    union { block *_padding; uint count; } ref;   /* blocks in use */
+    block *freeblock; struct pool_header *nextpool, *prevpool;
+    uint arenaindex;                       /* +32 */
+    uint szidx;                            /* +36: blocks are (szidx + 1) * 16 bytes */
+    uint nextoffset, maxnextoffset;
+};
+```
+
+These are the same on 3.12, 3.13 and 3.14 (`ARENA_SIZE` 1 MiB and
+`POOL_SIZE` 16 KiB on 64-bit with the radix tree). An arena's pools are
+carved in order from its first 16 KiB boundary up to `pool_address`, so the
+reader reads the arena array in one piece and then each carved pool's
+header (on Linux, 1024 headers per `process_vm_readv`: about 30 ms per GiB
+of arenas). A header counts only when its `arenaindex` is its arena's slot,
+`szidx` is under 32 and `count` fits the pool; one that changed during the
+read fails these and is counted in `skipped_pools`. The sum of `count` over
+pools is what `sys.getallocatedblocks()` reports (less raw allocations); the
+live test `crates/heapspy-reader/tests/counters_live.rs` checks it within 1%,
+and the GC numbers against `gc.get_threshold()` and `gc.get_stats()`.
+
 ## Object header and types
 
 `PyObject`: `ob_refcnt` at 0, `ob_type` at 8; `PyVarObject.ob_size` at 16.

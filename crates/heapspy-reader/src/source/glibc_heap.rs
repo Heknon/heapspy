@@ -652,6 +652,71 @@ pub fn walk_heap<S: MemorySource + ?Sized>(
     Ok(Some((out, stats)))
 }
 
+/// What glibc malloc holds from the OS, from headers alone: no chunk is
+/// walked, so this costs one read per 64 MiB of anonymous memory and suits
+/// a sampler that runs every second against a process that keeps running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapTotals {
+    /// Size of the main arena's brk heap (`[heap]`).
+    pub brk_bytes: u64,
+    /// Thread arenas, by their `malloc_state` address.
+    pub thread_arenas: u32,
+    /// Heaps of those arenas (`heap_info`), and the bytes they have in use
+    /// (`heap_info.size`: grown to, not reserved).
+    pub thread_heaps: u32,
+    pub thread_heap_bytes: u64,
+}
+
+impl HeapTotals {
+    /// The malloc heaps' total: brk plus thread heaps. mmapped chunks
+    /// (allocations of 128 KiB and more, by default) are not in it.
+    pub fn heap_bytes(&self) -> u64 {
+        self.brk_bytes + self.thread_heap_bytes
+    }
+}
+
+/// [`HeapTotals`] for an image whose current mappings are `ranges`, with
+/// the brk heap at `brk`. `None` when the target does not use glibc malloc
+/// (another allocator is loaded, or it is not a 64-bit little-endian Linux
+/// target).
+pub fn heap_totals<S: MemorySource + ?Sized>(
+    src: &S,
+    ranges: &[super::MappedRange],
+    brk: Option<(u64, u64)>,
+) -> Option<HeapTotals> {
+    let t = src.target();
+    if t.os != Os::Linux
+        || t.pointer_size != 8
+        || !t.little_endian
+        || !matches!(t.arch, Arch::X86_64 | Arch::Aarch64)
+    {
+        return None;
+    }
+    let modules = src.modules().ok()?;
+    if modules.iter().any(|m| other_allocator(&m.name))
+        || !modules.iter().any(|m| is_glibc(&m.name))
+    {
+        return None;
+    }
+    let anon: Vec<Span> = ranges
+        .iter()
+        .filter(|r| r.file.is_none() && r.perms.read && r.perms.write && r.size > 0)
+        .filter(|r| brk.is_none_or(|(s, e)| r.start + r.size <= s || r.start >= e))
+        .filter_map(|r| Span::new(r.start, r.start.checked_add(r.size)?))
+        .collect();
+    let w = Walker { src, budget: 0 };
+    let infos = w.find_thread_heaps(&coalesce(&anon));
+    let mut arenas: Vec<u64> = infos.iter().map(|h| h.ar_ptr).collect();
+    arenas.sort_unstable();
+    arenas.dedup();
+    Some(HeapTotals {
+        brk_bytes: brk.map_or(0, |(s, e)| e.saturating_sub(s)),
+        thread_arenas: arenas.len() as u32,
+        thread_heaps: infos.len() as u32,
+        thread_heap_bytes: infos.iter().map(|h| h.size).sum(),
+    })
+}
+
 /// The file name of a path.
 fn module_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -1863,6 +1928,26 @@ mod tests {
             let (w, want) = thread_world(g);
             assert_eq!(blocks(&w.img(), &HeapHints::default()), Some(want), "{g:?}");
         }
+    }
+
+    #[test]
+    fn heap_totals_count_brk_and_thread_heaps_from_headers() {
+        for g in ALL {
+            let (w, _) = thread_world(g);
+            let img = w.img();
+            let ranges = img.mapped_ranges().unwrap();
+            let t = heap_totals(&img, &ranges, Some((BRK, BRK + 0x4000))).unwrap();
+            assert_eq!(t.brk_bytes, 0x4000, "{g:?}");
+            assert_eq!(t.thread_arenas, 2, "{g:?}");
+            assert_eq!(t.thread_heaps, 3, "{g:?}");
+            assert_eq!(t.thread_heap_bytes, 0x8000 + 0x4000 + 0x4000, "{g:?}");
+            assert_eq!(t.heap_bytes(), 0x4000 + 0x10000);
+        }
+        let (mut w, _) = thread_world(V2_35);
+        w.modules.push("libjemalloc.so.2");
+        let img = w.img();
+        let ranges = img.mapped_ranges().unwrap();
+        assert_eq!(heap_totals(&img, &ranges, None), None);
     }
 
     #[test]

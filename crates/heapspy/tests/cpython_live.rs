@@ -477,6 +477,86 @@ fn run_live_commands(minor: u8) {
         String::from_utf8_lossy(&out.stderr)
     );
     check_analyze(&approx);
+
+    // Counters, without snapshots: one `sample` per line, then a summary.
+    let out = heapspy(&[
+        "watch",
+        "--pid",
+        &pid,
+        "--counters",
+        "--every",
+        "100ms",
+        "--rounds",
+        "4",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    for (i, l) in lines[..4].iter().enumerate() {
+        assert_eq!(l["kind"], "sample");
+        assert_eq!(l["seq"], i as u64 + 1);
+        assert_eq!(l["approximate"], true);
+        assert!(l["os"]["rss_bytes"].as_u64().unwrap() > 0, "{l}");
+        let a = &l["python"]["allocator"];
+        // 1000 sessions of 1 KiB payloads are in bytes objects above
+        // pymalloc's 512-byte limit, but each Session and its dict is small.
+        assert!(a["blocks"].as_u64().unwrap() > 5000, "{l}");
+        assert!(a["arena_bytes"].as_u64().unwrap() >= a["block_bytes"].as_u64().unwrap());
+        let g = &l["python"]["gc"]["generations"];
+        assert_eq!(g.as_array().unwrap().len(), 3, "{l}");
+        assert!(g[0]["threshold"].as_i64().unwrap() > 0, "{l}");
+        assert!(l["native"]["heap_bytes"].as_u64().unwrap() > 0, "{l}");
+    }
+    assert_eq!(lines[4]["kind"], "watch_counters_summary");
+    assert_eq!(lines[4]["samples"], 4);
+    assert!(lines[4]["python_bytes"]["last"].as_u64().unwrap() > 0);
+
+    // Snapshots without stopping: rounds and summary say so.
+    let wdir = dir.path().join("w2");
+    let out = heapspy(&[
+        "watch",
+        "--pid",
+        &pid,
+        "--no-stop",
+        "--every",
+        "500ms",
+        "--rounds",
+        "2",
+        "--dir",
+        wdir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["kind"], "watch_round");
+    assert_eq!(lines[0]["approximate"], true);
+    assert!(lines[0]["pause_ms"].is_null());
+    assert_eq!(lines[2]["kind"], "watch_summary");
+    assert_eq!(lines[2]["approximate"], true);
+
+    let r: AnalyzeReport = json_of(&["analyze", "--pid", &pid, "--no-stop", "--json"]);
+    assert!(
+        r.snapshot.path.contains("not stopped"),
+        "{}",
+        r.snapshot.path
+    );
+    assert!(crate_path(&r.top_retainers[0]).ends_with("['CACHE']"));
 }
 
 fn crate_path(r: &heapspy_analyzer::report::Retainer) -> String {

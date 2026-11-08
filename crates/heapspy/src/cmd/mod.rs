@@ -11,6 +11,7 @@ use crate::cli::Command;
 
 mod allocations;
 mod analyze;
+mod counters;
 mod diff;
 mod dump;
 mod flamegraph;
