@@ -5,11 +5,18 @@
 //! asked for; all of them hand their profiles to one sender thread
 //! ([`push::sender`]), so a slow server never delays a reading.
 //!
-//! | profile | flag | `__name__` / sample type | stops the process |
-//! |---|---|---|---|
-//! | where the memory is | `--memory` (the default) | `heapspy_memory` / `inuse_space:bytes` | never |
-//! | who holds it | `--retained` | `memory` / `inuse_space:bytes` | only with `--stop` |
-//! | what allocated it | `--alloc` | `memory` / `alloc_space:bytes` | never (eBPF / ETW) |
+//! | profile | flag | sample type | `heapspy_profile` | stops the process |
+//! |---|---|---|---|---|
+//! | where the memory is | `--memory` (the default) | `inuse_space:bytes` | `memory` | never |
+//! | who holds it | `--retained` | `inuse_space:bytes` | `retained` | only with `--stop` |
+//! | what allocated it | `--alloc` | `alloc_space:bytes` | `allocations` | never (eBPF / ETW) |
+//!
+//! All are named `memory` (`__name__`). Grafana graphs a profile as a gauge
+//! in bytes only when its whole type is one it knows,
+//! `memory:inuse_space:bytes:space:bytes`; any other name, sample type or
+//! period type is graphed as bytes per second. So the RSS breakdown and the
+//! retained snapshot share that type and the `heapspy_profile` label tells
+//! them apart.
 //!
 //! Processes are given with `--pid`, or found with `--discover`: every
 //! few seconds the process list is read and each new CPython process whose
@@ -288,11 +295,15 @@ impl Target {
         live::process_alive(self.pid)
     }
 
-    fn send(&self, what: &'static str, name: &str, extra: &[(&str, &str)], p: &Builder) {
+    /// Queue a profile, named `memory` and labelled `heapspy_profile=what`.
+    fn send(&self, what: &'static str, extra: &[(&str, &str)], p: &Builder) {
         if p.is_empty() {
             return;
         }
-        let mut labels = vec![("__name__".to_string(), name.to_string())];
+        let mut labels = vec![
+            ("__name__".to_string(), "memory".to_string()),
+            ("heapspy_profile".to_string(), what.to_string()),
+        ];
         labels.extend(self.labels.iter().cloned());
         labels.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let _ = self.tx.send(Push {
@@ -326,7 +337,7 @@ fn memory_loop(t: &Target, mut sampler: Sampler, every: Duration) {
             return;
         };
         let p = memory_profile(&s, now_nanos(), every);
-        t.send("memory", "heapspy_memory", &[], &p);
+        t.send("memory", &[], &p);
         if t.once {
             return;
         }
@@ -339,10 +350,9 @@ fn memory_loop(t: &Target, mut sampler: Sampler, every: Duration) {
 
 /// The memory of one sample as stacks: where each byte of RSS is.
 ///
-/// The sample type is `inuse_space`, which Pyroscope and Grafana treat as
-/// a gauge (bytes at one moment), as they do Go's heap profiles. A custom
-/// name would be read as a cumulative counter and graphed as bytes per
-/// second.
+/// The type is `memory:inuse_space:bytes:space:bytes`, Go's heap profile,
+/// the one Grafana graphs as a gauge (bytes at one moment); see the module
+/// documentation.
 pub fn memory_profile(s: &Sample, time_nanos: i64, every: Duration) -> Builder {
     let mut p = Builder::new(
         &[("inuse_space", "bytes")],
@@ -387,7 +397,7 @@ fn retained_loop(t: &Target, every: Duration, stop_it: bool) {
         match retained_profile(t.pid, stop_it, started, every) {
             Ok(p) => {
                 let how = if stop_it { "stopped" } else { "approximate" };
-                t.send("retained", "memory", &[("heapspy_snapshot", how)], &p);
+                t.send("retained", &[("heapspy_snapshot", how)], &p);
             }
             Err(e) if t.alive() => {
                 log(&format!("retained snapshot of pid {} failed: {e:#}", t.pid));
@@ -454,7 +464,7 @@ fn alloc_loop(t: &Target, every: Duration, window: Duration, events: heapspy_all
         }
         let started = now_nanos();
         match alloc_profile(t.pid, window, events, t.stop, started) {
-            Ok(p) => t.send("allocations", "memory", &[], &p),
+            Ok(p) => t.send("allocations", &[], &p),
             Err(e) if t.alive() && !t.stopped() => {
                 log(&format!(
                     "allocation sampling of pid {} failed: {e:#}",

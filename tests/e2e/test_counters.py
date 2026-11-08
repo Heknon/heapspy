@@ -86,7 +86,8 @@ def test_agent_writes_a_memory_profile(heapspy, start_victim, tmp_path, python) 
     assert r.returncode == 0, r.describe()
     assert "sent 1 profiles" in r.stderr, r.describe()
     labels = json.loads((out / f"000001-{victim.pid}-memory.json").read_text())
-    assert labels["__name__"] == "heapspy_memory"
+    assert labels["__name__"] == "memory"
+    assert labels["heapspy_profile"] == "memory"
     assert labels["service_name"] == "growing_list"
     assert labels["pid"] == str(victim.pid) and labels["env"] == "e2e"
     pprof = (out / f"000001-{victim.pid}-memory.pprof").read_bytes()

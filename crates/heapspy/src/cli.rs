@@ -160,12 +160,14 @@ pub enum Command {
             --memory    where the process's memory is: Python objects by pymalloc block \
             size, free space in pymalloc, malloc's heaps, the rest of RSS. Read from \
             counters, never pauses the process, every --memory-every. The default when \
-            nothing is chosen. (heapspy_memory:inuse_space:bytes)\n  \
+            nothing is chosen. (memory:inuse_space:bytes, heapspy_profile=memory)\n  \
             --retained  who holds the memory: a snapshot every --retained-every, as stacks \
             of holders weighted by retained bytes. Taken without stopping the process \
-            (approximate, Linux) unless --stop. (memory:inuse_space:bytes)\n  \
+            (approximate, Linux) unless --stop. (memory:inuse_space:bytes, \
+            heapspy_profile=retained)\n  \
             --alloc     what allocated it: allocation sampling (eBPF on Linux, ETW on \
-            Windows) for --alloc-for every --alloc-every. (memory:alloc_space:bytes)\n\n\
+            Windows) for --alloc-for every --alloc-every. (memory:alloc_space:bytes, \
+            heapspy_profile=allocations)\n\n\
             Watch processes with --pid (repeatable), or --discover TEXT to pick up every \
             CPython process whose command line contains TEXT, now and as they start. Each \
             profile is labelled service_name (--app-name, else the script or module name), \

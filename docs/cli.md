@@ -293,11 +293,11 @@ CPU profiles of the same service.
 Each kind of profile is opt-in, and none of them stops the process unless
 you ask:
 
-| Flag | Profile in Pyroscope | What it shows | Cost to the process |
+| Flag | Profile in Pyroscope (`heapspy_profile`) | What it shows | Cost to the process |
 |---|---|---|---|
-| `--memory` (the default when none is chosen) | `heapspy_memory` · `inuse_space` bytes | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
-| `--retained` | `memory` · `inuse_space` bytes | who holds the memory: the [retention flame graph](#flamegraph) of a snapshot, every `--retained-every` (5m). Labelled `heapspy_snapshot=approximate` or `stopped` | not stopped (Linux): the snapshot is approximate. `--stop` takes exact snapshots and pauses the process for each walk |
-| `--alloc` | `memory` · `alloc_space` bytes | what allocated memory: Python stacks of sampled allocations, during a window of `--alloc-for` (30s) every `--alloc-every` (5m) | never stopped: eBPF on Linux (root or `CAP_BPF` and `CAP_PERFMON`), ETW on Windows (elevated). A few percent while a window runs |
+| `--memory` (the default when none is chosen) | `memory` · `inuse_space` bytes (`memory`) | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
+| `--retained` | `memory` · `inuse_space` bytes (`retained`) | who holds the memory: the [retention flame graph](#flamegraph) of a snapshot, every `--retained-every` (5m). Labelled `heapspy_snapshot=approximate` or `stopped` | not stopped (Linux): the snapshot is approximate. `--stop` takes exact snapshots and pauses the process for each walk |
+| `--alloc` | `memory` · `alloc_space` bytes (`allocations`) | what allocated memory: Python stacks of sampled allocations, during a window of `--alloc-for` (30s) every `--alloc-every` (5m) | never stopped: eBPF on Linux (root or `CAP_BPF` and `CAP_PERFMON`), ETW on Windows (elevated). A few percent while a window runs |
 
 **Which processes.** `--pid` (repeatable) watches given processes; a pid
 that is not a CPython heapspy can read is an error. `--discover TEXT`
@@ -332,10 +332,16 @@ export HEAPSPY_PYROSCOPE_TOKEN=...
 
 `--tenant-id` sets `X-Scope-OrgID` for a multi-tenant Pyroscope.
 
+`--memory` and `--retained` share one profile type, so that Grafana
+graphs both in bytes (it graphs any type it does not know as bytes per
+second). Filter on `heapspy_profile` to see one of them: a query of
+`memory:inuse_space` with both on and no such filter adds them up.
+
 **In Grafana**, add Pyroscope as a data source and query the profile types
-above, filtered on `service_name`. All three are gauges or windows, not
-counters, and Pyroscope adds up every profile that falls in a time step or
-in a flame graph's range. So:
+above, filtered on `service_name` and `heapspy_profile`, e.g.
+`{service_name="shop", heapspy_profile="memory"}`. All three are gauges
+or windows, not counters, and Pyroscope adds up every profile that falls
+in a time step or in a flame graph's range. So:
 
 - in a time series panel, set the query's min interval to the agent's
   interval for that profile (`--memory-every`, `--retained-every`), so each
