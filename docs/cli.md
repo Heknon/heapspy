@@ -295,7 +295,7 @@ you ask:
 
 | Flag | Profile in Pyroscope | What it shows | Cost to the process |
 |---|---|---|---|
-| `--memory` (the default when none is chosen) | `heapspy_memory` · `resident` bytes | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
+| `--memory` (the default when none is chosen) | `heapspy_memory` · `inuse_space` bytes | where the memory is, as one stack per kind: Python objects by pymalloc block size, free space inside pymalloc, glibc malloc's heaps, and the rest of RSS (code, stacks, buffers of 128 KiB and more). The slices add up to RSS | never stopped: [counters](#live-counters---counters), every `--memory-every` (15s) |
 | `--retained` | `memory` · `inuse_space` bytes | who holds the memory: the [retention flame graph](#flamegraph) of a snapshot, every `--retained-every` (5m). Labelled `heapspy_snapshot=approximate` or `stopped` | not stopped (Linux): the snapshot is approximate. `--stop` takes exact snapshots and pauses the process for each walk |
 | `--alloc` | `memory` · `alloc_space` bytes | what allocated memory: Python stacks of sampled allocations, during a window of `--alloc-for` (30s) every `--alloc-every` (5m) | never stopped: eBPF on Linux (root or `CAP_BPF` and `CAP_PERFMON`), ETW on Windows (elevated). A few percent while a window runs |
 
@@ -331,6 +331,19 @@ export HEAPSPY_PYROSCOPE_TOKEN=...
 ```
 
 `--tenant-id` sets `X-Scope-OrgID` for a multi-tenant Pyroscope.
+
+**In Grafana**, add Pyroscope as a data source and query the profile types
+above, filtered on `service_name`. All three are gauges or windows, not
+counters, and Pyroscope adds up every profile that falls in a time step or
+in a flame graph's range. So:
+
+- in a time series panel, set the query's min interval to the agent's
+  interval for that profile (`--memory-every`, `--retained-every`), so each
+  point is one reading. A longer range forces wider steps, and each point
+  is then the sum of several readings;
+- a flame graph over a range is the sum of the profiles in it: read its
+  proportions, or narrow the range (a panel's relative time, e.g. the last
+  `--retained-every`) for one reading's bytes.
 
 **Before sending anything,** `--dry-run DIR` writes each profile as
 `DIR/NNNNNN-PID-KIND.pprof` with its labels in a `.json` next to it, and

@@ -611,7 +611,7 @@ fn run_agent(minor: u8) {
         let b = std::fs::read(out.join(n)).unwrap();
         b.windows(what.len()).any(|w| w == what.as_bytes())
     };
-    assert!(has(&names[1], "resident") && has(&names[1], "pymalloc free"));
+    assert!(has(&names[1], "inuse_space") && has(&names[1], "pymalloc free"));
     assert!(has(&names[3], "inuse_space") && has(&names[3], "['CACHE']"));
 
     // --discover finds it by its command line.

@@ -90,5 +90,5 @@ def test_agent_writes_a_memory_profile(heapspy, start_victim, tmp_path, python) 
     assert labels["service_name"] == "growing_list"
     assert labels["pid"] == str(victim.pid) and labels["env"] == "e2e"
     pprof = (out / f"000001-{victim.pid}-memory.pprof").read_bytes()
-    for text in (b"resident", b"python objects (pymalloc)", b"pymalloc free"):
+    for text in (b"inuse_space", b"python objects (pymalloc)", b"pymalloc free"):
         assert text in pprof, text

@@ -160,7 +160,7 @@ pub enum Command {
             --memory    where the process's memory is: Python objects by pymalloc block \
             size, free space in pymalloc, malloc's heaps, the rest of RSS. Read from \
             counters, never pauses the process, every --memory-every. The default when \
-            nothing is chosen. (heapspy_memory:resident:bytes)\n  \
+            nothing is chosen. (heapspy_memory:inuse_space:bytes)\n  \
             --retained  who holds the memory: a snapshot every --retained-every, as stacks \
             of holders weighted by retained bytes. Taken without stopping the process \
             (approximate, Linux) unless --stop. (memory:inuse_space:bytes)\n  \

@@ -7,7 +7,7 @@
 //!
 //! | profile | flag | `__name__` / sample type | stops the process |
 //! |---|---|---|---|
-//! | where the memory is | `--memory` (the default) | `heapspy_memory` / `resident:bytes` | never |
+//! | where the memory is | `--memory` (the default) | `heapspy_memory` / `inuse_space:bytes` | never |
 //! | who holds it | `--retained` | `memory` / `inuse_space:bytes` | only with `--stop` |
 //! | what allocated it | `--alloc` | `memory` / `alloc_space:bytes` | never (eBPF / ETW) |
 //!
@@ -338,9 +338,14 @@ fn memory_loop(t: &Target, mut sampler: Sampler, every: Duration) {
 }
 
 /// The memory of one sample as stacks: where each byte of RSS is.
+///
+/// The sample type is `inuse_space`, which Pyroscope and Grafana treat as
+/// a gauge (bytes at one moment), as they do Go's heap profiles. A custom
+/// name would be read as a cumulative counter and graphed as bytes per
+/// second.
 pub fn memory_profile(s: &Sample, time_nanos: i64, every: Duration) -> Builder {
     let mut p = Builder::new(
-        &[("resident", "bytes")],
+        &[("inuse_space", "bytes")],
         ("space", "bytes"),
         time_nanos,
         every.as_nanos() as i64,
@@ -710,7 +715,7 @@ mod tests {
         let s = crate::sample::fake(1, 0.0, 100 << 20, 10 << 20, 0);
         let p = memory_profile(&s, 1, Duration::from_secs(10));
         let d = pprof::decode::decode(&p.encode());
-        assert_eq!(d.sample_types, vec![("resident".into(), "bytes".into())]);
+        assert_eq!(d.sample_types, vec![("inuse_space".into(), "bytes".into())]);
         let total: i64 = d.samples.iter().map(|s| s.1[0]).sum();
         // Every slice is subtracted from RSS once: they add up to it.
         assert_eq!(total, 100 << 20, "{:?}", d.samples);
