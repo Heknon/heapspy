@@ -54,6 +54,12 @@ def test_growth_is_reported_at_the_list(heapspy, start_victim, tmp_path, python,
 
     types = {t["type"]: t for t in doc["by_type"]}
     assert types["__main__.Event"]["delta_count"] == grown["added_events"]
-    assert types["builtins.bytes"]["delta_count"] >= grown["added_events"]
+    # Every new event's detail bytes is found under the list. (The heap-wide
+    # bytes count is not exact: the interpreter can free a bytes object of
+    # its own between the two dumps.)
+    detail = sites.get(f"{EVENTS}[<index>].detail")
+    assert detail is not None, listing
+    assert detail["type"] == "builtins.bytes"
+    assert detail["delta_retained_objects"] == grown["added_events"], detail
     delta = doc["totals"]["delta_reachable_bytes"]
     assert added * RETAINED_LO <= delta <= added * RETAINED_HI * 1.05, (delta, added)
