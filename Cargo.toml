@@ -10,18 +10,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
 repository = "https://github.com/Heknon/heapspy"
 
 [workspace.dependencies]
-heapspy-snapshot = { path = "crates/heapspy-snapshot", version = "0.2.0" }
-heapspy-alloc = { path = "crates/heapspy-alloc", version = "0.2.0" }
-heapspy-reader = { path = "crates/heapspy-reader", version = "0.2.0" }
-heapspy-record = { path = "crates/heapspy-record", version = "0.2.0" }
-heapspy-analyzer = { path = "crates/heapspy-analyzer", version = "0.2.0" }
+heapspy-snapshot = { path = "crates/heapspy-snapshot", version = "0.2.1" }
+heapspy-alloc = { path = "crates/heapspy-alloc", version = "0.2.1" }
+heapspy-reader = { path = "crates/heapspy-reader", version = "0.2.1" }
+heapspy-record = { path = "crates/heapspy-record", version = "0.2.1" }
+heapspy-analyzer = { path = "crates/heapspy-analyzer", version = "0.2.1" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }

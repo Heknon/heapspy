@@ -1,6 +1,6 @@
 [project]
 name = "heapspy-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server that exposes heapspy heap snapshots and analysis to coding agents"
 readme = "README.md"
 license = "MIT"

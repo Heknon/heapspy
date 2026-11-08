@@ -66,6 +66,27 @@ HEAPSPY_PY="$(uv python find 3.13)" \
     cargo test -p heapspy-reader --test native_heap_live -- --ignored --test-threads 1
 ```
 
+The same test runs against older and other glibc releases in
+`.github/workflows/glibc.yml`: one distro image per malloc layout, from
+Ubuntu 12.04 (glibc 2.15) to Ubuntu 24.04 (2.39). CPython does not run on
+the oldest, so each image builds the C victim
+(`crates/heapspy-reader/tests/victims/glibc_heap.c`) with its own gcc and
+runs the test, built statically for musl, live and through `gcore` (live
+only on 12.04, whose gdb 7.4 writes cores without file names):
+
+| Trigger | What runs |
+|---|---|
+| PR label `ci:glibc` | every image in the matrix |
+| manual dispatch (Actions tab) | the same |
+
+Locally, the C victim stands in for CPython the same way:
+
+```sh
+gcc -O0 -o /tmp/victim crates/heapspy-reader/tests/victims/glibc_heap.c -lpthread
+HEAPSPY_VICTIM=/tmp/victim \
+    cargo test -p heapspy-reader --test native_heap_live -- --ignored --test-threads 1
+```
+
 Live `heapspy record` tests (`.github/workflows/record.yml`) record real
 CPython 3.12, 3.13 and 3.14 processes through every mechanism:
 
