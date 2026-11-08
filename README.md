@@ -1,94 +1,51 @@
 # heapspy
 
-Read the object graph of a running Python process from the outside, and find out what is keeping memory alive.
+See what is using memory in a running Python process, and what keeps it alive.
 
-py-spy reads a process's stacks without touching it. heapspy does the same for the heap: it takes a consistent memory image of a CPython process, rebuilds the object graph from it, and computes dominators and retained sizes. Nothing is injected or imported into the target.
-
-> **Status: early development.** `heapspy top`, `watch` and `analyze --pid` look at a live process ([docs/cli.md](docs/cli.md)). `heapspy dump` (`--pid`, `--core`, `--minidump`) walks CPython 3.12, 3.13 and 3.14 heaps (default GIL builds, 64-bit) into snapshots, and `analyze`, `query`, `diff` and `flamegraph` work on them. `heapspy record` samples allocation stacks on Linux. Free-threaded and debug builds are refused. The walker's per-version layouts are in [docs/cpython-internals.md](docs/cpython-internals.md). An end-to-end suite ([tests/e2e](tests/e2e/README.md)) checks on Linux that known leaks in real 3.12 to 3.14 processes are found, by `--pid` and from `gcore` cores. The MCP server is in [python/heapspy-mcp](python/heapspy-mcp/README.md). Nothing is published on PyPI yet, and the Windows code paths have only been compile-checked, not run on Windows.
-
-## What it answers, and what it doesn't
-
-heapspy answers **"what is retained, and by whom?"** For a leak, that is usually the question that matters: the reference holding the memory is the thing you delete to fix it, and that reference is sitting in the heap right now. Eclipse MAT finds JVM leaks the same way, from heap dumps with no allocation stacks.
-
-heapspy cannot answer **"where was this allocated?"** for memory that already exists. That history is only recorded if a tracer was running at allocation time. `heapspy record` (M7) samples allocations with their Python stacks from outside the process, for a bounded window, and `analyze --allocations` links them to a snapshot. It uses eBPF on Linux (ptrace for arenas as a fallback), and ETW plus a debugger on Windows, and only sees allocations made while it runs. See [docs/allocation-sampling.md](docs/allocation-sampling.md). For full allocation history from process start, use tracemalloc or memray. For CPU, use py-spy alongside heapspy.
-
-## How it works
-
-```
-target Python process        untouched, no agent
-        |
-        |  heapspy dump        privileged, read-only
-        v                      Linux: gcore / process_vm_readv
-snapshot.hpy                   Windows: full minidump / ReadProcessMemory
-        |
-        |  heapspy analyze / query / diff     unprivileged, file only
-        v
-dominator tree, retained sizes, type histogram, retaining paths, diffs
-```
-
-`dump` is the only step that touches the target and the only step that needs privileges. It locates `PyRuntime` in libpython (or `python3xx.dll`), walks the GC generation lists to find every tracked container, follows each object's references the way its `tp_traverse` would, and writes a compact binary snapshot.
-
-Everything else reads the snapshot file. You can re-analyze without re-dumping, attach a snapshot to a bug report, or diff two captures taken an hour apart.
-
-## Planned usage
-
-### Look at a running process
-
-```sh
-sudo heapspy top --pid 1234                 # live view; Enter on a row for details
-sudo heapspy analyze --pid 1234             # one readable report, right now
-sudo heapspy watch --pid 1234 --every 30s   # is it growing, and what?
-```
-
-`top` is about what is in memory: one row per kind of object (Python types,
-and native malloc blocks in use and leaked) with how many there are, how
-big they are, how fast they grow, and which holder keeps most of them
-alive. Other tabs list the holders, native memory, threads and, with `a`
-or `--alloc`, which code allocated what is still alive. Where the memory
-sits is one bar at the top. Memory totals and thread stacks refresh every
-second without stopping the process; the object tables come from a
-snapshot taken every `--every` (10 s by default), which stops the process
-briefly unless `--no-stop`.
+heapspy reads a CPython process from the outside, the way py-spy reads its
+stacks: nothing is injected or imported into the target. It rebuilds the
+object graph, walks the native (malloc) heap, and tells you which objects
+take the memory, who holds them, and what is growing.
 
 ![heapspy top on a process with a growing cache, a buffer list and a native leak](docs/images/top.png)
 
-`analyze --pid` prints the same as one report, with what each thread is
-running; `watch` prints one line per snapshot and, at the end, each holder's
-growth with a verdict (likely leak, keep watching, fine). Every command, its
-options and what it costs the process are in [docs/cli.md](docs/cli.md).
-
-<details><summary>analyze --pid and watch output</summary>
-
-![heapspy analyze --pid](docs/images/analyze-pid.png)
-
-![heapspy watch](docs/images/watch.png)
-
-</details>
-
-### Capture a snapshot
+## Install
 
 ```sh
-# Dump a live process (brief pause while the image is taken)
-heapspy dump --pid 1234 -o app.hpy
-
-# Or convert an image you already have
-heapspy dump --core core.1234 -o app.hpy      # Linux ELF core
-heapspy dump --minidump app.dmp -o app.hpy    # Windows full minidump
+pip install heapspy        # or: pipx install heapspy
 ```
 
-By default the snapshot records types, sizes, lengths, and references, but **not** string or bytes contents. Contents often hold tokens, credentials, and user data. To include them, opt in explicitly; values are size-capped and redacted:
+The wheels hold only the binary and work with any Python 3.8 or later. They
+are built for Linux x86_64 and aarch64 (glibc), Linux x86_64 (musl) and
+Windows x86_64; each [GitHub release](https://github.com/Heknon/heapspy/releases)
+also has the bare binaries. To build from source (Rust 1.85 or later):
 
 ```sh
-heapspy dump --pid 1234 --capture-contents --max-str 128 -o app.hpy
+cargo install --git https://github.com/Heknon/heapspy heapspy
 ```
 
-### Find what retains memory
+## Quick start
 
 ```sh
-heapspy analyze app.hpy
+sudo heapspy top --pid 1234                 # live view; Enter on a row for details
+sudo heapspy analyze --pid 1234             # one report, right now
+sudo heapspy watch --pid 1234 --every 30s   # what grows, and how steadily
 ```
 
-Example output (abridged; the full report also lists leaked native blocks by size and allocator free space):
+- **`top`** is a live, full-screen view. Its main table lists what the
+  memory is made of, with count, size, growth per minute and the holder
+  that keeps most of it. Other tabs list holders, native memory, threads
+  and, after you press `a`, the code that allocated what is still alive.
+- **`analyze --pid`** prints the same as one report, plus what each thread
+  was running.
+- **`watch`** takes a snapshot every interval and prints one line per round.
+  On Ctrl-C it prints each holder's growth with a verdict: likely leak, keep
+  watching, or fine.
+
+Reading another process needs ptrace rights on Linux and an elevated prompt
+on Windows; reading snapshot files needs nothing.
+
+## Reading the report
 
 ```
 Memory 65.0 MiB resident
@@ -109,247 +66,140 @@ Who holds it                                                    retained    pyth
       dict · 46534 objects · holds bytes 18.7 MiB, str 1.0 MiB, app.cache.Session 875.6 KiB
 ```
 
-### Drill into a type or object
+- **What the memory is**: one row per type, by the bytes its objects take.
+  Native malloc blocks are rows too, split into blocks something points to
+  and blocks nothing points to (leaked: their address is gone, so nothing
+  can free them). Next to each row is the holder that keeps most of it alive.
+- **Who holds it**: the objects that keep the most memory alive. Retained
+  bytes are what would be freed if the holder went away, split into Python
+  objects and native memory. Holders are named the way code names them:
+  `app.cache.CACHE`, or `libfoo.so: g_cache` for a C global.
+- **The memory bar**: where the memory sits. Python objects, native memory
+  in use, leaked native blocks, free memory malloc keeps, and code, mapped
+  files and stacks.
+
+To see why one kind of object is alive, ask about its type:
+
+```
+$ heapspy query app.hpy --type bytes
+Kept alive by
+  share  kept by            instances      bytes  sizes
+    89%  app.cache.CACHE          660    1.3 MiB  2081 B ×660
+        through [<key>] app.cache.Session → .payload
+```
+
+[docs/cli.md](docs/cli.md#reading-the-reports) explains every row and
+column, and what to do when each one is large.
+
+## Snapshots
+
+A snapshot is a file holding the object graph, the native heap blocks and
+the memory map. Every command can read one, on any machine, without
+privileges.
 
 ```sh
-# All instances of a type, with sample holders
-heapspy query app.hpy --type app.session.Session
+sudo heapspy dump --pid 1234 -o app.hpy        # a live process
+heapspy dump --core core.1234 -o app.hpy       # a Linux core
+heapspy dump --minidump app.dmp -o app.hpy     # a Windows full minidump
 
-# The labelled chain of references keeping one object alive
+heapspy analyze app.hpy                        # the report above
+heapspy query app.hpy --type Session           # what keeps one type alive
 heapspy query app.hpy --retaining-path 0x7f3a2c41b0d0
-
-# Where a type, function or module is defined, as recorded in the snapshot
-heapspy query app.hpy --locate app.session.Session
+heapspy diff before.hpy after.hpy              # what grew between two snapshots
+heapspy flamegraph app.hpy -o app.svg          # retention flame graph
 ```
 
-Reports include source locations where the snapshot has them: functions
-and code objects at `co_filename:co_firstlineno`, classes near the first
-line of their methods (`app/session.py:~14`). See
-[docs/json-schema.md](docs/json-schema.md#source-locations).
+Taking a snapshot stops the process for the walk: about 0.1 s for a small
+heap, seconds for millions of objects. The pause is printed. `--no-stop`
+walks it while it runs, for an approximate snapshot (Linux).
 
-A retaining path reads root-first, one labelled hop per line:
+Snapshots record types, sizes and references, not string or bytes contents,
+which often hold tokens and user data. `--capture-contents` records them,
+capped by `--max-str`.
 
-```
-sys.modules['app.cache']
-  .__dict__['CACHE']            builtins.dict
-  ['user:8812']                 app.session.Session
-  .payload                      builtins.bytes  (1.0 MiB)
-```
+## Where memory was allocated
 
-### Compare two captures
+A snapshot shows what is alive and who holds it, not which code allocated
+it. For that, record allocations for a while and join them with a snapshot:
 
 ```sh
-heapspy dump --pid 1234 -o before.hpy
-# ... let the process run ...
-heapspy dump --pid 1234 -o after.hpy
-
-heapspy diff before.hpy after.hpy
-```
-
-`diff` reports growth by type and by retaining site. Object addresses change between dumps, so matching individual objects across snapshots is approximate. The output says so and reports aggregates.
-
-### Investigate until it is clear
-
-```sh
-python3 scripts/investigate.py --pid 1234 --heapspy target/release/heapspy
-```
-
-`scripts/investigate.py` runs `dump`, `analyze` and `diff` in rounds. After each round it asks what is still unclear about each suspect and gets the information that answers it. Another snapshot tells growth from size and a cache warming up from a leak. A snapshot with contents captured names module files. `query --locate` finds the code. It stops when nothing more can be learned. The report gives, for each holder, a verdict, a growth rate, what the growth is made of down to the field that pins it (`[<index>] <+40>.tb_frame local 'upload'`), and where the code is. It lists what heapspy could not make clear, and how to get it.
-
-### Retention flame graph
-
-```sh
-heapspy flamegraph app.hpy -o app.svg
-```
-
-![Retention flame graph of a process with a growing session cache and a listener list](docs/images/flamegraph.png)
-
-A retention flame graph shows the dominator tree. A snapshot has no call stacks, so a frame is not a function. Each frame is one hop of a retaining path, and its width is the bytes it retains: the objects in that frame and everything only reachable through them. The bottom row holds the roots (`sys.modules['__main__']`, frame locals, thread state). Each row above it names the reference that holds the next object. To find a leak, look for the widest frame you did not expect and read down to its root. In the image above, `.cell_contents bytearray` under `BUS.listeners` holds 70% of the heap: closures registered as listeners keep their buffers alive. `['SESSIONS'] dict` holds most of the rest.
-
-A CPU flame graph is different. Its widths count samples of time, and its frames are call stacks. An allocation flame graph (memray, tracemalloc, or `heapspy flamegraph --allocations` below) counts bytes allocated by each call stack, including memory freed long ago. A retention flame graph counts only memory that is alive in the snapshot, grouped by what keeps it alive, not by where it was allocated.
-
-Frame format:
-
-| object | frame text | example |
-|---|---|---|
-| root object | its root label | `sys.modules['__main__']` |
-| other object | label of the edge into it, a space, its type (`builtins.` dropped) | `['SESSIONS'] dict`, `.listeners list`, `.__closure__[0] cell`, `.cell_contents bytearray` |
-| reached through objects its dominator owns | `...` before the edge label | `...[<index>] bytes` |
-| dominated only by the super-root, not a root itself (shared by several roots) | a top-level frame with `...` | `...['SHARED'] list` |
-| folded objects | `[other]` | |
-
-The edge is the one breadth-first search entered the object through, as for `diff` sites ([docs/json-schema.md](docs/json-schema.md)). A `;` inside a label is written as `:`.
-
-Merge rules: siblings with the same frame text become one frame. List and tuple indices are written `[<index>]`, so all items of a list merge. Without `--capture-contents`, dict keys are placeholders such as `[<str len=9>]`, so all values whose keys have the same type and length merge. Merged frames merge their children too, so a cache of 100,000 sessions is one wide `['CACHE'] dict` frame with one `[<str len=N>] Session` frame per key length above it. A frame's self bytes are the shallow sizes of the objects merged into it, and its width (self plus everything above it) equals their total retained size.
-
-Cutoffs keep the output small on large heaps. Objects more than `--max-depth` levels (default 32) below a root are counted in an `[other]` frame at that depth. A frame narrower than `--min-pct` percent of the reachable bytes (default 0.01) or `--min-bytes N` is folded, with everything above it, into an `[other]` frame beside it. Folding never changes the width of the frames that remain.
-
-```sh
-# Folded stacks (`frame;frame;frame bytes`) for other tools, on stdout
-heapspy flamegraph app.hpy --folded --min-bytes 0 > app.folded
-
-# Differential: red frames grew, blue frames shrank, width is AFTER
-heapspy flamegraph --diff before.hpy after.hpy -o diff.svg
-```
-
-![Differential retention flame graph; the listener buffers grew](docs/images/flamegraph-diff.png)
-
-The differential graph matches frames between the two dumps by frame text, not by object identity, so the matching is approximate in the same way as `diff`. For example, sessions whose keys got one character longer show up as a new frame. `--diff ... --folded` writes `stack before after` lines, the input format of inferno's and FlameGraph's differential mode. The cutoff applies to the wider of the two sides, so a frame is folded in both snapshots or in neither.
-
-### Record where memory is allocated (M7)
-
-```sh
-# Sample allocations with their Python stacks for 60 s, then take a snapshot
-heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
-
+sudo heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
 heapspy analyze app.hpy --allocations app.hpya
-heapspy query app.hpy --type Session --allocations app.hpya
 ```
 
-`record` takes `--events arena,pool,large`, `--interval BYTES` (mean bytes between large-object samples, default 512K), `--max-frames N` (default 64) and `--mechanism auto|ebpf|ptrace|etw|debugger`. The `.hpya` file format is final for version 1.
+`record` samples allocations with their Python stacks from outside the
+process: eBPF on Linux, ETW on Windows. It sees only allocations made while
+it runs. `top --alloc` does the same from the live view. The mechanisms and
+their cost are in [docs/cli.md](docs/cli.md#record). For full allocation
+history from process start, use tracemalloc or memray.
 
-How it records, without running code in the target:
-- **Linux, eBPF** (default; root or `CAP_BPF` + `CAP_PERFMON`, kernel 5.8+): arenas from `mmap` and sampled large objects from allocator uprobes, each with the Python stack read in the kernel at the event.
-- **Linux, ptrace** (fallback, or `--mechanism ptrace`): arenas only, with exact stacks, stopping at system calls.
-- **Windows** (elevated): arenas from ETW (the default), with approximate frames, without stopping the target. `--mechanism debugger` gives exact frames but stops the target's threads for most of the window. Tested on `windows-latest` with CPython 3.12 to 3.14 ([test plan and results](docs/windows-record-test-plan.md)). If heapspy is killed while recording, a guardian process restores the target and stops heapspy's ETW session (`heapspy-<pid>`). A process-tree kill (`taskkill /T`) takes the guardian down too; see [docs/windows.md](docs/windows.md#when-heapspy-is-killed).
+## How it works
 
-Pools are never recorded, because pool carving is inlined in every build checked. Large objects cost one uprobe trap per allocator call above 512 bytes (about 0.5 µs). On an extreme benchmark that slowed the target by 30-50%; arenas alone cost a few percent. Numbers are in [docs/allocation-sampling.md](docs/allocation-sampling.md#measurements). Ctrl-C ends a recording early with a valid profile flagged truncated.
+`dump` finds `_PyRuntime` in libpython, walks the garbage collector's lists
+to find every tracked container, and follows each object's references the
+way its `tp_traverse` would. It then walks glibc's malloc heap (or the
+Windows heap from a minidump) and scans native blocks, C globals and thread
+stacks for pointers, so native memory gets owners too. The analyzer builds
+the dominator tree over all of it: an object's retained size is everything
+only it keeps alive.
 
-`analyze --allocations` links snapshot objects to samples by address. Each object gets the latest sample whose range (an arena, a pool, or one large allocation) contains it. It then adds an "Allocated by" section: the stacks that allocated the most during the window, innermost frame first with `file:line`, with estimated bytes allocated and the bytes of live objects linked to each. Under each top retainer it shows the one or two stacks that allocated the memory it retains. `query --type --allocations` shows the same per instance. Read the numbers as an estimate of where growth came from:
+`top` and `watch` repeat this on a schedule. `top` also reads memory totals
+from the OS and each thread's Python stack every second, without stopping
+the process.
 
-- Only allocations made while recording are covered. Memory allocated before recording started, and blocks reused from freed memory, have no stack.
-- Links through large-object samples are exact. Links through arena and pool samples are approximate: they name the most recent growth event that created the memory, not necessarily the call that allocated the object. The text output marks each stack `exact` or `approx`.
-- If the profile is from another pid or CPython version, or recording started after the snapshot, heapspy warns and links nothing.
+## Supported targets
 
-`diff --allocations` only checks the profile against AFTER for now; it does not add stacks to growth sites. The JSON fields are `allocations` and `allocated_at` ([docs/json-schema.md](docs/json-schema.md#allocations)), and the join is described in [docs/allocation-sampling.md](docs/allocation-sampling.md#joining-with-a-snapshot).
-
-### Allocation flame graph
-
-```sh
-# Width is estimated bytes allocated while recording
-heapspy flamegraph --allocations app.hpya -o alloc.svg
-
-# Width is the bytes still alive in the snapshot, by allocating stack
-heapspy flamegraph --allocations app.hpya --retained app.hpy -o alive.svg
-
-heapspy flamegraph --allocations app.hpya --folded > alloc.folded
-```
-
-This is a classic flame graph of the sampled stacks. Frames are Python functions written `function (file:line)`, the outermost frame is at the root, and width is bytes. Without `--retained`, the width is the estimated bytes allocated, which includes memory freed since. With `--retained SNAP`, the width is the bytes of the objects in the snapshot linked to each stack's samples, which shows where the memory still alive was allocated. The subtitle gives the recording length, the sample count, the mechanisms, and whether any frames were matched by time (approximate). `--min-bytes` and `--min-pct` fold narrow frames into `[other]` as for retention graphs. `--max-depth` does not apply.
-
-### JSON output
-
-Every command except `flamegraph` takes `--json`. The schema is versioned and kept stable, since tooling (including the MCP server below) builds on it. `dump --json` reports what was written; a failed command prints an error document with a stable code such as `not_python` or `permission_denied`. See [docs/json-schema.md](docs/json-schema.md).
-
-```sh
-heapspy analyze app.hpy --json | jq '.top_retainers[0]'
-heapspy dump --pid 1234 -o app.hpy --json | jq '.objects, .pause_ms'
-```
-
-## Permissions
-
-Dumping another process needs elevated rights. Analysis does not.
-
-| OS      | `dump` needs                                                                 |
-|---------|------------------------------------------------------------------------------|
-| Linux   | `CAP_SYS_PTRACE`, or a permissive `kernel.yama.ptrace_scope`. In containers: `SYS_PTRACE` and a shared PID namespace. |
-| Windows | `SeDebugPrivilege` (run elevated) to read another user's process.            |
-
-Taking the image pauses the target. On a large heap, expect a pause of a few seconds and a multi-gigabyte image file.
-
-## Supported targets (v1)
-
-| | v1 | Later |
-|---|---|---|
-| OS | Linux, Windows | macOS |
-| CPython | 3.12, 3.13, 3.14 | free-threaded builds |
-| Acquisition | consistent dump (ELF core, full minidump) | live attach with a brief stop |
-| Graph | GC-tracked containers and the leaf objects they reference | full pymalloc arena walk |
-| Native memory | totals only, from memory maps | per-allocation detail |
-
-Out of scope for v1: allocation call chains, per-object native or C-extension memory, leaks made only of untracked objects, reads with no pause, and runtimes other than CPython.
-
-## Known blind spots
-
-- **Untracked objects.** Bare ints, short strings, and raw buffers are not on the GC lists. heapspy sees them only when a tracked container references them. A leak made entirely of floating untracked objects will not show up in v1, and the output will say so.
-- **Native memory.** Memory allocated by C extensions is invisible to the object graph. heapspy reports how much of RSS falls outside the graph rather than guessing. Python objects that native code holds are not lost: their refcounts show owners heapspy found no reference from, and they are reported under the root `held outside the Python graph`.
-- **C types heapspy has no layout for.** Their references are found by scanning their fields for pointers to objects, and the memory they point at but do not lay out (a `deque`'s blocks, an extension's item array) is searched the same way. Both kinds of edge are checked against the targets' refcounts, so a field that only borrows, or a stale slot, does not count as ownership.
-- **Struct layouts.** CPython's internal layouts change between versions and builds. heapspy uses DWARF or PDB symbols when available, 3.14's debug offsets section where present, and shipped per-version offset tables otherwise.
-
-## Agent integration: heapspy-mcp
-
-A second package, `heapspy-mcp` in [`python/heapspy-mcp`](python/heapspy-mcp/README.md), exposes heapspy to coding agents over the Model Context Protocol. It shells out to the `heapspy` binary and parses `--json`. The intended loop: capture a snapshot, summarize it, pick a suspect, trace what retains it, map the holder to `file:line` in your repo, read the code, diagnose. It is built and tested against the documented JSON schema; it becomes useful once `dump` and the analyzer work.
-
-Tools:
-
-| Tool | Purpose |
+| | |
 |---|---|
-| `list_python_processes` | candidate PIDs with RSS, command line, Python version |
-| `capture_snapshot` | dump a PID or ingest a core/minidump (privileged, requires confirmation) |
-| `heap_summary` | top retainers and type histogram |
-| `retaining_path` | the chain keeping an object or type alive |
-| `type_detail` | instances, sizes, sample holders for one type |
-| `diff_snapshots` | growth between two captures |
-| `map_to_source` | resolve `module.qualname` to `file:line` |
+| OS | Linux (x86_64, aarch64), Windows (x86_64) |
+| CPython | 3.12, 3.13, 3.14, 64-bit, default builds. Free-threaded and debug builds are refused. |
+| Native heap walk | glibc malloc 2.15 to 2.43; the Windows heap from minidumps. With other allocators (jemalloc, tcmalloc, mimalloc) native memory is one total. |
+| Linux permissions | `CAP_SYS_PTRACE` or a permissive `kernel.yama.ptrace_scope`; in containers, `SYS_PTRACE` and a shared PID namespace. `record` and `top --alloc` need root or `CAP_BPF` + `CAP_PERFMON`. |
+| Windows permissions | an elevated prompt to read another user's process |
 
-`capture_snapshot` is the only tool that touches a process, and it is gated by confirmation, a process allowlist, and a heap-size limit. The other tools only read snapshot files. Tools return bounded, ranked summaries. The raw graph is never sent to the model, both to keep token use down and to keep memory contents out of transcripts.
+## Limits
 
-## Installation (planned)
+- **Untracked objects.** Bare ints, short strings and raw buffers are not on
+  the garbage collector's lists. heapspy sees them only when a tracked
+  container references them, so a leak made only of such objects does not
+  show up.
+- **C structs heapspy has no layout for** (extension types). Their fields
+  are scanned for pointers and checked against reference counts. A pointer
+  into native memory reads as `C field +offset`, not the field's name.
+- **Native ownership.** A native block's owner is whatever points to it.
+  A snapshot cannot say who allocated it; `record` can, for allocations made
+  while it runs (native heap events on Windows only for now).
+- **Layouts.** CPython's internal layouts change between versions. heapspy
+  uses `_Py_DebugOffsets` on 3.13 and later, DWARF or PDB symbols when
+  present, and shipped per-version tables otherwise.
 
-Nothing has been released yet. Until the first release, the commands below will not find a package. heapspy will be a Rust binary distributed as PyPI wheels, the same way py-spy is. The wheels contain only the binary and work with any Python 3.8 or later:
+## For tools and agents
 
-```sh
-pip install heapspy
-pipx install heapspy      # or keep it in its own environment
-pip install heapspy-mcp   # optional, for agent integration
-```
+Every command except `top` and `flamegraph` takes `--json`. The schema is
+versioned and stable within a version: fields are only added
+([docs/json-schema.md](docs/json-schema.md)). Errors are JSON documents too,
+with codes such as `permission_denied` or `not_python`.
 
-Wheels are planned for Linux x86_64 and aarch64 (glibc), Linux x86_64 (musl) and Windows x86_64. Each GitHub release will also have the bare binaries attached.
+[heapspy-mcp](python/heapspy-mcp/README.md) (`pip install heapspy-mcp`)
+exposes heapspy to coding agents over the Model Context Protocol: find the
+process, take a snapshot with the user's consent, summarize it, follow a
+holder to `file:line`. It also has process and CPU diagnostics. The raw
+object graph is never sent to the model.
 
-To build from source now, with Rust 1.85 or later:
+## Documentation
 
-```sh
-cargo install --git https://github.com/Heknon/heapspy heapspy
-```
-
-See [docs/releasing.md](docs/releasing.md) for how releases are built and published.
-
-## Roadmap
-
-| Milestone | Deliverable | Status |
-|---|---|---|
-| M1 | Linux core dump reader to snapshot, proven on one `gcore` of a 3.12 process | done |
-| M2 | Analyzer: dominators, retained sizes, histogram, retaining paths, `--json`, property tests | done |
-| M3 | Linux end-to-end test matrix (3.12 to 3.14) passing in CI | passes locally; CI job added (`ci:e2e`), not yet run on GitHub |
-| M4 | Windows minidump backend | done |
-| M5 | Windows end-to-end test matrix passing on `windows-latest` | harness and CI job written, not yet run |
-| M6 | `heapspy-mcp` | done |
-| M7 | `heapspy record`: sampled allocation stacks from outside the process (Linux eBPF, Windows ETW and debugger breakpoints), joined with snapshots. Design in [docs/allocation-sampling.md](docs/allocation-sampling.md) | Linux done, CI job `ci:record`; Windows passes on `windows-latest` except the kill-mid-run safety checks |
-
-The end-to-end tests run heapspy against fixture processes with known leaks (an unbounded module-level cache, a listener registry that never shrinks, a closure holding a large object, and others) and check that the analyzer names the right holder, reports a retained size within tolerance, and produces the expected retaining path. See [tests/e2e/README.md](tests/e2e/README.md).
-
-## Repository layout
-
-| Path | Contents |
+| | |
 |---|---|
-| `crates/heapspy-snapshot` | snapshot file format: types, streaming writer, mmap reader, test builder |
-| `crates/heapspy-reader` | `MemorySource` trait, ELF core / live Linux / minidump backends, CPython walker, `dump` |
-| `crates/heapspy-analyzer` | JSON report types (schema v1), dominators, retained sizes, paths, diffs |
-| `crates/heapspy-alloc` | allocation profile format (`.hpya`): types, streaming writer, mmap reader, line tables, test builder |
-| `crates/heapspy-record` | `heapspy record`: recorder interface and options; eBPF (`bpf/` holds the committed BPF object and its source), ptrace and Windows recorders |
-| `crates/heapspy` | the `heapspy` command-line tool |
-| `tests/e2e` | end-to-end tests against real CPython processes (pytest) |
-| `docs/snapshot-format.md` | byte-level specification of `.hpy` files |
-| `docs/alloc-format.md` | byte-level specification of `.hpya` files |
-| `docs/allocation-sampling.md` | M7 design: allocation sampling from outside the process |
-| `docs/json-schema.md` | the `--json` output schema; examples in `docs/examples/` |
-| `docs/cli.md` | every command, its output, and what it costs the target |
-| `python/heapspy-mcp` | the `heapspy-mcp` MCP server (Python) |
-| `docs/releasing.md` | how to cut a release and the one-time PyPI setup |
-| `pyproject.toml` | maturin config that packages the `heapspy` binary as a PyPI wheel |
-| `scripts/check-version.py` | checks that the release tag and package versions agree |
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and how CI is run.
+| [docs/cli.md](docs/cli.md) | every command, its output, and what it costs the process |
+| [docs/flamegraph.md](docs/flamegraph.md) | reading retention and allocation flame graphs |
+| [docs/allocation-sampling.md](docs/allocation-sampling.md) | how `record` samples allocations from outside |
+| [docs/json-schema.md](docs/json-schema.md) | the `--json` schema, with examples in `docs/examples/` |
+| [docs/cpython-internals.md](docs/cpython-internals.md) | the CPython layouts the walker relies on |
+| [docs/snapshot-format.md](docs/snapshot-format.md), [docs/alloc-format.md](docs/alloc-format.md) | the `.hpy` and `.hpya` file formats |
+| [docs/windows.md](docs/windows.md) | Windows specifics |
+| [scripts/investigate.py](scripts/investigate.py) | runs `dump`, `analyze` and `diff` in rounds until it can say which holder leaks and where its code is |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | local checks, CI labels, end-to-end tests |
+| [docs/releasing.md](docs/releasing.md) | how releases are cut |
 
 ## License
 

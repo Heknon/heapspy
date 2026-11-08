@@ -247,9 +247,41 @@ sudo heapspy record --pid 1234 --duration 60s -o app.hpya --then-dump app.hpy
 heapspy analyze app.hpy --allocations app.hpya
 ```
 
-Samples allocations with their Python stacks for a time window. See
-[allocation-sampling.md](allocation-sampling.md) for the mechanisms, events
-and costs.
+Samples allocations with their Python stacks for a time window, without
+running code in the target, and writes an allocation profile (`.hpya`).
+Joined with a snapshot, it says which code allocated the memory that is
+still alive.
+
+Options: `--events arena,pool,large,native`, `--interval BYTES` (mean bytes
+between large-object samples, default 512K), `--max-frames N` (default 64),
+`--mechanism auto|ebpf|ptrace|etw|debugger`. Ctrl-C ends a recording early
+with a valid profile flagged truncated.
+
+| Mechanism | Needs | Records | Cost |
+|---|---|---|---|
+| Linux eBPF (default) | root or `CAP_BPF` + `CAP_PERFMON`, kernel 5.8+ | arenas from `mmap`, sampled large objects from allocator uprobes, Python stack read in the kernel | arenas: a few percent; large objects: one uprobe trap per allocator call above 512 bytes (~0.5 µs), 30–50% on an allocation-heavy benchmark |
+| Linux ptrace (fallback) | ptrace rights | arenas only, exact stacks | stops the target at system calls |
+| Windows ETW (default) | an elevated prompt | arenas with approximate frames; `--events native` for the C heap after `--prepare` | does not stop the target |
+| Windows debugger | an elevated prompt | exact frames | stops the target's threads for most of the window |
+
+Pools are never recorded: pool carving is inlined in every build checked. On
+Windows, if heapspy is killed while recording, a guardian process restores
+the target and stops heapspy's ETW session (see [windows.md](windows.md#when-heapspy-is-killed)).
+
+`analyze --allocations` and `query --type --allocations` link each snapshot
+object to the latest sample whose range contains it, and add the stacks that
+allocated the most and, under each holder, the stacks that allocated what it
+retains. Read the numbers as an estimate of where growth came from:
+
+- Only allocations made while recording are covered. Memory allocated
+  before, and blocks reused from freed memory, have no stack.
+- Links through large-object samples are exact. Links through arena and pool
+  samples are approximate (marked `approx`): they name the growth event that
+  created the memory, not necessarily the call that allocated the object.
+- A profile from another pid or CPython version, or one that started after
+  the snapshot, links nothing, with a warning.
+
+Design, events and measurements: [allocation-sampling.md](allocation-sampling.md).
 
 ## query
 
@@ -284,8 +316,7 @@ heapspy flamegraph --diff before.hpy after.hpy -o grew.svg
 heapspy flamegraph --allocations app.hpya --retained app.hpy -o alive.svg
 ```
 
-See the [README](../README.md#retention-flame-graph) for how to read a
-retention flame graph.
+How to read them, the frame format and the cutoffs: [flamegraph.md](flamegraph.md).
 
 ## Global options, output and exit codes
 
