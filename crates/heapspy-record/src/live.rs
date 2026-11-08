@@ -86,3 +86,17 @@ pub fn windows_processes() -> Vec<(u32, String)> {
         Vec::new()
     }
 }
+
+/// The command line of `pid` on Windows. `None` elsewhere (Linux callers
+/// read `/proc`), or when it cannot be read.
+pub fn windows_command_line(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        crate::windows::live::command_line(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}

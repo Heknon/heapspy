@@ -50,6 +50,7 @@
 //! layout gives `None`, not wrong numbers.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Result;
 use crate::source::{MemorySource, MemorySourceExt};
@@ -197,12 +198,23 @@ pub struct PyCounters {
 }
 
 /// Reads [`PyCounters`] from a target again and again.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CounterReader {
     runtime_addr: u64,
     layout: CounterLayout,
     frames: FrameOffsets,
+    /// `obmalloc`'s offset from `gc` as found in this target: unknown
+    /// ([`UNKNOWN`]) until the first read, [`NOT_FOUND`] when no offset
+    /// gave a state that checks out.
+    obmalloc_from_gc: AtomicU64,
 }
+
+const UNKNOWN: u64 = u64::MAX;
+const NOT_FOUND: u64 = u64::MAX - 1;
+/// How far from the measured offset to look for pymalloc's state, in
+/// bytes each way. Interpreter fields the debug offsets do not cover can
+/// differ between builds (Windows' LLP64 `long`, lock types).
+const SEARCH: u64 = 2048;
 
 impl CounterReader {
     /// Prepare to read the counters of the runtime `rt` in `src`.
@@ -215,6 +227,7 @@ impl CounterReader {
             runtime_addr: rt.runtime_addr,
             layout,
             frames: FrameOffsets::from_offsets(&o, src.target().os),
+            obmalloc_from_gc: AtomicU64::new(UNKNOWN),
         })
     }
 
@@ -228,6 +241,7 @@ impl CounterReader {
             runtime_addr,
             layout,
             frames,
+            obmalloc_from_gc: AtomicU64::new(UNKNOWN),
         }
     }
 
@@ -252,18 +266,13 @@ impl CounterReader {
         // New interpreters are pushed at the head: the main one is last.
         let gc = interps.last().and_then(|&i| read_gc(src, i + l.is_gc, l));
         let mut states: Vec<u64> = Vec::new();
-        for &i in &interps {
-            let at = i + l.is_gc + l.obmalloc_from_gc;
-            let state = if l.obmalloc_is_pointer {
-                match src.read_ptr(at) {
-                    Ok(p) if p != 0 => p,
-                    _ => continue,
+        if let Some(off) = self.obmalloc_offset(src, &interps) {
+            for &i in &interps {
+                if let Some(state) = self.state_at(src, i, off) {
+                    if !states.contains(&state) {
+                        states.push(state);
+                    }
                 }
-            } else {
-                at
-            };
-            if !states.contains(&state) {
-                states.push(state);
             }
         }
         let mut allocator: Option<AllocatorCounters> = None;
@@ -282,6 +291,58 @@ impl CounterReader {
             gc,
             allocator: allocator.filter(|a| a.arenas > 0 || a.arenas_allocated_total > 0),
         })
+    }
+}
+
+impl CounterReader {
+    /// Where pymalloc's state is for interpreter `interp`, with `obmalloc`
+    /// at `off` from `gc`: the embedded struct (3.12), or the one its
+    /// pointer names (3.13+).
+    fn state_at(&self, src: &dyn MemorySource, interp: u64, off: u64) -> Option<u64> {
+        let at = interp + self.layout.is_gc + off;
+        if self.layout.obmalloc_is_pointer {
+            src.read_ptr(at).ok().filter(|&p| p != 0)
+        } else {
+            Some(at)
+        }
+    }
+
+    /// `obmalloc`'s offset from `gc`. The measured one is tried first; when
+    /// the main interpreter's state there does not check out, the offsets
+    /// around it are searched once, 8 bytes at a time, for a state whose
+    /// arenas hold pools that name their own arena, more of them than not
+    /// (a test random memory does not pass), and the one found is kept.
+    fn obmalloc_offset(&self, src: &dyn MemorySource, interps: &[u64]) -> Option<u64> {
+        match self.obmalloc_from_gc.load(Ordering::Relaxed) {
+            NOT_FOUND => return None,
+            UNKNOWN => {}
+            off => return Some(off),
+        }
+        let main = *interps.last()?;
+        let base = self.layout.obmalloc_from_gc;
+        let strict = |off: u64| {
+            self.state_at(src, main, off)
+                .and_then(|s| read_allocator(src, s))
+                .is_some_and(|a| a.arenas > 0 && a.pools > a.skipped_pools)
+        };
+        let found = std::iter::once(base)
+            .chain((1..=SEARCH / 8).flat_map(|k| [base + 8 * k, base.wrapping_sub(8 * k)]))
+            .filter(|&o| o < 1 << 20)
+            .find(|&o| strict(o));
+        let Some(off) = found else {
+            // Too early to tell (no arena yet) is not a verdict; a target
+            // with arenas but no state that checks out is.
+            if self
+                .state_at(src, main, base)
+                .and_then(|s| read_allocator(src, s))
+                .is_none()
+            {
+                self.obmalloc_from_gc.store(NOT_FOUND, Ordering::Relaxed);
+            }
+            return None;
+        };
+        self.obmalloc_from_gc.store(off, Ordering::Relaxed);
+        Some(off)
     }
 }
 
@@ -474,8 +535,17 @@ mod tests {
     }
 
     fn fake(minor: u8) -> Fake {
+        fake_at(minor, 0)
+    }
+
+    /// [`fake`] with pymalloc's state `shift` bytes further from `gc`
+    /// than the layout says, as another build's interpreter might put it.
+    fn fake_at(minor: u8, shift: u64) -> Fake {
         let o = Offsets::table(minor, Os::Linux).unwrap();
         let l = CounterLayout::for_offsets(&o).unwrap();
+        let reader_layout = l;
+        let mut l = l;
+        l.obmalloc_from_gc += shift;
         let fo = FrameOffsets::from_offsets(&o, Os::Linux);
         let mut img = MemImage::new(TargetInfo::LINUX_X86_64);
 
@@ -564,7 +634,7 @@ mod tests {
         img.map(first1 + POOL_SIZE, pool(9, 1, 0)); // wrong arena: skipped
         Fake {
             img,
-            reader: CounterReader::with_layout(runtime, l, fo),
+            reader: CounterReader::with_layout(runtime, reader_layout, fo),
         }
     }
 
@@ -612,6 +682,21 @@ mod tests {
                     },
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn a_state_away_from_the_measured_offset_is_found() {
+        for minor in [12, 13, 14] {
+            for shift in [40u64, 8] {
+                let f = fake_at(minor, shift);
+                let a = f.reader.read(&f.img).unwrap().allocator;
+                let a = a.unwrap_or_else(|| panic!("3.{minor} +{shift}"));
+                assert_eq!((a.arenas, a.blocks), (2, 17), "3.{minor} +{shift}");
+                // Found once, then kept.
+                let again = f.reader.read(&f.img).unwrap().allocator.unwrap();
+                assert_eq!(again.blocks, 17);
+            }
         }
     }
 

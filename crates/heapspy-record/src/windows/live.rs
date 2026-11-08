@@ -218,6 +218,55 @@ pub fn process_memory(pid: u32) -> Option<(u64, u64)> {
     (ok != 0).then_some((c.WorkingSetSize as u64, c.PrivateUsage as u64))
 }
 
+/// The command line of `pid`, as the process was started
+/// (`NtQueryInformationProcess`, `ProcessCommandLineInformation`; Windows
+/// 8.1 and later). `None` when it cannot be read.
+pub fn command_line(pid: u32) -> Option<String> {
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows_sys::Win32::Foundation::UNICODE_STRING;
+    // SAFETY: plain OpenProcess; the handle is owned by `Handle`.
+    let h = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
+    if h.0.is_null() {
+        return None;
+    }
+    // The result is a UNICODE_STRING followed by the text it points at;
+    // u64 words keep it aligned.
+    let mut buf = vec![0u64; 4096];
+    for _ in 0..2 {
+        let mut needed = 0u32;
+        let bytes = (buf.len() * 8) as u32;
+        // SAFETY: `buf` is writable for `bytes` bytes.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                h.0,
+                ProcessCommandLineInformation,
+                buf.as_mut_ptr().cast(),
+                bytes,
+                &mut needed,
+            )
+        };
+        if status >= 0 {
+            // SAFETY: on success the buffer starts with a UNICODE_STRING
+            // whose `Buffer` points `Length` bytes into `buf`.
+            let text = unsafe {
+                let us = &*(buf.as_ptr() as *const UNICODE_STRING);
+                if us.Buffer.is_null() {
+                    return None;
+                }
+                std::slice::from_raw_parts(us.Buffer, us.Length as usize / 2)
+            };
+            return Some(String::from_utf16_lossy(text));
+        }
+        if needed as usize <= buf.len() * 8 {
+            return None;
+        }
+        buf = vec![0u64; (needed as usize).div_ceil(8)];
+    }
+    None
+}
+
 /// Every process: (pid, executable file name), from a Toolhelp snapshot.
 pub fn processes() -> Vec<(u32, String)> {
     let mut out = Vec::new();

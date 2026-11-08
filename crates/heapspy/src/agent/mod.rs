@@ -549,9 +549,14 @@ fn discover(text: &str) -> Vec<u32> {
 /// `server`), the module of `-m` (`-m uvicorn` → `uvicorn`), else the
 /// executable's name, else `python-PID`.
 pub fn app_name(cmd: &str, pid: u32) -> String {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let parts = split_args(cmd);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     let base = |s: &str| -> String {
         let f = s.rsplit(['/', '\\']).next().unwrap_or(s);
+        let f = f
+            .strip_suffix(".exe")
+            .or_else(|| f.strip_suffix(".EXE"))
+            .unwrap_or(f);
         f.strip_suffix(".py").unwrap_or(f).to_string()
     };
     let mut i = 1;
@@ -578,6 +583,33 @@ pub fn app_name(cmd: &str, pid: u32) -> String {
         Some(exe) if !exe.is_empty() => clean(&base(exe)),
         _ => format!("python-{pid}"),
     }
+}
+
+/// Split a command line into arguments at whitespace, keeping what is
+/// inside double quotes together (Windows quotes paths with spaces).
+fn split_args(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in cmd.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Pyroscope's service names are free text, but keep them to what shows
@@ -650,6 +682,14 @@ mod tests {
         assert_eq!(app_name("python -c print(1)", 1), "python");
         assert_eq!(app_name("", 9), "python-9");
         assert_eq!(app_name("python my app.py", 1), "my");
+        assert_eq!(
+            app_name(
+                r#""C:\Program Files\Python314\python.exe" -E -s "D:\a\my app\growing_list.py" x"#,
+                1
+            ),
+            "growing_list"
+        );
+        assert_eq!(app_name(r#""C:\Python\python.exe""#, 1), "python");
     }
 
     #[test]

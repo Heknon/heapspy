@@ -230,7 +230,8 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// The process's command line, for headers. Linux only.
+/// The process's command line, for headers and service names: from
+/// `/proc` on Linux, from the process itself on Windows.
 pub fn command_line(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -244,8 +245,7 @@ pub fn command_line(pid: u32) -> Option<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
-        None
+        heapspy_record::live::windows_command_line(pid).filter(|s| !s.trim().is_empty())
     }
 }
 
