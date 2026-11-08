@@ -459,6 +459,8 @@ mod data_symbol_tests {
         assert_eq!(d.lookup(base, base + 0x0fff), None);
     }
 
+    /// The test binary is an ELF file only on Linux (a PE file on Windows).
+    #[cfg(target_os = "linux")]
     #[test]
     fn reads_this_test_binarys_globals() {
         // The test binary itself has a symbol table with data objects.
