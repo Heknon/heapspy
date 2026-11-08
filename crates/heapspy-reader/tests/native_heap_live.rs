@@ -14,6 +14,12 @@
 //! ctypes, from the main thread (brk heap and mmapped chunks) and from a
 //! second thread (its own arena), fills them, writes their addresses and
 //! sleeps. Every one must be inside a busy block of the right kind.
+//!
+//! `HEAPSPY_VICTIM` names a built victim to run instead, given the file to
+//! write: `victims/glibc_heap.c` does the same in C, for glibc releases
+//! CPython no longer runs on. The glibc workflow builds it and this test
+//! (statically, for musl) inside old distro images. `HEAPSPY_SKIP_CORE`
+//! skips the `gcore` half where no gdb can be had.
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -72,18 +78,26 @@ impl Drop for Victim {
 }
 
 fn start(dir: &Path) -> Victim {
-    let py: PathBuf = std::env::var_os("HEAPSPY_PY")
-        .map(Into::into)
-        .unwrap_or_else(|| "python3".into());
-    let script = dir.join("victim.py");
-    std::fs::write(&script, VICTIM).unwrap();
     let ready = dir.join("ready");
-    let child = Command::new(&py)
-        .arg(&script)
+    // A built victim (victims/glibc_heap.c) if given, else the Python one.
+    let mut cmd = match std::env::var_os("HEAPSPY_VICTIM") {
+        Some(exe) => Command::new(exe),
+        None => {
+            let py: PathBuf = std::env::var_os("HEAPSPY_PY")
+                .map(Into::into)
+                .unwrap_or_else(|| "python3".into());
+            let script = dir.join("victim.py");
+            std::fs::write(&script, VICTIM).unwrap();
+            let mut cmd = Command::new(py);
+            cmd.arg(script);
+            cmd
+        }
+    };
+    let child = cmd
         .arg(&ready)
         .stdout(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| panic!("start {}: {e}", py.display()));
+        .unwrap_or_else(|e| panic!("start {cmd:?}: {e}"));
     let t0 = Instant::now();
     while !ready.exists() {
         assert!(
@@ -108,12 +122,57 @@ fn start(dir: &Path) -> Victim {
 }
 
 fn check(src: &dyn MemorySource, allocs: &[(u64, u64, String)], what: &str) {
-    let blocks: Vec<NativeBlock> = src
-        .native_blocks()
-        .unwrap()
-        .unwrap_or_else(|| panic!("{what}: no native blocks (allocator not recognised?)"));
+    let blocks: Vec<NativeBlock> = src.native_blocks().unwrap().unwrap_or_else(|| {
+        // What the walker had to go on: libc, and the anonymous memory
+        // a heap could be in.
+        let modules: Vec<String> = src
+            .modules()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|p| p.contains("libc"))
+            .collect();
+        let maps: Vec<String> = src
+            .mapped_ranges()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.perms.write)
+            .map(|r| format!("{:#x}+{:#x} {:?}", r.start, r.size, r.file))
+            .collect();
+        // libc's mappings, and whether the ELF header at each reads.
+        let libc: Vec<String> = src
+            .mapped_ranges()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.file.as_deref().is_some_and(|f| f.contains("libc")))
+            .map(|r| {
+                let mut b = [0u8; 4];
+                let head = src.read(r.start, &mut b).map(|()| b);
+                format!(
+                    "{:#x}+{:#x} {:?} {:?}: {head:x?}",
+                    r.start, r.size, r.perms, r.file
+                )
+            })
+            .collect();
+        panic!(
+            "{what}: no native blocks (allocator not recognised?)\n\
+             libc modules: {modules:?}\nlibc mappings: {libc:#?}\n\
+             writable mappings: {maps:#?}"
+        )
+    });
     eprintln!("{what}: {} native blocks", blocks.len());
-    assert!(blocks.len() > 100, "{what}: only {} blocks", blocks.len());
+    // A CPython has thousands; the C victim only what it asked for, and its
+    // stdio buffers.
+    let least = if std::env::var_os("HEAPSPY_VICTIM").is_some() {
+        allocs.len()
+    } else {
+        100
+    };
+    assert!(
+        blocks.len() >= least,
+        "{what}: only {} blocks",
+        blocks.len()
+    );
     for w in blocks.windows(2) {
         assert!(w[0].start + w[0].size <= w[1].start, "{what}: {w:?}");
     }
@@ -207,10 +266,18 @@ fn native_blocks_of_a_live_cpython_and_its_core() {
     let dir = tempfile::tempdir().unwrap();
     let v = start(dir.path());
     let pid = v.child.id();
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        let heap: Vec<&str> = maps.lines().filter(|l| l.ends_with("[heap]")).collect();
+        eprintln!("victim [heap]: {heap:?}");
+    }
     {
         let live = LiveProcess::attach(pid).expect("attach (ptrace permission?)");
         check(&live, &v.allocs, "live");
         live.release();
+    }
+    if std::env::var_os("HEAPSPY_SKIP_CORE").is_some() {
+        eprintln!("HEAPSPY_SKIP_CORE is set: not checking a gcore core");
+        return;
     }
     let prefix = dir.path().join("core");
     let out = Command::new("gcore")
