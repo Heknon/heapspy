@@ -75,6 +75,7 @@ pub fn run(args: AgentArgs) -> anyhow::Result<()> {
             server,
             authorization(args.basic_auth_user.as_deref())?,
             args.tenant_id.clone(),
+            extra_headers(std::env::var("HEAPSPY_PYROSCOPE_HEADERS").ok().as_deref())?,
         )?),
         (None, None) => unreachable!("clap requires --server or --dry-run"),
     };
@@ -220,6 +221,27 @@ fn authorization(user: Option<&str>) -> anyhow::Result<Option<String>> {
         (None, _, Some(t)) => Some(format!("Bearer {t}")),
         (None, _, None) => None,
     })
+}
+
+/// More HTTP headers for every request, from `HEAPSPY_PYROSCOPE_HEADERS`:
+/// a JSON object of names to values. From the environment, as they may
+/// carry credentials.
+fn extra_headers(json: Option<&str>) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(json) = json.filter(|j| !j.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let map: std::collections::BTreeMap<String, String> = serde_json::from_str(json)
+        .context("HEAPSPY_PYROSCOPE_HEADERS must be a JSON object of header names to strings")?;
+    for name in map.keys() {
+        let ok = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        if !ok {
+            anyhow::bail!("HEAPSPY_PYROSCOPE_HEADERS: {name:?} is not a header name");
+        }
+    }
+    Ok(map.into_iter().collect())
 }
 
 /// Start the collectors of one process. Fails when it is not a CPython
@@ -689,7 +711,7 @@ pub fn parse_tag(s: &str) -> Result<(String, String), String> {
             "bad tag key {k:?}: use letters, digits and _, not starting with a digit"
         ));
     }
-    if matches!(k, "__name__" | "service_name" | "pid") {
+    if matches!(k, "__name__" | "service_name" | "pid" | "heapspy_profile") {
         return Err(format!("tag {k:?} is set by the agent"));
     }
     Ok((k.to_string(), v.to_string()))
@@ -760,6 +782,18 @@ mod tests {
             .samples
             .iter()
             .any(|s| s.0 == vec!["other (code, stacks, large buffers)".to_string()]));
+    }
+
+    #[test]
+    fn extra_headers_are_a_json_object() {
+        assert!(extra_headers(None).unwrap().is_empty());
+        assert!(extra_headers(Some(" ")).unwrap().is_empty());
+        assert_eq!(
+            extra_headers(Some(r#"{"X-A": "1", "x-b": "two"}"#)).unwrap(),
+            vec![("X-A".into(), "1".into()), ("x-b".into(), "two".into())]
+        );
+        assert!(extra_headers(Some(r#"{"bad name": "1"}"#)).is_err());
+        assert!(extra_headers(Some(r#"["X-A"]"#)).is_err());
     }
 
     #[test]

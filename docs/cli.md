@@ -331,6 +331,8 @@ export HEAPSPY_PYROSCOPE_TOKEN=...
 ```
 
 `--tenant-id` sets `X-Scope-OrgID` for a multi-tenant Pyroscope.
+`HEAPSPY_PYROSCOPE_HEADERS`, a JSON object (`{"X-Name": "value"}`), adds
+headers to every request.
 
 `--memory` and `--retained` share one profile type, so that Grafana
 graphs both in bytes (it graphs any type it does not know as bytes per
@@ -382,6 +384,57 @@ in `go tool pprof`.
 
 A heapspy built without the `tls` Cargo feature (on by default) sends only
 to `http://` servers.
+
+### From Python: `heapspy.configure()`
+
+The `heapspy` package also has a Python module with the interface of
+Pyroscope's Python client (`pyroscope-io`): the application starts the
+agent for itself, with the same call it would make to `pyroscope.configure`.
+
+```python
+import heapspy
+
+heapspy.configure(
+    application_name="checkout",            # service_name
+    server_address="http://pyroscope:4040",
+    tags={"env": "prod", "region": "eu-west-1"},
+    # Grafana Cloud: basic_auth_username="123456", basic_auth_password="glc_...",
+    # tenant_id="team-a", http_headers={"X-Name": "value"},
+    # heapspy's own profiles, keyword only; memory is on, the rest opt-in:
+    retained=True, retained_interval=300,   # who holds it (approximate)
+    # stop=True,                            # exact snapshots, pausing the process
+    # alloc=True, alloc_interval=300, alloc_duration=30,  # needs eBPF / ETW
+)
+...
+heapspy.shutdown()                          # also runs at exit
+```
+
+`configure()` starts `heapspy agent --pid <this process>` as a child
+process, with the arguments translated: `upload_interval` (seconds, 15) is
+`--memory-every`, `tags` are `--tag`s, and the password and `http_headers`
+go through the environment (`HEAPSPY_PYROSCOPE_PASSWORD`,
+`HEAPSPY_PYROSCOPE_HEADERS`), not the command line. Nothing runs inside the
+interpreter. The agent's messages go to the `heapspy` logger with
+`enable_logging=True`. Calling `configure()` again replaces the agent;
+`shutdown()` stops it after it sends what it collected, and the agent also
+exits when the process does. `is_running()` says whether it is running.
+
+`pyroscope.configure`'s CPU options (`sample_rate`, `oncpu`, `gil_only`,
+`report_thread_id`, ...) are accepted and ignored, so `import heapspy as
+pyroscope` runs unchanged; every profile has a `pid` label, as with
+`report_pid`. The two can run side by side: Pyroscope for CPU, heapspy for
+memory, under the same `application_name`.
+
+The agent reads this process from outside, so it needs the same permission
+as `heapspy agent --pid` run by the same user. Under Yama's
+`ptrace_scope` 1 (Ubuntu's default), a process may only read its
+descendants; `configure()` names the agent as the process allowed to read
+this one (`prctl(PR_SET_PTRACER)`). Scope 2 needs `CAP_SYS_PTRACE`.
+
+A process started by `fork()` (a gunicorn or multiprocessing worker) is
+not the one the agent watches: call `configure()` in each worker, e.g.
+from gunicorn's `post_fork` hook. The binary is found next to the module
+(the package's script), on `PATH`, or at `$HEAPSPY_BIN`.
 
 ## analyze
 

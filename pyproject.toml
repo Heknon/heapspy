@@ -1,6 +1,7 @@
-# Builds the `heapspy` wheel. The wheel contains only the Rust binary
-# (maturin `bindings = "bin"`), so it is tagged py3-none-<platform> and works
-# with any Python 3 interpreter. The version comes from Cargo: see
+# Builds the `heapspy` wheel: the Rust binary (maturin `bindings = "bin"`) and
+# the pure-Python `heapspy` module in python/heapspy (`heapspy.configure()`,
+# which starts the binary's agent). It is tagged py3-none-<platform> and
+# works with any Python 3 interpreter. The version comes from Cargo: see
 # `[workspace.package] version` in Cargo.toml and docs/releasing.md.
 
 [build-system]
@@ -37,6 +38,7 @@ Documentation = "https://github.com/Heknon/heapspy#readme"
 
 [tool.maturin]
 bindings = "bin"
+python-source = "python/heapspy"
 manifest-path = "crates/heapspy/Cargo.toml"
 strip = true
 # maturin already adds the workspace crates the binary depends on. Keep
@@ -44,7 +46,7 @@ strip = true
 exclude = [
     { path = ".github/**", format = "sdist" },
     { path = "docs/**", format = "sdist" },
-    { path = "python/**", format = "sdist" },
+    { path = "python/heapspy-mcp/**", format = "sdist" },
     { path = "scripts/**", format = "sdist" },
     { path = "crates/*/tests/**", format = "sdist" },
 ]

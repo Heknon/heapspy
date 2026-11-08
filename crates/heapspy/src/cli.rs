@@ -173,7 +173,8 @@ pub enum Command {
             profile is labelled service_name (--app-name, else the script or module name), \
             pid, hostname and every --tag. Credentials come from the environment: \
             HEAPSPY_PYROSCOPE_PASSWORD with --basic-auth-user (Grafana Cloud: the stack's \
-            user id and an access token), or HEAPSPY_PYROSCOPE_TOKEN as a bearer token.",
+            user id and an access token), or HEAPSPY_PYROSCOPE_TOKEN as a bearer token; \
+            HEAPSPY_PYROSCOPE_HEADERS adds headers, as a JSON object.",
         after_long_help = "\x1b[1;4mExamples\x1b[0m\n  \
             sudo heapspy agent --server http://pyroscope:4040 --pid 1234\n  \
             sudo heapspy agent --server http://pyroscope:4040 --discover gunicorn --tag env=prod\n  \

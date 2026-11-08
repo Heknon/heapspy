@@ -48,6 +48,7 @@ pub struct Http {
     url: String,
     authorization: Option<String>,
     tenant: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 impl Http {
@@ -57,6 +58,7 @@ impl Http {
         server: &str,
         authorization: Option<String>,
         tenant: Option<String>,
+        headers: Vec<(String, String)>,
     ) -> anyhow::Result<Http> {
         let server = server.trim_end_matches('/');
         if !(server.starts_with("http://") || server.starts_with("https://")) {
@@ -77,6 +79,7 @@ impl Http {
             url: format!("{server}/push.v1.PusherService/Push"),
             authorization,
             tenant,
+            headers,
         })
     }
 }
@@ -159,6 +162,9 @@ impl Sink {
                 }
                 if let Some(t) = &h.tenant {
                     r = r.set("X-Scope-OrgID", t);
+                }
+                for (name, value) in &h.headers {
+                    r = r.set(name, value);
                 }
                 match r.send_string(&request_body(p)) {
                     Ok(_) => Ok(()),
@@ -337,8 +343,8 @@ mod tests {
 
     #[test]
     fn servers_must_be_http_urls() {
-        assert!(Http::new("pyroscope:4040", None, None).is_err());
-        assert!(Http::new("http://pyroscope:4040/", None, None).is_ok());
+        assert!(Http::new("pyroscope:4040", None, None, Vec::new()).is_err());
+        assert!(Http::new("http://pyroscope:4040/", None, None, Vec::new()).is_ok());
     }
 
     /// A server that answers each request with the next status of
@@ -390,7 +396,13 @@ mod tests {
     #[test]
     fn a_server_error_is_retried_and_a_refusal_is_not() {
         let (url, got) = mock(vec![503, 401]);
-        let http = Http::new(&url, Some("Bearer t".into()), Some("team-a".into())).unwrap();
+        let http = Http::new(
+            &url,
+            Some("Bearer t".into()),
+            Some("team-a".into()),
+            vec![("X-Extra".into(), "1".into())],
+        )
+        .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(push("memory")).unwrap();
         tx.send(push("retained")).unwrap();
@@ -415,6 +427,7 @@ mod tests {
         let h = head.to_ascii_lowercase();
         assert!(h.contains("authorization: bearer t"), "{head}");
         assert!(h.contains("x-scope-orgid: team-a"), "{head}");
+        assert!(h.contains("x-extra: 1"), "{head}");
         assert!(h.contains("content-type: application/json"), "{head}");
         assert!(body.contains("\"rawProfile\":\"AQ==\""), "{body}");
     }

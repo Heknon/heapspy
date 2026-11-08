@@ -120,6 +120,24 @@ it starts. Profiles carry `service_name`, `pid`, `hostname` and your
 (`HEAPSPY_PYROSCOPE_PASSWORD`, `HEAPSPY_PYROSCOPE_TOKEN`), never the command
 line. Details in [docs/cli.md](docs/cli.md#agent).
 
+Or from inside the application, with the interface of Pyroscope's Python
+client (`pip install heapspy`; the agent still reads the process from
+outside):
+
+```python
+import heapspy
+
+heapspy.configure(
+    application_name="checkout",
+    server_address="http://pyroscope:4040",
+    tags={"env": "prod"},
+    retained=True,  # opt-in, as on the command line
+)
+```
+
+See [docs/cli.md](docs/cli.md#from-python-heapspyconfigure) and
+[examples/pyroscope_configure.py](examples/pyroscope_configure.py).
+
 The counters behind `--memory` can also be read directly:
 
 ```sh
